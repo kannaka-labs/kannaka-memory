@@ -21,6 +21,9 @@ Output (trainer-compatible, same shape as p2/prep_sft.py):
                          training graph (edge-level hold-out). Adapter-alone should
                          sit at chance here; graph-in-context arms should not.
   serialize.manifest.json  counts per repo/kind, weights, seed, graph commits.
+  Every eval row also carries "nodes" (graph ids) and "context": the 1-hop neighbourhood
+  of the subject in the FULL graph (train + held-out), i.e. oracle retrieval for the *_ctx arms.
+  Keys of config files (.json/.yaml/.toml/...) are excluded from records and evals.
 
 Weighting ("original novel work weighs more", Nick 2026-09-06):
   repo weight   = CORE_WEIGHT (2.0) if the repo name matches a constellation pattern,
@@ -64,6 +67,10 @@ CALL_RELATIONS = {"calls", "indirect_call"}
 IMPORT_RELATIONS = {"imports", "imports_from", "dynamic_import", "re_exports"}
 HOLDOUT_RELATIONS = CALL_RELATIONS | IMPORT_RELATIONS | {"references"}
 MAX_LIST = 12
+# graphify emits keys of config files (tsconfig.json, *.yaml, ...) as symbols; they are not code
+CONFIG_EXT = (".json", ".yaml", ".yml", ".toml", ".lock", ".ini", ".cfg", ".env", ".csv", ".md")
+CONTEXT_EDGES = 30
+CONTEXT_CHARS = 4000
 
 
 def stable_frac(*parts: str) -> float:
@@ -96,6 +103,12 @@ class RepoGraph:
             else:
                 self.train_edges.append(e)
         self._index(self.train_edges)
+        # full view (train + held-out): only ever used to render oracle retrieval context for evals
+        self.full_out = defaultdict(list)
+        self.full_inc = defaultdict(list)
+        for e in self.train_edges + self.heldout_edges:
+            self.full_out[e["source"]].append((e.get("relation", ""), e["target"]))
+            self.full_inc[e["target"]].append((e.get("relation", ""), e["source"]))
 
     def _index(self, edges: list[dict]) -> None:
         self.out = defaultdict(list)
@@ -155,6 +168,8 @@ class RepoGraph:
             return "rationale"
         if ft == "concept":
             return "concept"
+        if (n.get("source_file") or "").lower().endswith(CONFIG_EXT):
+            return "config"
         if n.get("_callable_class"):
             return "class"
         if nid in self.contains or n.get("label") == n.get("source_file"):
@@ -168,6 +183,26 @@ class RepoGraph:
         n = self.nodes[nid]
         f, loc = n.get("source_file") or "", n.get("source_location") or ""
         return f"{f}:{loc}" if f and loc else f or "(unknown file)"
+
+    def context(self, ids: list[str], focus: list[str] | None = None) -> str:
+        """Oracle retrieval: the 1-hop neighbourhood of each node in the FULL graph, as compact lines.
+        This is what a perfect graph lookup would hand the model; the *_ctx eval arms use it.
+        Edges whose other end is one of `ids`/`focus` are rendered first, so the cap can never
+        drop the very edge a question is about (a hub with 32 callees did exactly that)."""
+        prio = set(ids) | set(focus or ())
+        lines = [f"Graph excerpt from {self.repo}:"]
+        for nid in ids:
+            if nid not in self.nodes:
+                continue
+            lines.append(f"`{self.name(nid)}` [{self.kind(nid)}] {self.where(nid)}")
+            outs = sorted(self.full_out.get(nid, []), key=lambda rt: rt[1] not in prio)
+            for rel, t in outs[:CONTEXT_EDGES]:
+                lines.append(f"  -> {rel} `{self.name(t)}` ({self.where(t)})")
+            incs = sorted(self.full_inc.get(nid, []), key=lambda rs: rs[1] not in prio)
+            for rel, s_ in incs[:CONTEXT_EDGES]:
+                lines.append(f"  <- {rel} `{self.name(s_)}` ({self.where(s_)})")
+        text = "\n".join(lines)
+        return text[:CONTEXT_CHARS]
 
     def novelty(self, nid: str) -> float:
         if self.novel is None:
@@ -429,6 +464,7 @@ def eval_records(g: RepoGraph, rng: random.Random, n_per_repo: int, train_ids: s
         verb = {"calls": "call", "indirect_call": "call", "references": "reference"}.get(rel, "import")
         rid = hashlib.sha256(f"{repo}|yn|{s}|{t}|{rel}|{truth}".encode()).hexdigest()[:16]
         bucket.append({"id": rid, "kind": f"yn_{kind_label}", "repo": repo, "relation": rel,
+                       "nodes": [s, t], "context": g.context([s], focus=[t]),
                        "user": f"In {repo}, does `{g.name(s)}` {verb} `{g.name(t)}`? Answer yes or no.",
                        "truth": "yes" if truth else "no"})
 
@@ -443,7 +479,7 @@ def eval_records(g: RepoGraph, rng: random.Random, n_per_repo: int, train_ids: s
     rng.shuffle(syms)
     for nid in syms[:n_per_repo // 2]:
         rid = hashlib.sha256(f"{repo}|deffile|{nid}".encode()).hexdigest()[:16]
-        seen.append({"id": rid, "kind": "define_file", "repo": repo,
+        seen.append({"id": rid, "kind": "define_file", "repo": repo, "nodes": [nid], "context": g.context([nid]),
                      "user": f"Which file in {repo} defines `{g.name(nid)}`?",
                      "truth": g.nodes[nid]["source_file"]})
 
@@ -461,7 +497,7 @@ def eval_records(g: RepoGraph, rng: random.Random, n_per_repo: int, train_ids: s
     for s, held_t in list(by_src.items())[: n_per_repo // 2]:
         full = sorted({t for r, t in g.out[s] if r in CALL_RELATIONS} | set(held_t))
         rid = hashlib.sha256(f"{repo}|calllist|{s}".encode()).hexdigest()[:16]
-        unseen.append({"id": rid, "kind": "callees_list", "repo": repo,
+        unseen.append({"id": rid, "kind": "callees_list", "repo": repo, "nodes": [s], "context": g.context([s]),
                        "user": f"In {repo}, list everything `{g.name(s)}` calls.",
                        "truth": [g.name(t) for t in full], "held_out": [g.name(t) for t in held_t]})
     return seen, unseen

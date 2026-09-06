@@ -31,12 +31,14 @@ def graph_a():
              node("src_util", "src/util.rs", "src/util.rs"), node("fmt", "format_row", "src/util.rs", "L5"),
              node("log", "log_line", "src/util.rs", "L9"), node("cfg", "Config", "src/cfg.rs", "L2", _callable=True, _callable_class=True),
              {"id": "r1", "label": "WHY: parse before run so flags gate the loop.", "file_type": "rationale",
-              "source_file": "src/main.rs", "source_location": "L19"}]
+              "source_file": "src/main.rs", "source_location": "L19"},
+             node("tsconfig", "tsconfig.json", "tsconfig.json"), node("isolated", "isolatedModules", "tsconfig.json", "L4")]
     links = [edge("src_main", "main", "contains"), edge("src_main", "parse", "contains"), edge("src_main", "run", "contains"),
              edge("src_util", "fmt", "contains"), edge("src_util", "log", "contains"),
              edge("main", "parse", "calls"), edge("main", "run", "calls"), edge("run", "fmt", "calls"),
              edge("run", "log", "calls"), edge("fmt", "log", "calls"), edge("parse", "cfg", "references"),
-             edge("src_main", "src_util", "imports_from"), edge("r1", "parse", "rationale_for")]
+             edge("src_main", "src_util", "imports_from"), edge("r1", "parse", "rationale_for"),
+             edge("tsconfig", "isolated", "contains"), edge("isolated", "parse", "references")]
     for i in range(30):  # bulk so a 10% hold-out is non-empty
         nodes.append(node(f"h{i}", f"helper_{i}", "src/util.rs", f"L{100 + i}"))
         links.append(edge("src_util", f"h{i}", "contains"))
@@ -121,6 +123,39 @@ def test_scramble_and_determinism(tmp):
     assert changed >= len(r1["train"]) // 4, f"scramble changed only {changed}/{len(r1['train'])}"
 
 
+def test_eval_context_and_config_filter(tmp):
+    res = run(tmp, "o5")
+    for u in res["eval_unseen"]:
+        assert u.get("nodes") and u.get("context", "").startswith("Graph excerpt"), u
+        if u["kind"] == "yn_unseen" and u["truth"] == "yes":
+            b = u["user"].split("`")[3]
+            assert f"`{b}`" in u["context"], ("oracle context lacks the held-out fact", u["user"])
+    texts = " ".join(r["messages"][1]["content"] for r in res["train"]) + " ".join(u["user"] for u in res["eval_seen"])
+    assert "isolatedModules" not in texts and "tsconfig.json" not in texts, "config keys leaked into records/evals"
+
+
+def test_eval_scoring():
+    sys.path.insert(0, os.path.dirname(__file__))
+    import eval_graph as eg
+    assert eg.score_yn("Yes, it calls it.", "yes")["correct"] == 1
+    assert eg.score_yn("No.", "yes")["correct"] == 0
+    assert eg.score_yn("It is unclear.", "no")["unparsed"] == 1
+    assert eg.score_define_file("It lives in src/main.rs at L3", "src/main.rs")["correct"] == 1
+    d = eg.score_define_file("in main.rs", "src/main.rs")
+    assert d["correct"] == 0 and d["basename"] == 1
+    c = eg.score_callees("`run_loop` calls `format_row()`, `log_line` and `nope`.", ["format_row", "log_line()", "x"],
+                         ["log_line"], subject="run_loop")
+    assert abs(c["precision"] - 2 / 3) < 1e-9 and abs(c["recall"] - 2 / 3) < 1e-9 and c["heldout_recall"] == 1.0, c
+    row = {"kind": "callees_list", "user": "In r, list everything `run_loop` calls.", "truth": ["a", "b"], "held_out": ["b"]}
+    assert eg.score(row, "`run_loop` calls `a` and `b`.")["f1"] == 1.0
+    rows = [{"id": f"{i}", "kind": "yn_seen", "truth": "yes" if i % 2 else "no"} for i in range(40)]
+    sub = eg.subsample(rows, 10)
+    assert len(sub) == 10 and sum(r["truth"] == "yes" for r in sub) == 5
+    agg = eg.aggregate([{"arm": "a", "kind": "yn_seen", "score": eg.score_yn("yes", "yes")},
+                        {"arm": "a", "kind": "yn_seen", "score": eg.score_yn("no", "yes")}])
+    assert agg["a"]["yn_seen"]["accuracy"] == 0.5 and agg["a"]["yn_seen"]["n"] == 2
+
+
 def test_is_core():
     assert sg.is_core("NickFlach/kannaka-memory") and sg.is_core("NickFlach/Agent-Kax") and sg.is_core("NickFlach/0xSCADA")
     assert not sg.is_core("NickFlach/llmfit") and not sg.is_core("NickFlach/voicebox")
@@ -130,11 +165,14 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         setup(tmp)
-        for t in (test_shape_and_weights, test_holdout_never_leaks, test_scramble_and_determinism):
+        for t in (test_shape_and_weights, test_holdout_never_leaks, test_scramble_and_determinism,
+                  test_eval_context_and_config_filter):
             t(tmp)
             print("ok", t.__name__)
         test_is_core()
         print("ok test_is_core")
+        test_eval_scoring()
+        print("ok test_eval_scoring")
     print("all serialize_graph tests passed")
 
 
