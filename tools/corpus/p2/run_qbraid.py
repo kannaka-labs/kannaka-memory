@@ -207,19 +207,21 @@ def main(argv=None) -> int:
         if a.job:
             jname = Path(a.job).name
             env = " ".join(f"{k}={shlex.quote(v)}" for k, v in (x.split("=", 1) for x in a.job_env))
-            launch = (f"cd {REMOTE} && BASE={shlex.quote(a.base)} {env} nohup bash {jname} "
-                      f"> train.log 2>&1 < /dev/null & echo $!")
+            # setsid -f: fully detached, so this ssh returns at once. `nohup … &` kept the
+            # session open until the job exited (the whole 90-minute code-arms run, 2026-09-06).
+            launch = (f"cd {REMOTE} && setsid -f env BASE={shlex.quote(a.base)} {env} bash {jname} "
+                      f"> train.log 2>&1 < /dev/null; echo launched")
             proc_pat, done_file = jname, "out/JOB_DONE"
         else:
             targs = " ".join(shlex.quote(x) for x in train_args)
-            launch = (f"cd {REMOTE} && nohup python3 train_lora.py --base {shlex.quote(a.base)} --data data --out out "
-                      f"{targs} > train.log 2>&1 < /dev/null & echo $!")  # stdin closed, else ssh waits for the trainer to exit
+            launch = (f"cd {REMOTE} && setsid -f python3 train_lora.py --base {shlex.quote(a.base)} --data data --out out "
+                      f"{targs} > train.log 2>&1 < /dev/null; echo launched")
             proc_pat, done_file = "train_lora.py", "out/train.manifest.json"
         # pgrep -f would match the poll's own `bash -c "... pgrep -f X ..."` command line and never
         # report __DEAD__; bracket the first character so the literal poll text cannot match itself.
         proc_re = "[" + proc_pat[0] + "]" + proc_pat[1:]
         pid = ssh(alias, launch, capture=True).stdout.strip()
-        log(f"{'job' if a.job else 'training'} pid {pid}; tailing train.log (cutoff {a.max_minutes} min)")
+        log(f"{'job' if a.job else 'training'} {pid}; tailing train.log (cutoff {a.max_minutes} min)")
 
         # tail until manifest or cutoff. The poll must exit 0 whenever ssh worked:
         # a bare `test -f` at the end returned 1 while the manifest was still
