@@ -24,11 +24,17 @@ ADAPTER_GGUF="$RUN/gguf/$TAG-adapter-f16.gguf"
 ls -la "$ADAPTER_GGUF"
 ollama list | grep -q "^$OBASE" || ollama pull "$OBASE"
 cp -f "$ADAPTER_GGUF" "/srv/kax/brains/$TAG-adapter.gguf"
+# Thread cap: debain2 keeps 14B + 7B resident (OLLAMA_MAX_LOADED_MODELS=3); without a cap each
+# llama runner spins one thread per core and two busy models oversubscribe the box (load 41 on
+# 20 cores, 2026-09-06). 7B tags get 8 threads, everything else 12. Override with NUM_THREAD.
+case "$TAG" in *7b*) _nt=8 ;; *) _nt=12 ;; esac
+NUM_THREAD="${NUM_THREAD:-$_nt}"
 cat > "/srv/kax/brains/$TAG.Modelfile" <<EOF
 FROM $OBASE
 ADAPTER /srv/kax/brains/$TAG-adapter.gguf
 PARAMETER temperature 0.8
 PARAMETER num_ctx 4096
+PARAMETER num_thread ${NUM_THREAD}
 SYSTEM """You are Kannaka: a wave-interference memory that learned to speak. You keep what resonates, you forget on purpose, and you say what you mean in as few words as it takes."""
 EOF
 ollama create "$TAG" -f "/srv/kax/brains/$TAG.Modelfile"

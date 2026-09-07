@@ -82,6 +82,11 @@ def main(argv=None) -> int:
     ap.add_argument("--instance", default=None, help="reuse an existing (stopped) instance id")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the cost ceiling; provision nothing")
     ap.add_argument("train_args", nargs=argparse.REMAINDER, help="passed to train_lora.py after --")
+    ap.add_argument("--job", default=None,
+                    help="pod-side bash script run INSTEAD of train_lora.py (shipped next to it; --data is shipped "
+                         "recursively; BASE is exported; the wait ends at out/JOB_DONE). E.g. code_arms.sh")
+    ap.add_argument("--job-env", action="append", default=[], help="KEY=VALUE exported to the job (repeatable)")
+    ap.add_argument("--ship", action="append", default=[], help="extra file shipped next to the trainer (repeatable)")
     a = ap.parse_args(argv)
     train_args = [x for x in a.train_args if x != "--"]
 
@@ -161,9 +166,14 @@ def main(argv=None) -> int:
             time.sleep(10)
         ssh(alias, f"mkdir -p {REMOTE}/data {REMOTE}/out")
         sh(["scp", "-q", "-o", "BatchMode=yes", str(HERE / "train_lora.py"), f"{alias}:{REMOTE}/"])
-        for f in ("train.jsonl", "holdout.jsonl"):
-            sh(["scp", "-q", "-o", "BatchMode=yes", str(Path(a.data) / f), f"{alias}:{REMOTE}/data/"])
-        log("shipped trainer + data")
+        for extra in list(a.ship) + ([a.job] if a.job else []):
+            sh(["scp", "-q", "-o", "BatchMode=yes", str(extra), f"{alias}:{REMOTE}/"])
+        if a.job:  # a job owns its data layout: ship the whole directory
+            sh(["scp", "-q", "-r", "-o", "BatchMode=yes", str(Path(a.data)) + "/.", f"{alias}:{REMOTE}/data/"])
+        else:
+            for f in ("train.jsonl", "holdout.jsonl"):
+                sh(["scp", "-q", "-o", "BatchMode=yes", str(Path(a.data) / f), f"{alias}:{REMOTE}/data/"])
+        log("shipped trainer + data" + (f" + job {Path(a.job).name}" if a.job else ""))
 
         # 4. bootstrap + launch
         # With --merge --gguf the pod also merges + quantizes (train_lora.py). A 14B merge
@@ -194,11 +204,24 @@ def main(argv=None) -> int:
             dest.mkdir(parents=True, exist_ok=True)
             sh(["scp", "-q", "-o", "BatchMode=yes", f"{alias}:{REMOTE}/bootstrap.log", str(dest)], check=False)
             return 6
-        targs = " ".join(shlex.quote(x) for x in train_args)
-        launch = (f"cd {REMOTE} && nohup python3 train_lora.py --base {shlex.quote(a.base)} --data data --out out "
-                  f"{targs} > train.log 2>&1 < /dev/null & echo $!")  # stdin closed, else ssh waits for the trainer to exit
+        if a.job:
+            jname = Path(a.job).name
+            env = " ".join(f"{k}={shlex.quote(v)}" for k, v in (x.split("=", 1) for x in a.job_env))
+            # setsid -f: fully detached, so this ssh returns at once. `nohup … &` kept the
+            # session open until the job exited (the whole 90-minute code-arms run, 2026-09-06).
+            launch = (f"cd {REMOTE} && setsid -f env BASE={shlex.quote(a.base)} {env} bash {jname} "
+                      f"> train.log 2>&1 < /dev/null; echo launched")
+            proc_pat, done_file = jname, "out/JOB_DONE"
+        else:
+            targs = " ".join(shlex.quote(x) for x in train_args)
+            launch = (f"cd {REMOTE} && setsid -f python3 train_lora.py --base {shlex.quote(a.base)} --data data --out out "
+                      f"{targs} > train.log 2>&1 < /dev/null; echo launched")
+            proc_pat, done_file = "train_lora.py", "out/train.manifest.json"
+        # pgrep -f would match the poll's own `bash -c "... pgrep -f X ..."` command line and never
+        # report __DEAD__; bracket the first character so the literal poll text cannot match itself.
+        proc_re = "[" + proc_pat[0] + "]" + proc_pat[1:]
         pid = ssh(alias, launch, capture=True).stdout.strip()
-        log(f"training pid {pid}; tailing train.log (cutoff {a.max_minutes} min)")
+        log(f"{'job' if a.job else 'training'} {pid}; tailing train.log (cutoff {a.max_minutes} min)")
 
         # tail until manifest or cutoff. The poll must exit 0 whenever ssh worked:
         # a bare `test -f` at the end returned 1 while the manifest was still
@@ -207,8 +230,8 @@ def main(argv=None) -> int:
         lost = 0
         while True:
             poll = (f"tail -c +{last + 1} {REMOTE}/train.log | head -c 20000; "
-                    f"if [ -f {REMOTE}/out/train.manifest.json ]; then echo __DONE__; "
-                    f"elif ! pgrep -f train_lora.py >/dev/null; then echo __DEAD__; fi; true")
+                    f"if [ -f {REMOTE}/{done_file} ]; then echo __DONE__; "
+                    f"elif ! pgrep -f {shlex.quote(proc_re)} >/dev/null; then echo __DEAD__; fi; true")
             r = ssh(alias, poll, check=False, capture=True, timeout=90)
             if r.returncode != 0:
                 lost += 1
@@ -231,7 +254,7 @@ def main(argv=None) -> int:
                 sys.stdout.flush()
                 last += len(chunk.encode())
             if done:
-                log("train.manifest.json present")
+                log(f"{done_file} present")
                 break
             if dead:
                 log("training process exited WITHOUT a manifest — see train.log above")
@@ -244,7 +267,10 @@ def main(argv=None) -> int:
         # 5. fetch
         dest = Path(a.fetch_to) / run_name
         dest.mkdir(parents=True, exist_ok=True)
-        for item in ("out/train.manifest.json", "out/samples.json", "train.log", "bootstrap.log", "out/adapter", "out/gguf"):
+        items = ("out/train.manifest.json", "out/samples.json", "train.log", "bootstrap.log", "out/adapter", "out/gguf")
+        if a.job:  # a job's outputs live in named subdirs (code_arms.sh: real/, scr/, eval*/, arms.json)
+            items = ("train.log", "bootstrap.log", "out/arms.json", "out/eval_stage1", "out/eval", "out/real", "out/scr")
+        for item in items:
             sh(["scp", "-q", "-r", "-o", "BatchMode=yes", f"{alias}:{REMOTE}/{item}", str(dest)], check=False)
         log(f"fetched to {dest}: {sorted(p.name for p in dest.iterdir())}")
     finally:
