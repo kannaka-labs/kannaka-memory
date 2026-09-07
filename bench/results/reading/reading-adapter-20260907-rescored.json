@@ -1,0 +1,114 @@
+{
+ "base_ctx": {
+  "callees_list": {
+   "n": 60,
+   "f1": 0.7984,
+   "precision": 0.7472,
+   "recall": 0.951,
+   "heldout_recall": null
+  },
+  "define_file": {
+   "n": 60,
+   "accuracy": 0.7667,
+   "ci95": 0.107,
+   "basename_accuracy": 0.8,
+   "fabrication_rate": 0.2
+  },
+  "yn_seen": {
+   "n": 60,
+   "accuracy": 1.0,
+   "ci95": 0.0,
+   "unparsed": 0.0
+  },
+  "yn_unseen": {
+   "n": 60,
+   "accuracy": 0.9833,
+   "ci95": 0.0324,
+   "unparsed": 0.0
+  }
+ },
+ "real_ctx": {
+  "callees_list": {
+   "n": 60,
+   "f1": 0.974,
+   "precision": 0.9944,
+   "recall": 0.9655,
+   "heldout_recall": null
+  },
+  "define_file": {
+   "n": 60,
+   "accuracy": 0.9833,
+   "ci95": 0.0324,
+   "basename_accuracy": 0.9833,
+   "fabrication_rate": 0.0167
+  },
+  "yn_seen": {
+   "n": 60,
+   "accuracy": 1.0,
+   "ci95": 0.0,
+   "unparsed": 0.0
+  },
+  "yn_unseen": {
+   "n": 60,
+   "accuracy": 1.0,
+   "ci95": 0.0,
+   "unparsed": 0.0
+  }
+ },
+ "base_alone": {
+  "callees_list": {
+   "n": 60,
+   "f1": 0.0,
+   "precision": 0.0,
+   "recall": 0.0,
+   "heldout_recall": null
+  },
+  "define_file": {
+   "n": 60,
+   "accuracy": 0.0833,
+   "ci95": 0.0699,
+   "basename_accuracy": 0.1167,
+   "fabrication_rate": 0.2
+  },
+  "yn_seen": {
+   "n": 60,
+   "accuracy": 0.5,
+   "ci95": 0.1265,
+   "unparsed": 0.0
+  },
+  "yn_unseen": {
+   "n": 60,
+   "accuracy": 0.5,
+   "ci95": 0.1265,
+   "unparsed": 0.0
+  }
+ },
+ "real_alone": {
+  "callees_list": {
+   "n": 60,
+   "f1": 0.0,
+   "precision": 0.0,
+   "recall": 0.0,
+   "heldout_recall": null
+  },
+  "define_file": {
+   "n": 60,
+   "accuracy": 0.2667,
+   "ci95": 0.1119,
+   "basename_accuracy": 0.3,
+   "fabrication_rate": 0.0167
+  },
+  "yn_seen": {
+   "n": 60,
+   "accuracy": 0.4667,
+   "ci95": 0.1262,
+   "unparsed": 0.11666666666666667
+  },
+  "yn_unseen": {
+   "n": 60,
+   "accuracy": 0.45,
+   "ci95": 0.1259,
+   "unparsed": 0.1
+  }
+ }
+}

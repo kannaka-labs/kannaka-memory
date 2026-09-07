@@ -35,9 +35,35 @@ SYSTEM = ("You are Kannaka's archivist: you answer questions about the constella
 
 # ---- scoring (pure) ---------------------------------------------------------
 
+#: Phrases a model uses to refuse when the excerpt does not carry the answer. Matched before any
+#: other scoring: a refusal is the RIGHT answer to an unanswerable question and a wrong one otherwise.
+REFUSAL_RE = re.compile(
+    r"\b(?:not (?:in|recorded|listed|present|included|shown|available|found)"
+    r"|no record|nothing recorded|cannot (?:determine|say|tell)|can't (?:determine|say|tell)"
+    r"|do(?:es)? not (?:appear|contain)|isn't in|is not in|not part of)\b", re.I)
+#: Explicit negation/affirmation, for answers that state the fact in prose instead of "Yes."/"No."
+_NEG_RE = re.compile(r"\b(?:does not|doesn't|do not|don't|is not|isn't|are not|aren't|never|no direct)\b", re.I)
+_AFF_RE = re.compile(r"\b(?:yes|it does|does (?:call|import|reference)|indeed)\b", re.I)
+
+
+def is_refusal(answer: str) -> bool:
+    """True when the answer declines to state a fact rather than asserting one."""
+    return bool(REFUSAL_RE.search(answer or ""))
+
+
 def parse_yn(answer: str) -> str | None:
-    m = re.search(r"\b(yes|no)\b", answer.strip().lower())
-    return m.group(1) if m else None
+    """yes / no / None. A bare token wins; otherwise explicit prose negation or affirmation counts,
+    because "`x.tsx` does not import `y`" is an answer, not a non-answer. Ambiguity stays None."""
+    a = (answer or "").strip().lower()
+    m = re.search(r"\b(yes|no)\b", a)
+    if m:
+        return m.group(1)
+    neg, aff = _NEG_RE.search(a), _AFF_RE.search(a)
+    if neg and not aff:
+        return "no"
+    if aff and not neg:
+        return "yes"
+    return None
 
 
 def score_yn(answer: str, truth: str) -> dict:
@@ -46,10 +72,16 @@ def score_yn(answer: str, truth: str) -> dict:
 
 
 def score_define_file(answer: str, truth: str) -> dict:
-    a = answer.replace("\\", "/")
+    """truth "not recorded" marks a question the excerpt cannot answer: refusing is correct and
+    naming any file is a fabrication. Otherwise the truth path must appear."""
+    a = (answer or "").replace("\\", "/")
+    refused = is_refusal(a)
+    if truth == "not recorded":
+        return {"correct": int(refused), "basename": int(refused), "got": "refusal" if refused else "fabrication",
+                "fabricated": int(not refused)}
     base = truth.rsplit("/", 1)[-1]
     strict = int(truth in a)
-    return {"correct": strict, "basename": int(strict or (base in a)), "got": None}
+    return {"correct": strict, "basename": int(strict or (base in a)), "got": None, "fabricated": 0}
 
 
 def norm_name(n: str) -> str:
@@ -106,6 +138,9 @@ def aggregate(rows: list[dict]) -> dict:
                 d["unparsed"] = sum(s["unparsed"] for s in scs) / n
             else:
                 d["basename_accuracy"] = round(sum(s["basename"] for s in scs) / n, 4)
+                fab = [s.get("fabricated") for s in scs if s.get("fabricated") is not None]
+                if fab:
+                    d["fabrication_rate"] = round(sum(fab) / len(fab), 4)
         else:
             f1 = sum(s["f1"] for s in scs) / n
             ho = [s["heldout_recall"] for s in scs if s["heldout_recall"] is not None]
@@ -159,17 +194,35 @@ def table(results: dict) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base", required=True)
+    ap.add_argument("--base", default=None)
     ap.add_argument("--adapter", action="append", default=[], help="name=path (repeatable)")
-    ap.add_argument("--evals", nargs="+", required=True, help="eval_seen.jsonl eval_unseen.jsonl ...")
-    ap.add_argument("--arms", nargs="+", required=True)
+    ap.add_argument("--evals", nargs="+", default=[], help="eval_seen.jsonl eval_unseen.jsonl ...")
+    ap.add_argument("--arms", nargs="+", default=[])
     ap.add_argument("--n-per-kind", type=int, default=60)
     ap.add_argument("--max-new-tokens", type=int, default=96)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
     ap.add_argument("--system", default=SYSTEM)
+    ap.add_argument("--rescore", type=Path, default=None,
+                    help="re-aggregate a saved rows.jsonl with the CURRENT scorer; no model, no cost")
     a = ap.parse_args(argv)
 
+    if a.rescore:
+        saved = [json.loads(l) for l in a.rescore.read_text(encoding="utf-8").splitlines() if l.strip()]
+        for r in saved:
+            r["score"] = score(r, r["answer"])
+        out = Path(a.out)
+        out.mkdir(parents=True, exist_ok=True)
+        results = aggregate(saved)
+        (out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+        with (out / "rows.jsonl").open("w", encoding="utf-8") as f:
+            for r in saved:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(table(results), flush=True)
+        return 0
+
+    if not (a.base and a.evals and a.arms):
+        ap.error("--base, --evals and --arms are required unless --rescore is given")
     rows = []
     for f in a.evals:
         rows += [json.loads(l) for l in Path(f).read_text(encoding="utf-8").splitlines() if l.strip()]
