@@ -90,7 +90,7 @@ def build(graphs_dir: Path, out: Path) -> dict:
 # ---------------------------------------------------------------- query
 
 _IDENT = re.compile(r"`([^`]{2,80})`")
-_CODEISH = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|[a-z0-9]+_[a-z0-9_]+|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*|[\w./-]+\.(?:py|rs|ts|tsx|js|mjs|sh|go|c|h|toml|yaml|yml|sql))\b")
+_CODEISH = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|[A-Za-z0-9]+_[A-Za-z0-9_]+|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*|[\w./-]+\.(?:py|rs|ts|tsx|js|mjs|sh|go|c|h|toml|yaml|yml|sql))\b")
 STOP = {"what", "does", "call", "calls", "where", "which", "file", "defines", "define", "the", "in", "of", "and",
         "for", "how", "is", "are", "to", "a", "an", "it", "this", "that", "list", "everything", "repo", "code"}
 
