@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly code-graph corpus refresh
+
+[Timer]
+# 03:20 local, off the hour so it does not collide with the other nightly jobs on this box.
+OnCalendar=*-*-* 03:20:00
+# A box that was asleep still gets its refresh rather than silently skipping a day.
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

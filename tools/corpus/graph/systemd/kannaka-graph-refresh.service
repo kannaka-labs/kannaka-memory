@@ -1,0 +1,29 @@
+# Nightly refresh of the code-graph corpus + the index the Archivist reads.
+# Install on the box that holds ~/graphify-corpus (debain2):
+#   sudo cp kannaka-graph-refresh.{service,timer} /etc/systemd/system/
+#   sudo systemctl enable --now kannaka-graph-refresh.timer
+#   systemctl list-timers kannaka-graph-refresh    # next run
+#   journalctl -u kannaka-graph-refresh -n 40      # last run
+[Unit]
+Description=Refresh the Kannaka code-graph corpus and rebuild its index
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nick
+WorkingDirectory=/home/nick/graphify-corpus
+Environment=PATH=/home/nick/.local/bin:/usr/local/bin:/usr/bin:/bin
+# --jobs 4 x --workers 4 keeps the box usable: the citizens and the gateway share these cores,
+# and an uncapped extraction pushed debain2 to load 41 once already.
+ExecStart=/usr/bin/python3 /home/nick/graphify-corpus/refresh_corpus.py \
+    --root /home/nick/graphify-corpus \
+    --builder /home/nick/graphify-corpus/graph_index.py \
+    --jobs 4 --workers 4
+# The index swap is atomic, so a killed refresh leaves the previous index serving.
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
