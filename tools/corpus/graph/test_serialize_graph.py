@@ -155,6 +155,22 @@ def test_eval_scoring():
                         {"arm": "a", "kind": "yn_seen", "score": eg.score_yn("no", "yes")}])
     assert agg["a"]["yn_seen"]["accuracy"] == 0.5 and agg["a"]["yn_seen"]["n"] == 2
 
+    # prose negation is an answer, not a non-answer (2026-09-07: it scored as unparsed)
+    assert eg.parse_yn("`checkbox.tsx` does not import `.saveTransaction()`.") == "no"
+    assert eg.parse_yn("It does call it, at line 12.") == "yes"
+    assert eg.parse_yn("The relationship is unclear from this excerpt.") is None
+
+    # a refusal and a fabrication must not score alike on an unanswerable question
+    refusal = "`.lock_funds()` is not in the graph I was given; I cannot determine which file."
+    fabrication = "The method `.lock_funds()` is defined in the file `src/agent.py`."
+    assert eg.is_refusal(refusal) and not eg.is_refusal(fabrication)
+    assert eg.score_define_file(refusal, "not recorded")["correct"] == 1
+    assert eg.score_define_file(fabrication, "not recorded")["correct"] == 0
+    assert eg.score_define_file(fabrication, "not recorded")["fabricated"] == 1
+    # a real question is unaffected: the truth path must still appear
+    assert eg.score_define_file("it lives in src/main.rs", "src/main.rs")["correct"] == 1
+    assert eg.score_define_file(refusal, "src/main.rs")["correct"] == 0
+
 
 def test_is_core():
     assert sg.is_core("NickFlach/kannaka-memory") and sg.is_core("NickFlach/Agent-Kax") and sg.is_core("NickFlach/0xSCADA")

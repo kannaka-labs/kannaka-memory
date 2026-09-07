@@ -1,0 +1,141 @@
+{
+ "status": "complete",
+ "elapsed_min": 27,
+ "base": "Qwen/Qwen2.5-7B-Instruct",
+ "real": {
+  "base": "Qwen/Qwen2.5-7B-Instruct",
+  "train": 2861,
+  "holdout": 139,
+  "lora": {
+   "r": 16,
+   "alpha": 32
+  },
+  "epochs": 2.0,
+  "max_steps": -1,
+  "lr": 0.0001,
+  "qlora": true,
+  "holdout_loss": {
+   "before": 3.6050039701324574,
+   "after": 0.3584050557060207
+  },
+  "holdout_ppl": {
+   "before": 36.78182988569097,
+   "after": 1.4310451561059223
+  },
+  "seconds": 1351,
+  "adapter": "out/real/adapter",
+  "cuda": true,
+  "dpo": null,
+  "device": "NVIDIA A100-SXM4-80GB"
+ },
+ "eval": {
+  "base_ctx": {
+   "callees_list": {
+    "n": 60,
+    "f1": 0.7984,
+    "precision": 0.7472,
+    "recall": 0.951,
+    "heldout_recall": 0.875
+   },
+   "define_file": {
+    "n": 60,
+    "accuracy": 0.6833,
+    "ci95": 0.1177,
+    "basename_accuracy": 0.7167
+   },
+   "yn_seen": {
+    "n": 60,
+    "accuracy": 1.0,
+    "ci95": 0.0,
+    "unparsed": 0.0
+   },
+   "yn_unseen": {
+    "n": 60,
+    "accuracy": 0.9833,
+    "ci95": 0.0324,
+    "unparsed": 0.0
+   }
+  },
+  "real_ctx": {
+   "callees_list": {
+    "n": 60,
+    "f1": 0.974,
+    "precision": 0.9944,
+    "recall": 0.9655,
+    "heldout_recall": 0.9333
+   },
+   "define_file": {
+    "n": 60,
+    "accuracy": 0.7167,
+    "ci95": 0.114,
+    "basename_accuracy": 0.7167
+   },
+   "yn_seen": {
+    "n": 60,
+    "accuracy": 0.9833,
+    "ci95": 0.0324,
+    "unparsed": 0.016666666666666666
+   },
+   "yn_unseen": {
+    "n": 60,
+    "accuracy": 0.9333,
+    "ci95": 0.0631,
+    "unparsed": 0.06666666666666667
+   }
+  },
+  "base_alone": {
+   "callees_list": {
+    "n": 60,
+    "f1": 0.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "heldout_recall": 0.0
+   },
+   "define_file": {
+    "n": 60,
+    "accuracy": 0.0,
+    "ci95": 0.0,
+    "basename_accuracy": 0.0333
+   },
+   "yn_seen": {
+    "n": 60,
+    "accuracy": 0.5,
+    "ci95": 0.1265,
+    "unparsed": 0.0
+   },
+   "yn_unseen": {
+    "n": 60,
+    "accuracy": 0.5,
+    "ci95": 0.1265,
+    "unparsed": 0.0
+   }
+  },
+  "real_alone": {
+   "callees_list": {
+    "n": 60,
+    "f1": 0.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "heldout_recall": 0.0
+   },
+   "define_file": {
+    "n": 60,
+    "accuracy": 0.0,
+    "ci95": 0.0,
+    "basename_accuracy": 0.0333
+   },
+   "yn_seen": {
+    "n": 60,
+    "accuracy": 0.3,
+    "ci95": 0.116,
+    "unparsed": 0.3333333333333333
+   },
+   "yn_unseen": {
+    "n": 60,
+    "accuracy": 0.2667,
+    "ci95": 0.1119,
+    "unparsed": 0.3333333333333333
+   }
+  }
+ }
+}
