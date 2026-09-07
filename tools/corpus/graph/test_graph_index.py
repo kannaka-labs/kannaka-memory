@@ -22,8 +22,8 @@ def node(nid, label, f, loc="L1", **kw):
     return {"id": nid, "label": label, "file_type": "code", "source_file": f, "source_location": loc, **kw}
 
 
-def edge(s, t, rel):
-    return {"source": s, "target": t, "relation": rel}
+def edge(s, t, rel, conf="EXTRACTED"):
+    return {"source": s, "target": t, "relation": rel, "confidence": conf}
 
 
 def graph(repo_tag):
@@ -34,7 +34,8 @@ def graph(repo_tag):
              {"id": "r1", "label": "WHY: parse before run.", "file_type": "rationale", "source_file": "src/main.rs", "source_location": "L19"}]
     links = [edge("src_main", "main", "contains"), edge("src_main", "parse", "contains"), edge("src_main", "run", "contains"),
              edge("main", "parse", "calls"), edge("main", "run", "calls"), edge("run", "fmt", "calls"),
-             edge("r1", "parse", "rationale_for"), edge("tsconfig", "isolated", "contains")]
+             edge("r1", "parse", "rationale_for"), edge("tsconfig", "isolated", "contains"),
+             edge("main", "fmt", "references", conf="INFERRED")]
     return {"directed": False, "nodes": nodes, "links": links, "built_at_commit": repo_tag}
 
 
@@ -93,6 +94,28 @@ def main():
         assert len(short) <= 121, len(short)
         db.close()
 
+        # resolve: the typed component query KannakaHDL asks (facts, not invented scores)
+        db2 = sqlite3.connect(str(out))
+        hits = gi.resolve(db2, "run_loop")
+        assert hits and hits[0]["label"] == "run_loop"
+        assert {h["repo"] for h in hits} == {"NickFlach/kannaka-thing", "NickFlach/other-thing"}
+        assert hits[0]["id"].startswith("NickFlach/") and "src/main.rs:L40" in hits[0]["id"]
+        assert hits[0]["in_degree"] == 1 and hits[0]["out_degree"] == 1
+        # material narrows to one repo, tolerantly (bare name or full name)
+        assert len(gi.resolve(db2, "run_loop", repo="kannaka-thing")) == 1
+        assert len(gi.resolve(db2, "run_loop", repo="NickFlach/kannaka-thing")) == 1
+        assert gi.resolve(db2, "run_loop", repo="no-such-repo") == []
+        # type narrows by kind; a file is not a symbol
+        assert gi.resolve(db2, "src/main.rs", kind="symbol") == []
+        assert gi.resolve(db2, "src/main.rs", kind="file")[0]["kind"] == "file"
+        # confidence is carried so a caller can weigh EXTRACTED against INFERRED
+        assert gi.has_confidence(db2)
+        fmt = gi.resolve(db2, "format_row", repo="kannaka-thing")[0]
+        assert fmt["extracted"] == 1 and fmt["inferred"] == 1, fmt
+        # config keys are never components
+        assert gi.resolve(db2, "isolatedModules") == []
+        db2.close()
+
         # CLI: exit 3 when nothing is recorded, 0 with text otherwise
         here = os.path.join(os.path.dirname(__file__), "graph_index.py")
         r = subprocess.run([sys.executable, here, "query", "--index", str(out), "`nothing_like_this`"], capture_output=True, text=True)
@@ -101,6 +124,14 @@ def main():
         assert r.returncode == 0 and "format_row" in r.stdout
         r = subprocess.run([sys.executable, here, "stats", "--index", str(out)], capture_output=True, text=True)
         assert json.loads(r.stdout)["repos"] == 2
+        r = subprocess.run([sys.executable, here, "resolve", "--index", str(out), "--class", "run_loop"],
+                           capture_output=True, text=True)
+        env = json.loads(r.stdout)
+        assert r.returncode == 0 and env["schema_version"] == "code-graph-resolve/1" and env["confidence"] is True
+        assert env["data"][0]["label"] == "run_loop"
+        r = subprocess.run([sys.executable, here, "resolve", "--index", str(out), "--class", "nope_not_here"],
+                           capture_output=True, text=True)
+        assert r.returncode == 3 and json.loads(r.stdout)["data"] == []
     finally:
         shutil.rmtree(td, ignore_errors=True)
     test_identifiers()
