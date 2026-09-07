@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS nodes(repo TEXT, id TEXT, label TEXT, norm TEXT, kind
                                  PRIMARY KEY(repo, id));
 CREATE INDEX IF NOT EXISTS nodes_norm ON nodes(norm);
 CREATE INDEX IF NOT EXISTS nodes_file ON nodes(repo, file);
-CREATE TABLE IF NOT EXISTS edges(repo TEXT, src TEXT, dst TEXT, rel TEXT, loc TEXT);
+CREATE TABLE IF NOT EXISTS edges(repo TEXT, src TEXT, dst TEXT, rel TEXT, conf TEXT, loc TEXT);
 CREATE INDEX IF NOT EXISTS edges_src ON edges(repo, src);
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(repo, dst);
 """
@@ -74,9 +74,10 @@ def build(graphs_dir: Path, out: Path) -> dict:
         rows = [(repo, n["id"], n.get("label") or n["id"], norm(n.get("label") or n["id"]), _kind(n, contains_src),
                  n.get("source_file") or "", n.get("source_location") or "") for n in nodes]
         db.executemany("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?)", rows)
-        erows = [(repo, e["source"], e["target"], e.get("relation") or "", e.get("source_location") or "")
+        erows = [(repo, e["source"], e["target"], e.get("relation") or "", e.get("confidence") or "",
+                  e.get("source_location") or "")
                  for e in links if e.get("relation") != "contains"]
-        db.executemany("INSERT INTO edges VALUES (?,?,?,?,?)", erows)
+        db.executemany("INSERT INTO edges VALUES (?,?,?,?,?,?)", erows)
         db.execute("INSERT OR REPLACE INTO repos VALUES (?,?,?,?)", (repo, len(rows), len(erows), g.get("built_at_commit")))
         total["repos"] += 1
         total["nodes"] += len(rows)
@@ -186,6 +187,55 @@ def lookup(db: sqlite3.Connection, question: str, max_nodes: int = 4, max_chars:
     return "\n".join(parts).strip()
 
 
+def has_confidence(db: sqlite3.Connection) -> bool:
+    """False for an index built before edges carried confidence — report nothing rather than
+    inventing a certainty the file cannot support."""
+    return any(r[1] == "conf" for r in db.execute("PRAGMA table_info(edges)"))
+
+
+def resolve(db: sqlite3.Connection, name: str, kind: str | None = None, repo: str | None = None,
+            limit: int = 8) -> list[dict]:
+    """Components matching a typed query, as facts.
+
+    `name` matches a node label exactly after normalisation (case, trailing "()"), then by
+    prefix. `repo` matches the full name or the bare name, tolerantly — the same rule the crystal
+    registry uses for class names. Config-file keys are never components.
+    """
+    conf = has_confidence(db)
+    n = norm(name)
+    rows = db.execute(
+        "SELECT repo, id, label, kind, file, loc FROM nodes WHERE (norm=? OR norm=?) AND kind != 'config'",
+        (n, n.rsplit("/", 1)[-1])).fetchall()
+    if not rows and len(n) >= 5:
+        rows = db.execute(
+            "SELECT repo, id, label, kind, file, loc FROM nodes WHERE norm LIKE ? AND kind != 'config' "
+            "ORDER BY length(norm) LIMIT 40", (n + "%",)).fetchall()
+    if kind:
+        rows = [r for r in rows if r[3] == kind]
+    if repo:
+        want = repo.strip().lower()
+        rows = [r for r in rows if r[0].lower() == want or r[0].split("/", 1)[-1].lower() == want]
+    out = []
+    for repo_name, nid, label, k, f, loc in rows[: max(limit, 1) * 4]:
+        ins = db.execute("SELECT COUNT(*) FROM edges WHERE repo=? AND dst=?", (repo_name, nid)).fetchone()[0]
+        outs = db.execute("SELECT COUNT(*) FROM edges WHERE repo=? AND src=?", (repo_name, nid)).fetchone()[0]
+        extracted = inferred = None
+        if conf:
+            extracted = db.execute(
+                "SELECT COUNT(*) FROM edges WHERE repo=? AND (src=? OR dst=?) AND conf='EXTRACTED'",
+                (repo_name, nid, nid)).fetchone()[0]
+            inferred = db.execute(
+                "SELECT COUNT(*) FROM edges WHERE repo=? AND (src=? OR dst=?) AND conf='INFERRED'",
+                (repo_name, nid, nid)).fetchone()[0]
+        out.append({
+            "id": f"{repo_name}@{f}:{loc}#{label}" if f else f"{repo_name}#{label}",
+            "label": label, "kind": k, "repo": repo_name, "file": f, "loc": loc,
+            "in_degree": ins, "out_degree": outs, "extracted": extracted, "inferred": inferred,
+        })
+    out.sort(key=lambda d: (-d["in_degree"], d["label"]))
+    return out[:limit]
+
+
 def open_index(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     return db
@@ -204,11 +254,22 @@ def main(argv=None) -> int:
     q.add_argument("question")
     s = sub.add_parser("stats")
     s.add_argument("--index", required=True, type=Path)
+    rs = sub.add_parser("resolve", help="typed component query -> JSON (the KannakaHDL contract)")
+    rs.add_argument("--index", required=True, type=Path)
+    rs.add_argument("--class", dest="klass", required=True, help="component name (a node label)")
+    rs.add_argument("--type", default=None, help="symbol | class | file | rationale | concept")
+    rs.add_argument("--material", default=None, help="repo, full name or bare name")
+    rs.add_argument("--limit", type=int, default=8)
     a = ap.parse_args(argv)
     if a.cmd == "build":
         print(json.dumps(build(a.graphs, a.out)))
         return 0
     db = open_index(a.index)
+    if a.cmd == "resolve":
+        data = resolve(db, a.klass, a.type, a.material, a.limit)
+        print(json.dumps({"schema_version": "code-graph-resolve/1", "confidence": has_confidence(db),
+                          "data": data}))
+        return 0 if data else 3  # 3 = nothing recorded, same as query
     if a.cmd == "stats":
         n, e, r = db.execute("SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM edges), (SELECT COUNT(*) FROM repos)").fetchone()
         print(json.dumps({"repos": r, "nodes": n, "edges": e}))
