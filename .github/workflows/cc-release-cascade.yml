@@ -6,9 +6,9 @@ name: consciousness-core release cascade
 # Cargo.lock's `consciousness-core` line to the new tag, so the next
 # kannaka release ships with the new constellation physics.
 #
-# Setup (one-time, in NickFlach/consciousness-core):
+# Setup (one-time, in kannaka-labs/consciousness-core):
 #   1. Create a fine-scoped PAT with `contents: write` + `pull-requests:
-#      write` on this repo (NickFlach/kannaka-memory). Store it as
+#      write` on this repo (kannaka-labs/kannaka-memory). Store it as
 #      `secrets.KANNAKA_CASCADE_PAT` in consciousness-core's settings.
 #   2. Add the partner workflow described in
 #      .github/workflows/cc-release-cascade.yml of consciousness-core.
@@ -51,7 +51,7 @@ jobs:
       - name: Checkout consciousness-core at the new tag
         uses: actions/checkout@v4
         with:
-          repository: NickFlach/consciousness-core
+          repository: kannaka-labs/consciousness-core
           ref: v${{ steps.resolve.outputs.version }}
           path: consciousness-core
 
@@ -84,7 +84,7 @@ jobs:
       - name: Checkout kannaka-attention (pinned to the lockfile)
         uses: actions/checkout@v4
         with:
-          repository: NickFlach/kannaka-attention
+          repository: kannaka-labs/kannaka-attention
           ref: ${{ steps.ka.outputs.ref }}
           path: kannaka-attention
 

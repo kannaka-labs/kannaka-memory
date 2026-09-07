@@ -12,7 +12,7 @@ name: marketplace cascade
 #
 # DORMANT until a secret is set. This workflow is a no-op unless the repo has a
 # `KANNAKA_CASCADE_PAT` secret — a fine-scoped PAT with `contents: write` +
-# `pull-requests: write` on NickFlach/kannaka-constellation-marketplace. Add it
+# `pull-requests: write` on kannaka-labs/kannaka-constellation-marketplace. Add it
 # under Settings → Secrets and variables → Actions to arm the cascade.
 
 on:
@@ -58,7 +58,7 @@ jobs:
           fi
           gh api --method POST \
             -H "Accept: application/vnd.github+json" \
-            /repos/NickFlach/kannaka-constellation-marketplace/dispatches \
+            /repos/kannaka-labs/kannaka-constellation-marketplace/dispatches \
             -f event_type=plugin-released \
             -f client_payload[plugin]="kannaka-memory" \
             -f client_payload[version]="${{ steps.v.outputs.version }}"

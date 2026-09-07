@@ -42,7 +42,7 @@ jobs:
             os: macos-latest
             artifact: kannaka-macos-aarch64
             acp_artifact: kannaka-acp-macos-aarch64
-    # TUI binary moved to NickFlach/kannaka-tui (extracted at v0.5.12).
+    # TUI binary moved to kannaka-labs/kannaka-tui (extracted at v0.5.12).
     # That repo has its own Release workflow producing kannaka-tui-* artifacts.
     runs-on: ${{ matrix.os }}
     steps:
@@ -99,14 +99,14 @@ jobs:
       - name: Checkout consciousness-core (pinned to the lockfile)
         uses: actions/checkout@v4
         with:
-          repository: NickFlach/consciousness-core
+          repository: kannaka-labs/consciousness-core
           ref: ${{ steps.siblings.outputs.cc }}
           path: consciousness-core
 
       - name: Checkout kannaka-attention (pinned to the lockfile)
         uses: actions/checkout@v4
         with:
-          repository: NickFlach/kannaka-attention
+          repository: kannaka-labs/kannaka-attention
           ref: ${{ steps.siblings.outputs.ka }}
           path: kannaka-attention
 

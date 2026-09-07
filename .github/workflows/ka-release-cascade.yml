@@ -9,7 +9,7 @@ name: kannaka-attention release cascade
 # Mirrors .github/workflows/cc-release-cascade.yml — only the upstream
 # repo and event name differ. Setup parallel to consciousness-core:
 #   1. Create a fine-scoped PAT with `contents: write` + `pull-requests:
-#      write` on this repo (NickFlach/kannaka-memory). Store it as
+#      write` on this repo (kannaka-labs/kannaka-memory). Store it as
 #      `secrets.KANNAKA_CASCADE_PAT` in kannaka-attention's settings.
 #   2. The partner workflow (sender) lives at
 #      .github/workflows/release-cascade.yml in kannaka-attention.
@@ -50,7 +50,7 @@ jobs:
       - name: Checkout kannaka-attention at the new tag
         uses: actions/checkout@v4
         with:
-          repository: NickFlach/kannaka-attention
+          repository: kannaka-labs/kannaka-attention
           ref: v${{ steps.resolve.outputs.version }}
           path: kannaka-attention
 
@@ -81,7 +81,7 @@ jobs:
       - name: Checkout consciousness-core (pinned to the lockfile)
         uses: actions/checkout@v4
         with:
-          repository: NickFlach/consciousness-core
+          repository: kannaka-labs/consciousness-core
           ref: ${{ steps.cc.outputs.ref }}
           path: consciousness-core
 
