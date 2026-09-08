@@ -1,8 +1,10 @@
 """refresh_corpus tests — decision logic only, no network and no graphify.
 
 Run: python tools/corpus/graph/test_refresh_corpus.py
-Pins: a repo is re-extracted only when its HEAD differs from the graph's built_at_commit; a
-commit already known to hold no code is skipped until it changes; the index swap is atomic and
+Pins: a repo is re-extracted only when its HEAD differs from the graph's built_at_commit or the
+graph was built by a different graphify version (2026-09-08: an upgrade never reached the index
+because graphify's incremental path handed back the old graph); every extraction passes --force;
+a commit already known to hold no code is skipped until it changes; the index swap is atomic and
 a failed build leaves the old index in place; a discovery that loses most of the corpus is
 treated as a bad listing rather than as deletions (2026-09-07: /users/<login>/repos hides all
 54 private repos).
@@ -18,20 +20,20 @@ sys.path.insert(0, os.path.dirname(__file__))
 import refresh_corpus as rc  # noqa: E402
 
 
-def write_graph(root: Path, repo: str, commit: str) -> Path:
+def write_graph(root: Path, repo: str, commit: str, version: str | None = None) -> Path:
     d = root / "graphs" / repo / "graphify-out"
     d.mkdir(parents=True, exist_ok=True)
     p = d / "graph.json"
-    p.write_text(json.dumps({"nodes": [], "links": [], "built_at_commit": commit}), encoding="utf-8")
+    g = {"nodes": [], "links": [], "built_at_commit": commit}
+    if version:
+        g["built_with"] = version
+    p.write_text(json.dumps(g), encoding="utf-8")
     return p
 
 
-def is_stale(root: Path, repo: str, head: str, force: bool = False) -> bool:
-    """The same decision main() makes, kept in one place so the test pins the real rule."""
-    gj = root / "graphs" / repo / "graphify-out" / "graph.json"
-    nocode = root / "graphs" / repo / "graphify-out" / ".no-code"
-    known_empty = nocode.exists() and nocode.read_text(encoding="utf-8").strip() == head
-    return force or (not known_empty and (not gj.exists() or rc.graphed_commit(gj) != head))
+# main() and this test call the same rc.is_stale — the previous copy of the rule in this file
+# could drift from the one that ran (and it did not know about versions at all).
+is_stale = rc.is_stale
 
 
 def test_staleness(root: Path):
@@ -41,6 +43,52 @@ def test_staleness(root: Path):
     assert not is_stale(root, repo, "aaaa"), "graph matches HEAD -> skip"
     assert is_stale(root, repo, "bbbb"), "HEAD moved -> extract"
     assert is_stale(root, repo, "aaaa", force=True), "--force-extract overrides"
+
+
+def test_staleness_by_graphify_version(root: Path):
+    repo = "acct/versioned"
+    write_graph(root, repo, "aaaa")  # a graph from before stamping
+    assert not is_stale(root, repo, "aaaa", version=None), "unknown installed version -> commit rule only"
+    assert is_stale(root, repo, "aaaa", version="0.9.56"), "unstamped graph + known version -> one re-scan"
+    write_graph(root, repo, "aaaa", version="0.9.55")
+    assert is_stale(root, repo, "aaaa", version="0.9.56"), "built by an older graphify -> extract"
+    assert not is_stale(root, repo, "aaaa", version="0.9.55"), "same version, same commit -> skip"
+    assert is_stale(root, repo, "bbbb", version="0.9.55"), "same version, HEAD moved -> extract"
+
+
+def test_extract_passes_force_and_stamps_the_version(root: Path):
+    """graphify's incremental path returns the previous graph when no file changed; the refresh
+    must ask for a full re-scan every time and record which graphify produced the result."""
+    fake = root / "fake_graphify.py"
+    fake.write_text(
+        "import sys, json, pathlib\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('graphify 9.9.9'); sys.exit(0)\n"
+        "out = pathlib.Path(sys.argv[sys.argv.index('--out') + 1]) / 'graphify-out'\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'argv.json').write_text(json.dumps(sys.argv[1:]))\n"
+        "(out / 'graph.json').write_text(json.dumps({'nodes': [{'id': 'a'}], 'links': [],\n"
+        "                                            'built_at_commit': 'ffff'}))\n",
+        encoding="utf-8")
+    # extract_repo runs the tool as an executable; wrap the script so it runs anywhere
+    if os.name == "nt":
+        launcher = root / "fake_graphify.cmd"
+        launcher.write_text(f'@"{sys.executable}" "{fake}" %*\n', encoding="utf-8")
+    else:
+        launcher = root / "fake_graphify"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n', encoding="utf-8")
+        launcher.chmod(0o755)
+    (root / "repos" / "acct" / "thing").mkdir(parents=True, exist_ok=True)
+    version = rc.graphify_version(str(launcher))
+    assert version == "9.9.9", version
+    res = rc.extract_repo(root, "acct/thing", str(launcher), 2, version)
+    assert res["ok"] and res["nodes"] == 1, res
+    argv = json.loads((root / "graphs" / "acct" / "thing" / "graphify-out" / "argv.json").read_text())
+    assert "--force" in argv, argv
+    gj = root / "graphs" / "acct" / "thing" / "graphify-out" / "graph.json"
+    assert rc.graphed_version(gj) == "9.9.9" and rc.graphed_commit(gj) == "ffff"
+    assert not is_stale(root, "acct/thing", "ffff", version="9.9.9"), "just built by this version -> skip"
+    assert is_stale(root, "acct/thing", "ffff", version="9.9.10"), "a newer graphify -> extract again"
 
     empty = "acct/empty"
     (root / "graphs" / empty / "graphify-out").mkdir(parents=True)
@@ -101,6 +149,10 @@ def main():
         (root / "graphs").mkdir()
         test_staleness(root)
         print("ok test_staleness")
+        test_staleness_by_graphify_version(root)
+        print("ok test_staleness_by_graphify_version")
+        test_extract_passes_force_and_stamps_the_version(root)
+        print("ok test_extract_passes_force_and_stamps_the_version")
         test_graphed_commit_survives_a_broken_graph(root)
         print("ok test_graphed_commit_survives_a_broken_graph")
         test_index_swap_is_atomic_and_failure_keeps_the_old_index(root)

@@ -15,8 +15,12 @@ Stages
   2 sync      clone what is new, `fetch --depth 1` + `reset --hard` what exists. Shallow clones
               stay shallow; a repo whose default branch was renamed is re-pointed.
   3 extract   re-run graphify ONLY where the checkout's HEAD differs from the graph's
-              built_at_commit (or no graph exists). This is the whole point: a no-op refresh
-              costs one fetch per repo and no CPU.
+              built_at_commit, or the graph was built by a different graphify version than the
+              one installed (stamped as built_with), or no graph exists. This is the whole
+              point: a no-op refresh costs one fetch per repo and no CPU. Every extraction is
+              `graphify extract --force` — a full re-scan. graphify's own incremental path reuses
+              the previous graph.json wholesale when no file changed, which on 2026-09-08 made a
+              forced refresh after a graphify upgrade a 1-second no-op per repo.
   4 index     build to <index>.new, fsync, then os.replace() onto the live path. Readers holding
               the old file keep reading it; the next query opens the new one. A failed build
               leaves the previous index exactly where it was.
@@ -128,6 +132,56 @@ def graphed_commit(graph_json: Path) -> str | None:
         return None
 
 
+def graphed_version(graph_json: Path) -> str | None:
+    """The graphify version that built this graph (our `built_with` stamp), or None for a graph
+    from before stamping — which is treated as stale once, so it gets one full re-scan."""
+    try:
+        return json.loads(graph_json.read_text(encoding="utf-8")).get("built_with")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def graphify_version(graphify: str) -> str | None:
+    """`graphify --version` -> "0.9.56". graphify records its version nowhere in its output, so
+    the refresh has to ask and stamp it itself."""
+    try:
+        r = run([graphify, "--version"], timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or r.stderr or "").strip().split()
+    return out[-1] if r.returncode == 0 and out else None
+
+
+def stamp_version(graph_json: Path, version: str | None) -> None:
+    """Write `built_with` into graph.json beside graphify's own built_at_commit, atomically."""
+    if not version:
+        return
+    try:
+        g = json.loads(graph_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - not our graph to fix
+        return
+    g["built_with"] = version
+    tmp = graph_json.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(g), encoding="utf-8")
+    os.replace(tmp, graph_json)
+
+
+def is_stale(root: Path, repo: str, head: str, version: str | None = None, force: bool = False) -> bool:
+    """The one rule main() uses: extract when forced, when there is no graph, when the checkout
+    moved past the graph's commit, or when the installed graphify is not the one that built it.
+    A commit already known to hold no code stays quiet until it changes."""
+    if force:
+        return True
+    out = root / "graphs" / repo / "graphify-out"
+    nocode = out / ".no-code"
+    if nocode.exists() and nocode.read_text(encoding="utf-8").strip() == head:
+        return False
+    gj = out / "graph.json"
+    if not gj.exists() or graphed_commit(gj) != head:
+        return True
+    return bool(version) and graphed_version(gj) != version
+
+
 def sync_repo(root: Path, repo: str, branch: str) -> dict:
     """Clone or fast-forward one repo. Returns {repo, action, head, error}."""
     dest = root / "repos" / repo
@@ -152,13 +206,16 @@ def sync_repo(root: Path, repo: str, branch: str) -> dict:
 
 # ---------------------------------------------------------------- 3. extract
 
-def extract_repo(root: Path, repo: str, graphify: str, workers: int) -> dict:
+def extract_repo(root: Path, repo: str, graphify: str, workers: int, version: str | None = None) -> dict:
     src = root / "repos" / repo
     out = root / "graphs" / repo
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    r = run([graphify, "extract", str(src), "--code-only", "--max-workers", str(workers), "--out", str(out)],
-            timeout=3600)
+    # --force: a full re-scan every time we decide to extract. Without it graphify's incremental
+    # path keeps the previous graph.json when no file changed, so a re-extract after a graphify
+    # upgrade returned the old graph in one second and the upgrade never reached the index.
+    r = run([graphify, "extract", str(src), "--code-only", "--force", "--max-workers", str(workers),
+             "--out", str(out)], timeout=3600)
     gj = out / "graphify-out" / "graph.json"
     if r.returncode != 0 or not gj.exists():
         tail = (r.stdout or r.stderr or "").strip().splitlines()[-1:] or [""]
@@ -174,6 +231,7 @@ def extract_repo(root: Path, repo: str, graphify: str, workers: int) -> dict:
             return {"repo": repo, "ok": True, "no_code": True, "seconds": round(time.time() - t0, 1),
                     "nodes": 0, "edges": 0}
         return {"repo": repo, "ok": False, "seconds": round(time.time() - t0, 1), "error": err}
+    stamp_version(gj, version)
     try:
         g = json.loads(gj.read_text(encoding="utf-8"))
         nodes, edges = len(g.get("nodes", [])), len(g.get("links", g.get("edges", [])))
@@ -272,17 +330,11 @@ def main(argv=None) -> int:
             acts[s["action"]] = acts.get(s["action"], 0) + 1
         log("sync: " + ", ".join(f"{k} {v}" for k, v in sorted(acts.items())))
 
-    # 3. extract only what moved
-    stale = []
-    for s in synced:
-        repo, head = s["repo"], s.get("head")
-        gj = root / "graphs" / repo / "graphify-out" / "graph.json"
-        if not head:
-            continue
-        nocode = root / "graphs" / repo / "graphify-out" / ".no-code"
-        known_empty = nocode.exists() and nocode.read_text(encoding="utf-8").strip() == head
-        if a.force_extract or (not known_empty and (not gj.exists() or graphed_commit(gj) != head)):
-            stale.append(repo)
+    # 3. extract what moved — or what was built by a different graphify
+    version = graphify_version(a.graphify)
+    log(f"graphify {version or 'version unknown'} at {a.graphify}")
+    stale = [s["repo"] for s in synced
+             if s.get("head") and is_stale(root, s["repo"], s["head"], version, a.force_extract)]
     log(f"{len(stale)} repos to re-extract" + (f": {', '.join(stale[:8])}{' …' if len(stale) > 8 else ''}" if stale else ""))
     extracted: list[dict] = []
     if stale and not a.dry_run:
@@ -290,7 +342,7 @@ def main(argv=None) -> int:
             log(f"graphify not found at {a.graphify}; skipping extraction")
         else:
             with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-                for res in ex.map(lambda r: extract_repo(root, r, a.graphify, a.workers), stale):
+                for res in ex.map(lambda r: extract_repo(root, r, a.graphify, a.workers, version), stale):
                     extracted.append(res)
                     log(("  none " if res.get("no_code") else "  ok   " if res["ok"] else "  FAIL ") + res["repo"] +
                         (f" {res.get('nodes')}n/{res.get('edges')}e {res['seconds']}s" if res["ok"]
