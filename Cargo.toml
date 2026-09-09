@@ -3,7 +3,7 @@ name = "kannaka-memory"
 version = "0.16.1"
 edition = "2021"
 description = "Hypervector memory system for Kannaka — wave-modulated holographic memory with skip links"
-license = "MIT"
+license-file = "LICENSE"
 
 [dependencies]
 # Advisory flock for the single-writer dream/write lock (ADR-0036). Already in

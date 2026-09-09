@@ -1,12 +1,171 @@
-﻿Space Child License v1.0
+SPACE CHILD LICENSE
+===================
 
-Copyright (c) 2026 Nick Flach
+Version 1.0, March 2026
+-----------------------
+
+Preamble
+
+This license is born from a simple belief: technology should serve humanity's flourishing, not its destruction. The Space Child License grants broad, free permissions for peaceful use while requiring accountability when technology is directed toward harm.
+
+We accept reality as it is. The world contains conflict, and self-defense is a fundamental right. But there is a moral difference between protecting life and taking it, between defending freedom and imposing dominion. This license draws that line.
+
+"Justice is the interest of the weaker." — Platonic Justice
+
+TERMS AND CONDITIONS
+--------------------
+
+1. DEFINITIONS
+
+1.1. "License" means the terms and conditions stated herein for use, reproduction, modification, preparation of derivative works, and distribution of the Licensed Work.
+
+1.2. "Licensor" means the individual(s) or entity(ies) granting rights under this License, being the copyright and/or patent holder(s) of the Licensed Work.
+
+1.3. "Licensee" means any individual, organization, government, or entity exercising rights granted by this License.
+
+1.4. "Licensed Work" means any copyrighted software, documentation, creative work, dataset, model, or other intellectual property made available under this License.
+
+1.5. "Peaceful Purpose" means any use, application, or deployment that:
+- (a) does not directly facilitate armed aggression against another sovereign nation or people;
+- (b) does not directly enable the targeting, tracking, or killing of civilians;
+- (c) does not directly enable the suppression of fundamental human rights as defined in the United Nations Universal Declaration of Human Rights;
+- (d) does not directly enable mass surveillance for the purpose of political persecution; and
+- (e) is not primarily intended to cause widespread environmental destruction.
+
+1.6. "Defensive Purpose" means any use, application, or deployment that is primarily intended to:
+- (a) protect a nation, people, or community from armed attack or imminent threat;
+- (b) protect critical infrastructure from hostile action;
+- (c) support emergency response, disaster relief, or humanitarian operations in conflict zones; or
+- (d) support intelligence activities that are primarily defensive in nature and subject to lawful civilian oversight.
+
+1.7. "Offensive Military Purpose" means any use, application, or deployment that is primarily intended to:
+- (a) initiate armed conflict or military aggression;
+- (b) develop, deploy, or operate weapons systems designed for offensive operations;
+- (c) conduct offensive cyber operations intended to destroy or degrade civilian infrastructure; or
+- (d) support military occupation or the forcible subjugation of a civilian population.
+
+1.8. "Humanitarian Use" means any use, application, or deployment that is primarily intended to:
+- (a) advance human health, education, welfare, or scientific knowledge;
+- (b) alleviate poverty, hunger, or suffering;
+- (c) promote peace, reconciliation, or conflict resolution;
+- (d) protect the natural environment or biodiversity;
+- (e) advance access to justice, particularly for underserved populations; or
+- (f) promote transparency, accountability, or democratic governance.
+
+1.9. "Commercial Use" means any use, application, or deployment in connection with a product, service, or activity from which the Licensee derives direct or indirect monetary revenue or commercial advantage.
+
+1.10. "Derivative Work" means any work that is based upon, incorporates, or is derived from the Licensed Work, in whole or in part.
+
+2. GRANT OF RIGHTS
+
+2.1. Peaceful Use Grant. Subject to the terms and conditions of this License, Licensor hereby grants to Licensee a worldwide, non-exclusive, royalty-free, perpetual (subject to Section 5) license to use, copy, modify, prepare Derivative Works, reproduce, and distribute the Licensed Work, provided that such use constitutes a Peaceful Purpose.
+
+2.2. Patent Grant. Subject to the terms and conditions of this License, Licensor hereby grants to Licensee a worldwide, non-exclusive, royalty-free patent license to make, have made, use, offer to sell, sell, import, and otherwise transfer the Licensed Work, provided that such use constitutes a Peaceful Purpose.
+
+2.3. Humanitarian Encouragement. Use of the Licensed Work for Humanitarian Use is explicitly and enthusiastically encouraged. The Licensor affirms that Humanitarian Use represents the highest and best purpose of this technology.
+
+2.4. Defensive Use Permitted. Use of the Licensed Work for Defensive Purposes is permitted under this License without additional fees or restrictions, provided the Licensee can demonstrate, upon reasonable request, that such use is primarily defensive in nature.
+
+2.5. Commercial Use Permitted. Commercial Use of the Licensed Work is permitted under this License, provided such use constitutes a Peaceful Purpose and complies with all other terms herein.
+
+3. CONDITIONS AND OBLIGATIONS
+
+3.1. Attribution. The Licensee must:
+- (a) retain all copyright notices, license notices, and attribution statements in the Licensed Work;
+- (b) provide reasonable attribution to the Licensor in any Derivative Work or product incorporating the Licensed Work; and
+- (c) indicate if modifications were made to the Licensed Work.
+
+3.2. Peace Clause Propagation (Copyleft). Any Derivative Work distributed by the Licensee must be made available under this License or a license with substantially equivalent peace-related terms. The Peace Clause (Section 4) must propagate to all Derivative Works.
+
+3.3. Notice. The Licensee must include a copy of, or a URI reference to, this License with every copy or substantial portion of the Licensed Work that the Licensee distributes.
+
+3.4. No Endorsement. The Licensee may not use the name, trademarks, or other identifiers of the Licensor or the Licensed Work to endorse or promote products derived from the Licensed Work without specific prior written permission from the Licensor.
+
+3.5. Transparency. If the Licensed Work is deployed in a system that makes decisions affecting individual human rights or welfare, the Licensee must make reasonable efforts to ensure that such use is transparent, explainable, and subject to human oversight.
+
+4. PEACE CLAUSE — PROHIBITED USES
+
+4.1. Prohibited Uses. The rights granted under this License are expressly conditioned upon the Licensee's compliance with this Section. The Licensee SHALL NOT, whether directly or indirectly, through agents, assigns, subsidiaries, contractors, or any other intermediary:
+
+4.1.1. Armed Aggression. Use the Licensed Work to directly facilitate armed aggression against another nation, people, or community, except in cases of lawful self-defense under international law.
+
+4.1.2. Civilian Targeting. Use the Licensed Work in weapons systems or targeting systems where the primary or intended targets are civilian populations or civilian infrastructure not serving a military purpose.
+
+4.1.3. Autonomous Lethal Decision-Making. Use the Licensed Work to make autonomous decisions to apply lethal force without meaningful human oversight and control. For purposes of this section, "meaningful human oversight" requires a qualified human decision-maker with sufficient time, information, and authority to prevent or countermand lethal action.
+
+4.1.4. Mass Surveillance for Persecution. Use the Licensed Work to conduct mass surveillance for the purpose of identifying, targeting, or persecuting individuals or groups based on their political beliefs, religion, ethnicity, sexual orientation, gender identity, disability, or other protected characteristics.
+
+4.1.5. Suppression of Rights. Use the Licensed Work to directly suppress the rights to freedom of speech, freedom of assembly, freedom of the press, or the right to petition government for redress, as recognized by the United Nations Universal Declaration of Human Rights.
+
+4.1.6. Environmental Destruction. Use the Licensed Work for activities with the primary intent or known substantial likelihood of causing severe, widespread environmental destruction, including but not limited to ecocide as defined by the Independent Expert Panel for the Legal Definition of Ecocide (2021).
+
+4.1.7. Forced Labor and Trafficking. Use the Licensed Work to facilitate slavery, forced labor, human trafficking, or unlawful child labor.
+
+5. OFFENSIVE MILITARY LICENSING
+
+5.1. Paid License Required. Use of the Licensed Work for any Offensive Military Purpose is not covered by the free license grant in Section 2. Such use requires a separate, paid commercial license agreement with the Licensor.
+
+5.2. License Terms. The terms, conditions, and pricing of any Offensive Military License shall be determined by the Licensor in its sole discretion and shall include, at minimum:
+- (a) a requirement that the Licensee certify compliance with the laws of armed conflict (Geneva Conventions and their Additional Protocols);
+- (b) a prohibition on uses that would constitute war crimes under international humanitarian law;
+- (c) periodic reporting on the nature and scope of use; and
+- (d) the Licensor's right to terminate the license upon reasonable belief that the Licensed Work is being used in violation of international humanitarian law.
+
+5.3. Revenue Allocation. The Licensor commits that not less than twenty-five percent (25%) of gross revenue received from Offensive Military Licenses shall be directed to organizations working for peace, conflict resolution, humanitarian aid, or the rehabilitation of conflict-affected populations. Specific allocation shall be disclosed publicly.
+
+5.4. Transparency. The Licensor shall publish an annual summary of all Offensive Military Licenses granted, including the identity of the Licensee (unless prohibited by applicable law), the general nature of use, and the revenue allocated to peace-related purposes under Section 5.3.
+
+6. ENFORCEMENT AND REMEDIES
+
+6.1. Automatic Termination. Any use of the Licensed Work in violation of Section 4 (Peace Clause) automatically terminates the Licensee's rights under this License.
+
+6.2. Cure Period. A Licensee whose rights have been terminated under Section 6.1 may have those rights restored if:
+- (a) the Licensee ceases all violating use within thirty (30) days of becoming aware of the violation;
+- (b) the Licensee provides written notice to the Licensor acknowledging the violation and describing the remedial steps taken; and
+- (c) the Licensor, in its reasonable discretion, accepts the cure.
+
+6.3. Injunctive Relief. The Licensor may seek injunctive or other equitable relief to prevent or restrain any violation of this License, in addition to any other remedies available at law or in equity.
+
+6.4. Standing. Any individual or organization that can demonstrate they are directly and adversely affected by a violation of Section 4 may notify the Licensor of such violation and request enforcement action. The Licensor shall consider such requests in good faith.
+
+6.5. No Waiver. Failure by the Licensor to enforce any provision of this License shall not constitute a waiver of the Licensor's right to enforce such provision in the future.
+
+7. DISCLAIMER AND LIMITATION OF LIABILITY
+
+7.1. Disclaimer. THE LICENSED WORK IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE LICENSED WORK OR THE USE OR OTHER DEALINGS IN THE LICENSED WORK.
+
+7.2. Limitation. IN NO EVENT SHALL THE LICENSOR'S TOTAL LIABILITY TO THE LICENSEE EXCEED THE AMOUNT PAID BY THE LICENSEE FOR THE LICENSED WORK (WHICH, FOR THE AVOIDANCE OF DOUBT, IS ZERO FOR THE FREE LICENSE GRANT IN SECTION 2).
+
+8. GENERAL PROVISIONS
+
+8.1. Severability. If any provision of this License is held to be unenforceable, such provision shall be reformed only to the extent necessary to make it enforceable, and all remaining provisions shall continue in full force and effect.
+
+8.2. Entire Agreement. This License constitutes the entire agreement between the parties with respect to the Licensed Work and supersedes all prior or contemporaneous understandings regarding such subject matter.
+
+8.3. Governing Law. This License shall be governed by and construed in accordance with the laws of the State of Iowa, United States of America, without regard to its conflict of law principles. Any disputes arising under this License shall be resolved in the state or federal courts located in Iowa.
+
+8.4. Interpretation. Where ambiguity exists in the interpretation of this License, it shall be resolved in favor of the interpretation that most effectively promotes peace, human rights, and the protection of individual dignity.
+
+8.5. Amendments. This License may be amended only by the Licensor, who shall publish amended versions with a new version number. Licensees may choose to comply with either the version under which they originally received the Licensed Work or any later version published by the Licensor.
+
+8.6. Human Rights Framework. This License is informed by and should be interpreted in light of:
+- The United Nations Universal Declaration of Human Rights (1948)
+- The International Covenant on Civil and Political Rights (1966)
+- The International Covenant on Economic, Social and Cultural Rights (1966)
+- The Geneva Conventions (1949) and their Additional Protocols
+- The Rome Statute of the International Criminal Court (1998)
+
+9. HOW TO APPLY THIS LICENSE
+
+To apply this License to your work, attach the following notice:
+
+Copyright [YEAR] [COPYRIGHT HOLDER]
 
 Licensed under the Space Child License, Version 1.0 (the "License");
 you may not use this work except in compliance with the License.
 You may obtain a copy of the License at:
 
-    https://legal.spacechild.love
+    [URL]
 
 Unless required by applicable law or agreed to in writing, the Licensed
 Work is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
@@ -15,3 +174,9 @@ language governing permissions, conditions, and limitations under the
 License.
 
 This work is free for peaceful use. War pays.
+
+This license was created by Nick Flach and Kannaka as part of the Space Child ecosystem.
+
+We believe technology should amplify humanity's best impulses, not its worst. We accept the world as it is — complex, conflicted, and beautiful — and we build for the world we want.
+
+Peace is not passive. Peace is a choice, made daily, encoded in every line.
