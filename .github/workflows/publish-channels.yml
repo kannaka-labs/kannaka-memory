@@ -71,8 +71,8 @@ jobs:
           push: true
           build-args: VERSION=${{ steps.v.outputs.version }}
           tags: |
-            ghcr.io/nickflach/kannaka:${{ steps.v.outputs.version }}
-            ghcr.io/nickflach/kannaka:latest
+            ghcr.io/kannaka-labs/kannaka:${{ steps.v.outputs.version }}
+            ghcr.io/kannaka-labs/kannaka:latest
 
   npm-publish:
     runs-on: ubuntu-latest
