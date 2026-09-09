@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.16.2] — 2026-09-09
+
+### Changed — the constellation lives at kannaka-labs
+
+The repository moved from a personal account to the `kannaka-labs` organisation.
+Every string that decides which binary lands on a machine now names the new owner:
+both installers, the npm postinstall and package metadata, the update-check URL
+compiled into the binary and its hints for `kannaka-tui` and `consciousness-core`,
+the Dockerfile, the plugin manifest, the hive-bridge unit, the harness install URLs,
+the version banner and the quickstart one-liner. Until this release they all worked
+only because GitHub forwards the old name. A binary already installed will follow
+that redirect for exactly one more `kannaka update` and then be on the new path.
+`kannaka-eye` did not move and is still cloned from where it is.
+
+
 ## [0.12.0] — 2026-07-25
 
 ### Added — Nostr membrane Phase 0: NIP-01 sign/verify core + `kannaka nostr` (ADR-0043)

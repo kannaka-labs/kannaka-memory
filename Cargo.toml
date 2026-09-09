@@ -1,6 +1,6 @@
 [package]
 name = "kannaka-memory"
-version = "0.16.1"
+version = "0.16.2"
 edition = "2021"
 description = "Hypervector memory system for Kannaka — wave-modulated holographic memory with skip links"
 license = "MIT"
