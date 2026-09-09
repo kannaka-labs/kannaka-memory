@@ -85,7 +85,6 @@ pub fn build_cli() -> Command {
              Medium where recall is matrix multiplication, not search.\n\n\
              Sibling plugins on PATH are discoverable as subcommands:\n  \
              kannaka tui     → kannaka-tui   (terminal dashboard)\n  \
-             kannaka code    → kannaka-code  (Rust agentic CLI)\n  \
              kannaka topus   → kannaktopus   (orchestration)\n\
              Any binary named kannaka-X on PATH becomes `kannaka X`.",
         )
