@@ -99,7 +99,6 @@ remember  recall  forget  dream  hear  ask  search  boost  invariant  voice  swa
 Slash-commands route to **sibling constellation binaries** (must be on PATH):
 
 ```
-/code    → kannaka-code   (Rust agentic CLI)
 /topus   → kannaktopus    (orchestration)
 ```
 
