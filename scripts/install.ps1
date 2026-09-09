@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "NickFlach/kannaka-memory"
+$Repo = "kannaka-labs/kannaka-memory"
 $InstallDir = if ($env:KANNAKA_INSTALL_DIR) { $env:KANNAKA_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\kannaka" }
 $Version = if ($env:KANNAKA_VERSION) { $env:KANNAKA_VERSION } else { "latest" }
 

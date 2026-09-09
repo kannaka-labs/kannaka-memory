@@ -5,17 +5,17 @@
 ### One-liner (Linux/macOS)
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/NickFlach/kannaka-memory/master/scripts/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/kannaka-labs/kannaka-memory/master/scripts/install.sh | sh
 ```
 
 ### Windows
 
-Download the latest release from [GitHub Releases](https://github.com/NickFlach/kannaka-memory/releases/latest) and add it to your PATH.
+Download the latest release from [GitHub Releases](https://github.com/kannaka-labs/kannaka-memory/releases/latest) and add it to your PATH.
 
 ### From source
 
 ```bash
-git clone https://github.com/NickFlach/kannaka-memory
+git clone https://github.com/kannaka-labs/kannaka-memory
 cd kannaka-memory
 cargo build --release
 ```

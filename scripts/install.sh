@@ -7,7 +7,7 @@
 
 set -e
 
-REPO="NickFlach/kannaka-memory"
+REPO="kannaka-labs/kannaka-memory"
 BINARY_NAME="kannaka"
 INSTALL_DIR="${KANNAKA_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${KANNAKA_VERSION:-latest}"

@@ -32,7 +32,7 @@ with a different subcommand, wired as a systemd unit:
 
 `kannaka-eye` is the exception: it's a **separate Node service** (not part of
 the binary — it has a WebGL UI and its own glyph emitter). It's deployed from
-its own repo (`NickFlach/kannaka-eye`, see that repo's `ops/`), and it's the
+its own repo (`kannaka-labs/kannaka-eye`, see that repo's `ops/`), and it's the
 *producer* whose glyph events `attention serve` consumes. Eye → glyph →
 `KANNAKA.attention.eye` → attention beam → instant recall.
 

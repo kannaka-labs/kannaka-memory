@@ -1,6 +1,6 @@
 //! KAX Compute District envelope contract — canonical JSON + Ed25519 signing.
 //!
-//! The machines in the KAX Compute District (NickFlach/kax-computer) are
+//! The machines in the KAX Compute District (kannaka-labs/kax-computer) are
 //! woken by a signed job envelope published to `KAX.machine.<id>.inbox`:
 //!
 //! ```text

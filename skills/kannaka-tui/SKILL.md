@@ -56,7 +56,7 @@ kannaka update --bootstrap-tui      # installs kannaka-tui next to kannaka, even
 kannaka update                       # also updates an already-installed sibling kannaka-tui
 
 # From source:
-cargo install --git https://github.com/NickFlach/kannaka-tui
+cargo install --git https://github.com/kannaka-labs/kannaka-tui
 
 # Or grab a prebuilt release asset:
 #   kannaka-tui-linux-x86_64 / -linux-aarch64 / -macos-x86_64 / -macos-aarch64

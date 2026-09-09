@@ -819,7 +819,7 @@ pub fn apply_entropy_env_from_config(cfg: &KannakaConfig) {
 // ---------------------------------------------------------------------------
 
 const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/NickFlach/kannaka-memory/releases/latest";
+    "https://api.github.com/repos/kannaka-labs/kannaka-memory/releases/latest";
 
 /// Spawns a background thread that checks for updates if due.
 /// Never blocks the main CLI.
@@ -1141,7 +1141,7 @@ pub fn self_update() -> Result<(), String> {
                 return Err(format!(
                     "failed to install update: {e}. Close any running kannaka processes \
                      (kannaka-tui, swarm/daemon workers) and retry, or download manually \
-                     from https://github.com/NickFlach/kannaka-memory/releases/latest"
+                     from https://github.com/kannaka-labs/kannaka-memory/releases/latest"
                 ));
             }
         }
@@ -1156,7 +1156,7 @@ pub fn self_update() -> Result<(), String> {
     Ok(())
 }
 
-/// Probe `NickFlach/consciousness-core` releases and print a hint when
+/// Probe `kannaka-labs/consciousness-core` releases and print a hint when
 /// the upstream tag is newer than the version baked into this binary.
 /// Pure UX — `kannaka update` only ships pre-built `kannaka` binaries,
 /// and consciousness-core rides into them at build time via the path
@@ -1166,7 +1166,7 @@ pub fn self_update() -> Result<(), String> {
 /// at .github/workflows/cc-release-cascade.yml).
 fn report_consciousness_core_drift(agent: &ureq::Agent) {
     const CC_RELEASES_URL: &str =
-        "https://api.github.com/repos/NickFlach/consciousness-core/releases/latest";
+        "https://api.github.com/repos/kannaka-labs/consciousness-core/releases/latest";
     let resp = match agent
         .get(CC_RELEASES_URL)
         .set("User-Agent", "kannaka-update-check")
@@ -1212,7 +1212,7 @@ fn report_consciousness_core_drift(agent: &ureq::Agent) {
 /// download failure so the user knows to retry.
 ///
 /// As of kannaka-memory v0.5.13 the TUI lives in its own repo
-/// (NickFlach/kannaka-tui) with its own release cadence — the sibling
+/// (kannaka-labs/kannaka-tui) with its own release cadence — the sibling
 /// asset lookup hits THAT repo's latest release, not the kannaka-memory
 /// release the caller is currently updating to. The two version streams
 /// don't have to stay aligned; this just keeps an installed TUI binary
@@ -1240,15 +1240,15 @@ fn update_sibling_tui(
         eprintln!();
         eprintln!("Tip: kannaka-tui isn't installed alongside kannaka.");
         eprintln!("     Install with one of:");
-        eprintln!("       cargo install --git https://github.com/NickFlach/kannaka-tui");
+        eprintln!("       cargo install --git https://github.com/kannaka-labs/kannaka-tui");
         eprintln!("       curl -L -o {tui_name} \\");
-        eprintln!("         https://github.com/NickFlach/kannaka-tui/releases/latest/download/{asset_name_hint}");
+        eprintln!("         https://github.com/kannaka-labs/kannaka-tui/releases/latest/download/{asset_name_hint}");
         return;
     }
 
     // Hit the kannaka-tui repo's latest release directly.
     const TUI_RELEASES_URL: &str =
-        "https://api.github.com/repos/NickFlach/kannaka-tui/releases/latest";
+        "https://api.github.com/repos/kannaka-labs/kannaka-tui/releases/latest";
     let tui_release: serde_json::Value = match agent
         .get(TUI_RELEASES_URL)
         .set("User-Agent", "kannaka-update")
@@ -1489,7 +1489,7 @@ pub fn bootstrap_install_tui() -> Result<std::path::PathBuf, String> {
     }
 
     // Fetch kannaka-tui's latest release.
-    let resp = agent.get("https://api.github.com/repos/NickFlach/kannaka-tui/releases/latest")
+    let resp = agent.get("https://api.github.com/repos/kannaka-labs/kannaka-tui/releases/latest")
         .set("User-Agent", "kannaka-bootstrap-tui")
         .set("Accept", "application/vnd.github.v3+json")
         .call()
@@ -1610,7 +1610,7 @@ pub fn install_tui_binary(install_dir: &std::path::Path) {
     // the version sidecar and the asset list for SHA-256 verification, the
     // same posture as bootstrap_install_tui and update_sibling_tui.
     let release: serde_json::Value = match agent
-        .get("https://api.github.com/repos/NickFlach/kannaka-tui/releases/latest")
+        .get("https://api.github.com/repos/kannaka-labs/kannaka-tui/releases/latest")
         .set("User-Agent", "kannaka-install")
         .set("Accept", "application/vnd.github.v3+json")
         .call()
@@ -1618,7 +1618,7 @@ pub fn install_tui_binary(install_dir: &std::path::Path) {
     {
         Ok(b) => b,
         Err(_) => {
-            eprintln!(" {}not available (install later with: kannaka update, or from https://github.com/NickFlach/kannaka-tui/releases){}", a.gray, a.reset);
+            eprintln!(" {}not available (install later with: kannaka update, or from https://github.com/kannaka-labs/kannaka-tui/releases){}", a.gray, a.reset);
             return;
         }
     };
@@ -1680,9 +1680,9 @@ pub fn install_tui_binary(install_dir: &std::path::Path) {
         }
         Err(_) => {
             // No `tui` feature exists in this crate anymore — the TUI lives in
-            // NickFlach/kannaka-tui. Point users there instead of at a
+            // kannaka-labs/kannaka-tui. Point users there instead of at a
             // cargo command that can't work.
-            eprintln!(" {}not available (install later with: kannaka update, or from https://github.com/NickFlach/kannaka-tui/releases){}", a.gray, a.reset);
+            eprintln!(" {}not available (install later with: kannaka update, or from https://github.com/kannaka-labs/kannaka-tui/releases){}", a.gray, a.reset);
         }
     }
 }

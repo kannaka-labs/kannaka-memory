@@ -18,7 +18,7 @@ const crypto = require("crypto");
 
 const pkg = require("./package.json");
 const VERSION = pkg.version;
-const REPO = "NickFlach/kannaka-memory";
+const REPO = "kannaka-labs/kannaka-memory";
 
 const OS_MAP = { linux: "linux", darwin: "macos", win32: "windows" };
 const ARCH_MAP = { x64: "x86_64", arm64: "aarch64" };

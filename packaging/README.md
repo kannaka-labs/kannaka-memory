@@ -49,7 +49,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ## Homebrew
 
-Tap: [`NickFlach/homebrew-kannaka`](https://github.com/NickFlach/homebrew-kannaka)
+Tap: [`kannaka-labs/homebrew-kannaka`](https://github.com/kannaka-labs/homebrew-kannaka)
 
 ```sh
 brew install nickflach/kannaka/kannaka

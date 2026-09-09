@@ -170,7 +170,7 @@ const definition = {
   command,
   args: ["--top-k", topK],
   env,
-  installInstructionsUrl: "https://github.com/NickFlach/kannaka-plugin",
+  installInstructionsUrl: "https://github.com/kannaka-labs/kannaka-plugin",
   installHint: "cargo install --path . --bin kannaka-acp, then re-run scripts/install-buzz-harness.mjs",
 };
 

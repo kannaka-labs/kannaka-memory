@@ -1,6 +1,6 @@
 //! Quantum tools for the `kannaka agent` harness — give the coding agent real
 //! quantum capabilities by shelling out to the `kannaka-quantum` bridge
-//! (https://github.com/NickFlach/kannaka-quantum), which runs circuits on
+//! (https://github.com/kannaka-labs/kannaka-quantum), which runs circuits on
 //! qBraid backends (free simulator by default; real QPUs when the account has
 //! credits).
 //!
@@ -205,7 +205,7 @@ fn run_bridge(args: &[String], stdin_data: Option<&str>) -> (String, bool) {
             return (
                 format!(
                     "quantum bridge unavailable: could not run '{py} -m kannaka_quantum' ({e}). \
-                     Install it: pip install git+https://github.com/NickFlach/kannaka-quantum \
+                     Install it: pip install git+https://github.com/kannaka-labs/kannaka-quantum \
                      (set KANNAKA_QUANTUM_PYTHON if python isn't on PATH)."
                 ),
                 true,

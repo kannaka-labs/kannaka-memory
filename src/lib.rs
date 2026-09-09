@@ -117,7 +117,7 @@ pub mod dispatch;
 // attribution/integrity only — no absorb/trust/enrollment behaviour here.
 pub mod provenance;
 
-// KAX Compute District (NickFlach/kax-computer) wake/grant envelope contract:
+// KAX Compute District (kannaka-labs/kax-computer) wake/grant envelope contract:
 // Python-identical canonical JSON + Ed25519 signing, pinned by golden vectors.
 // Pure — the CLI handler in bin/handlers/compute.rs does the NATS/HTTP.
 pub mod compute_envelope;

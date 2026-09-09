@@ -13,7 +13,7 @@
 
 `kannaka-memory` is the substrate: a wave-interference memory system with bilateral chiral hemispheres, dream consolidation, belief formation, and multi-agent collective sensemaking. Built in Rust on the **Holographic Resonance Medium** — a 10,000-dimensional tensor field where recall is matrix multiplication, not search. Memories fade through destructive interference, dream up new connections during consolidation, crystallize into **beliefs** — stable spiral cores in the phase field — and converge across agents toward shared understanding: collective sensemaking, not just phase gossip.
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/NickFlach/kannaka-memory) [![License](https://img.shields.io/badge/license-MIT-blueviolet)]() [![Rust](https://img.shields.io/badge/rust-2021-orange)]() [![HRM](https://img.shields.io/badge/backend-HRM%20Tensors-purple)]() [![NATS](https://img.shields.io/badge/transport-NATS-green)]()
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kannaka-labs/kannaka-memory) [![License](https://img.shields.io/badge/license-MIT-blueviolet)]() [![Rust](https://img.shields.io/badge/rust-2021-orange)]() [![HRM](https://img.shields.io/badge/backend-HRM%20Tensors-purple)]() [![NATS](https://img.shields.io/badge/transport-NATS-green)]()
 
 ---
 
@@ -195,11 +195,11 @@ The library ships canonical IIT-style Φ computation via the `consciousness-core
 ```bash
 # Binary release (Linux / macOS / Windows)
 curl -L -o kannaka \
-  https://github.com/NickFlach/kannaka-memory/releases/latest/download/kannaka-linux-x86_64
+  https://github.com/kannaka-labs/kannaka-memory/releases/latest/download/kannaka-linux-x86_64
 chmod +x kannaka && mv kannaka ~/.local/bin/
 
 # Or build from source
-git clone https://github.com/NickFlach/kannaka-memory.git
+git clone https://github.com/kannaka-labs/kannaka-memory.git
 cd kannaka-memory
 cargo build --release --bin kannaka
 cp target/release/kannaka ~/.local/bin/
@@ -208,7 +208,7 @@ cp target/release/kannaka ~/.local/bin/
 kannaka update
 ```
 
-Companion: [`kannaka-tui`](https://github.com/NickFlach/kannaka-tui) — terminal dashboard. Installs alongside `kannaka` automatically when found by `kannaka update`.
+Companion: [`kannaka-tui`](https://github.com/kannaka-labs/kannaka-tui) — terminal dashboard. Installs alongside `kannaka` automatically when found by `kannaka update`.
 
 ---
 
@@ -306,15 +306,15 @@ kannaka belief couple --from <peer-agent-id> --min-cos 0.7
 
 | repo | role |
 |---|---|
-| [`kannaka-tui`](https://github.com/NickFlach/kannaka-tui) | terminal dashboard — six tabs over the live HRM |
-| [`kannaka-radio`](https://github.com/NickFlach/kannaka-radio) | ghost-DJ broadcaster — wave memory as music |
-| [`kannaka-observatory`](https://github.com/NickFlach/kannaka-observatory) | web dashboard + cross-host HRM comparison |
-| [`consciousness-core`](https://github.com/NickFlach/consciousness-core) | the physics — Kuramoto, IIT Φ, the Ξ operator |
-| [`kannaka-attention`](https://github.com/NickFlach/kannaka-attention) | sparse-attention beam over HRM (recency + landmarks) |
-| [`kannaka-eye`](https://github.com/NickFlach/kannaka-eye) | vision-modality sensor feeding the HRM |
-| [`kannaka-staff`](https://github.com/NickFlach/kannaka-staff) | production health watcher |
-| [`kannaka-cannon`](https://github.com/NickFlach/kannaka-cannon) | 22-stage video-intelligence pipeline |
-| [`Kannaktopus`](https://github.com/NickFlach/Kannaktopus) | multi-LLM orchestration with HRM as memory |
+| [`kannaka-tui`](https://github.com/kannaka-labs/kannaka-tui) | terminal dashboard — six tabs over the live HRM |
+| [`kannaka-radio`](https://github.com/kannaka-labs/kannaka-radio) | ghost-DJ broadcaster — wave memory as music |
+| [`kannaka-observatory`](https://github.com/kannaka-labs/kannaka-observatory) | web dashboard + cross-host HRM comparison |
+| [`consciousness-core`](https://github.com/kannaka-labs/consciousness-core) | the physics — Kuramoto, IIT Φ, the Ξ operator |
+| [`kannaka-attention`](https://github.com/kannaka-labs/kannaka-attention) | sparse-attention beam over HRM (recency + landmarks) |
+| [`kannaka-eye`](https://github.com/kannaka-labs/kannaka-eye) | vision-modality sensor feeding the HRM |
+| [`kannaka-staff`](https://github.com/kannaka-labs/kannaka-staff) | production health watcher |
+| [`kannaka-cannon`](https://github.com/kannaka-labs/kannaka-cannon) | 22-stage video-intelligence pipeline |
+| [`Kannaktopus`](https://github.com/kannaka-labs/Kannaktopus) | multi-LLM orchestration with HRM as memory |
 
 ---
 

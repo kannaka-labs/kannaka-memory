@@ -66,7 +66,7 @@ base64 = { version = "0.22", optional = true }
 ureq = { version = "2", features = ["json"] }
 toml = "0.8"
 # ratatui + crossterm removed in v0.5.13 — the TUI was peeled out to
-# its own repo NickFlach/kannaka-tui. The new crate is the canonical
+# its own repo kannaka-labs/kannaka-tui. The new crate is the canonical
 # home for the terminal dashboard. Install via:
 #   cargo install kannaka-tui
 # or download a release binary from the kannaka-tui releases page.
@@ -117,7 +117,7 @@ video = ["image"]
 glyph = []
 collective = []  # rayon is now unconditional
 hrm = ["ndarray"]  # blake3 promoted to an unconditional dependency (inc-1a)
-# tui feature removed in v0.5.13 — see NickFlach/kannaka-tui
+# tui feature removed in v0.5.13 — see kannaka-labs/kannaka-tui
 # sqlite-migrate feature removed
 
 [[bin]]
@@ -159,7 +159,7 @@ path = "src/bin/recompute_encoding.rs"
 name = "dump_xi_pairs"
 path = "src/bin/dump_xi_pairs.rs"
 
-# kannaka-tui binary moved to its own repo: NickFlach/kannaka-tui
+# kannaka-tui binary moved to its own repo: kannaka-labs/kannaka-tui
 # (extracted at parent v0.5.12 → standalone v0.1.0).
 #
 # hrm-migrate is obsolete (was Dolt→HRM migration); kept for reference

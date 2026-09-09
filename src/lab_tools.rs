@@ -1053,7 +1053,7 @@ fn run_bridge(args: &[String]) -> (String, bool) {
             return (
                 format!(
                     "quantum bridge unavailable: could not run '{py} -m kannaka_quantum' ({e}). \
-                     Install it: pip install git+https://github.com/NickFlach/kannaka-quantum \
+                     Install it: pip install git+https://github.com/kannaka-labs/kannaka-quantum \
                      (set KANNAKA_QUANTUM_PYTHON if python isn't on PATH)."
                 ),
                 true,

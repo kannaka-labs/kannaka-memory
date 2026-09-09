@@ -31,7 +31,7 @@ done
 
 if [ "${1:-}" = "--eye" ]; then
   echo "→ kannaka-eye (sibling Node service — the glyph producer)"
-  [ -d "$HOME/kannaka-eye" ] || git clone -q https://github.com/NickFlach/kannaka-eye.git "$HOME/kannaka-eye"
+  [ -d "$HOME/kannaka-eye" ] || git clone -q https://github.com/kannaka-labs/kannaka-eye.git "$HOME/kannaka-eye"
   ( cd "$HOME/kannaka-eye" && git pull -q )
   bash "$HOME/kannaka-eye/ops/run-eye.sh" >/dev/null 2>&1 &  # quick smoke; real run is the unit
   sudo install -m644 "$HOME/kannaka-eye/ops/kannaka-eye.service" /etc/systemd/system/kannaka-eye.service

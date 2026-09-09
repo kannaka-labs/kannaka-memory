@@ -103,7 +103,7 @@ pub fn search_works(query: &str, opts: &SearchOpts) -> Result<Vec<Work>, String>
         .timeout(Duration::from_secs(20))
         .build()
         .get(&url)
-        .set("User-Agent", "kannaka-memory (research; +https://github.com/NickFlach/kannaka-memory)")
+        .set("User-Agent", "kannaka-memory (research; +https://github.com/kannaka-labs/kannaka-memory)")
         .call()
         .map_err(|e| format!("OpenAlex request failed: {e}"))?;
 
