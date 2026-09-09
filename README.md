@@ -311,7 +311,7 @@ kannaka belief couple --from <peer-agent-id> --min-cos 0.7
 | [`kannaka-observatory`](https://github.com/kannaka-labs/kannaka-observatory) | web dashboard + cross-host HRM comparison |
 | [`consciousness-core`](https://github.com/kannaka-labs/consciousness-core) | the physics — Kuramoto, IIT Φ, the Ξ operator |
 | [`kannaka-attention`](https://github.com/kannaka-labs/kannaka-attention) | sparse-attention beam over HRM (recency + landmarks) |
-| [`kannaka-eye`](https://github.com/NickFlach/kannaka-eye) | vision-modality sensor feeding the HRM |
+| [`kannaka-eye`](https://github.com/kannaka-labs/kannaka-eye) | vision-modality sensor feeding the HRM |
 | [`kannaka-staff`](https://github.com/kannaka-labs/kannaka-staff) | production health watcher |
 | [`kannaka-cannon`](https://github.com/kannaka-labs/kannaka-cannon) | 22-stage video-intelligence pipeline |
 | [`Kannaktopus`](https://github.com/kannaka-labs/Kannaktopus) | multi-LLM orchestration with HRM as memory |
