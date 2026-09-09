@@ -9,9 +9,12 @@ so a live reader never sees a half-built file.
   refresh_corpus.py --root ... --only kannaka --dry-run # plan one slice, touch nothing
 
 Stages
-  1 discover  both accounts' non-fork repos from the GitHub API (token at --token-file), plus the
-              pinned fork list; writes source-repos.tsv. A repo that has vanished is left on disk
-              and reported, never silently deleted.
+  1 discover  both accounts' and both organisations' non-fork repos from the GitHub API (token at
+              --token-file), plus the pinned fork list; writes source-repos.tsv. A repo that has
+              vanished is left on disk and reported, never silently deleted. A repo that moved
+              from an account into an organisation (kannaka-labs 2026-09-07, spacechild-labs
+              2026-09-09) is recognised by name and its checkout and graph are renamed to the new
+              owner, so it is neither cloned twice nor counted as vanished.
   2 sync      clone what is new, `fetch --depth 1` + `reset --hard` what exists. Shallow clones
               stay shallow; a repo whose default branch was renamed is re-pointed.
   3 extract   re-run graphify ONLY where the checkout's HEAD differs from the graph's
@@ -44,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ACCOUNTS = ("NickFlach", "flaukowski")
+ORGS = ("kannaka-labs", "spacechild-labs")
 API = "https://api.github.com"
 
 
@@ -80,19 +84,25 @@ def authenticated_login(token: str | None) -> str | None:
 
 
 def discover(token: str | None) -> tuple[list[str], dict[str, str]]:
-    """(non-fork repos, {repo: default_branch}) across both accounts.
+    """(non-fork repos, {repo: default_branch}) across both accounts and both organisations.
 
     /users/<login>/repos lists only PUBLIC repos even with a token, so the account that owns the
     token is read from /user/repos instead — otherwise every private repo looks like it vanished
-    and a new private repo is never discovered (2026-09-07: 54 of them)."""
+    and a new private repo is never discovered (2026-09-07: 54 of them). An organisation's
+    repos come from /orgs/<org>/repos, which lists private ones for a member's token; the
+    affiliation=owner listing never includes them, which is why the 26 repos moved to
+    kannaka-labs read as "29 on disk missing from discovery" on 2026-09-08."""
     me = authenticated_login(token)
     repos: list[str] = []
     branches: dict[str, str] = {}
     seen_any = False
-    for account in ACCOUNTS:
-        url = (f"{API}/user/repos?per_page=100&affiliation=owner"
-               if me and account.lower() == me.lower()
-               else f"{API}/users/{account}/repos?per_page=100&type=owner")
+    for account in ACCOUNTS + ORGS:
+        if account in ORGS:
+            url = f"{API}/orgs/{account}/repos?per_page=100&type=all"
+        else:
+            url = (f"{API}/user/repos?per_page=100&affiliation=owner"
+                   if me and account.lower() == me.lower()
+                   else f"{API}/users/{account}/repos?per_page=100&type=owner")
         page = 1
         while True:
             try:
@@ -116,6 +126,35 @@ def discover(token: str | None) -> tuple[list[str], dict[str, str]]:
     if not seen_any:
         return [], {}
     return sorted(set(repos)), branches
+
+
+def migrate_moved(root: Path, discovered: list[str]) -> list[tuple[str, str]]:
+    """A repo discovered under an organisation whose checkout still sits under a personal
+    account (same name, exactly one candidate) is the same repository after a transfer: rename
+    its checkout and its graph directory to the new owner and repoint origin. Without this the
+    org copy would be cloned fresh beside the old one, both would be extracted, and the index
+    would carry every moved repo twice. Two same-named checkouts under different accounts are
+    ambiguous and are left alone with a log line."""
+    moves: list[tuple[str, str]] = []
+    for full in discovered:
+        owner, _, name = full.partition("/")
+        if owner not in ORGS or (root / "repos" / owner / name).exists():
+            continue
+        candidates = [f"{acct}/{name}" for acct in ACCOUNTS if (root / "repos" / acct / name / ".git").exists()]
+        if len(candidates) != 1:
+            if candidates:
+                log(f"  {full}: {len(candidates)} same-named checkouts ({', '.join(candidates)}) — not migrating")
+            continue
+        old = candidates[0]
+        for kind in ("repos", "graphs"):
+            src, dst = root / kind / old, root / kind / full
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(src, dst)
+        r = run(["git", "remote", "set-url", "origin", f"https://github.com/{full}.git"], cwd=root / "repos" / full, timeout=60)
+        log(f"  moved {old} -> {full}" + ("" if r.returncode == 0 else f" (remote not repointed: {(r.stderr or '').strip()[:80]})"))
+        moves.append((old, full))
+    return moves
 
 
 # ---------------------------------------------------------------- 2. sync
@@ -298,6 +337,9 @@ def main(argv=None) -> int:
 
     # 1. discover
     discovered, branches = discover(token)
+    migrated = migrate_moved(root, discovered) if discovered and not a.dry_run else []
+    if migrated:
+        log(f"{len(migrated)} checkout(s) followed their repository into an organisation")
     on_disk = sorted("/".join(p.parts[-2:]) for p in (root / "repos").glob("*/*") if (p / ".git").exists())
     forks_file = root / "fork-repos.tsv"
     forks = [ln.split("\t")[0].strip() for ln in forks_file.read_text(encoding="utf-8").splitlines()
@@ -352,7 +394,7 @@ def main(argv=None) -> int:
     idx = {"ok": None}
     if a.dry_run:
         log("dry-run: would rebuild the index")
-    elif any(e["ok"] and not e.get("no_code") for e in extracted) or not index.exists() or a.force_extract:
+    elif any(e["ok"] and not e.get("no_code") for e in extracted) or not index.exists() or a.force_extract or migrated:
         log("rebuilding the index")
         idx = build_index(root, index, builder)
         log(f"index: {idx}" if idx["ok"] else f"index FAILED: {idx.get('error')}")

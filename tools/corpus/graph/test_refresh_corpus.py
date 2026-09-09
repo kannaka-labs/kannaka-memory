@@ -127,6 +127,31 @@ def test_index_swap_is_atomic_and_failure_keeps_the_old_index(root: Path):
     assert index.read_text(encoding="utf-8") == "NEW INDEX", "a failed build must not touch the live index"
 
 
+def test_migrate_moved_follows_a_repo_into_its_org_by_name(root: Path):
+    """After an org transfer the checkout still sits under the personal account. The refresh
+    must rename it (and its graph) rather than clone the org copy beside it; two same-named
+    checkouts under different accounts are ambiguous and stay put."""
+    def checkout(owner, name):
+        d = root / "repos" / owner / name / ".git"
+        d.mkdir(parents=True, exist_ok=True)
+        (root / "graphs" / owner / name / "graphify-out").mkdir(parents=True, exist_ok=True)
+        (root / "graphs" / owner / name / "graphify-out" / "graph.json").write_text("{}", encoding="utf-8")
+    checkout("NickFlach", "SpaceChild")
+    checkout("NickFlach", "0xSCADA")
+    checkout("flaukowski", "0xSCADA")          # ambiguous twin
+    checkout("NickFlach", "stays")             # not discovered under an org
+    discovered = ["spacechild-labs/SpaceChild", "kannaka-labs/0xSCADA", "NickFlach/stays",
+                  "spacechild-labs/brand-new"]  # brand-new has no checkout at all -> plain clone later
+    moves = rc.migrate_moved(root, discovered)
+    assert moves == [("NickFlach/SpaceChild", "spacechild-labs/SpaceChild")], moves
+    assert (root / "repos" / "spacechild-labs" / "SpaceChild" / ".git").is_dir()
+    assert not (root / "repos" / "NickFlach" / "SpaceChild").exists()
+    assert (root / "graphs" / "spacechild-labs" / "SpaceChild" / "graphify-out" / "graph.json").exists(), "the graph moves too"
+    assert (root / "repos" / "NickFlach" / "0xSCADA").exists() and (root / "repos" / "flaukowski" / "0xSCADA").exists(), "ambiguous twins untouched"
+    assert (root / "repos" / "NickFlach" / "stays").exists()
+    assert rc.migrate_moved(root, discovered) == [], "a second run finds nothing to move"
+
+
 def test_a_shrunken_listing_is_not_treated_as_deletions():
     on_disk = [f"acct/r{i}" for i in range(100)]
     discovered = ["acct/r0", "acct/r1"]  # e.g. the API hid every private repo
@@ -153,6 +178,8 @@ def main():
         print("ok test_staleness_by_graphify_version")
         test_extract_passes_force_and_stamps_the_version(root)
         print("ok test_extract_passes_force_and_stamps_the_version")
+        test_migrate_moved_follows_a_repo_into_its_org_by_name(root)
+        print("ok test_migrate_moved_follows_a_repo_into_its_org_by_name")
         test_graphed_commit_survives_a_broken_graph(root)
         print("ok test_graphed_commit_survives_a_broken_graph")
         test_index_swap_is_atomic_and_failure_keeps_the_old_index(root)
