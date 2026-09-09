@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 (`clap` 4 builder API as in `src/cli.rs`, `serde`/`serde_json`, `ureq` 2, `sha2`, `ed25519-dalek` 2, `dirs` 5, `tempfile` 3 in dev-deps), POSIX sh, PowerShell 5.1, Node 18+ (`node --test`).
 
-**Spec:** `kannaka-labs/kannaka-plugin` PR #19, `docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md`. Sections referenced as §N. The installer half of the same spec is planned in kannaka-plugin (`docs/superpowers/plans/2026-09-09-fresh-install-installer.md`, PR #21); the receipt shape below is the one that plan writes.
+**Spec:** `kannaka-labs/kannaka-plugin` PR #19, `docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md` **revision 2**. Sections referenced as §N. The installer half of the same spec is planned in kannaka-plugin (`docs/superpowers/plans/2026-09-09-fresh-install-installer.md`, PR #21); the receipt shape below is the one that plan writes.
 
 ## Global Constraints
 
@@ -26,28 +26,33 @@
 
 ## Rulings
 
-1. **`kannaka` itself keeps updating from the latest GitHub release** (the existing, tested `self_update` path with the sha256 sidecar). The manifest governs the *siblings*. Pinning the engine itself to the manifest is a follow-up once kannaka-library publishes a manifest per release; today the manifest lags the release by design (it pinned 0.16.1 while 0.16.2 was current).
+1. **`kannaka` itself keeps updating from the latest GitHub release** (the existing, tested `self_update` path with the sha256 sidecar). The manifest governs the *siblings*. Spec §7 rev 2 says the same; the engine joins the pinned set once kannaka-library publishes a manifest per release.
 2. **`kannaka update` rewrites the receipt in place, without rotation.** Rotation is for installs; an update every few days would otherwise fill all three slots with near-identical receipts and lose the install that mattered.
 3. **Without a receipt, `kannaka update` refreshes the siblings it finds beside itself** (today's behaviour, plus `kannaka-hdl`) and then writes a first receipt with `installer = "kannaka update@<VERSION>"`, so the next uninstall has something to read.
-4. **`--purge` asks once when stdin is a terminal** (`This removes <data dir> including your identity key and memory. Type 'purge' to continue:`); `--yes` skips it; a non-tty stdin proceeds (scriptable, like every other verb). The spec does not mention a prompt; deleting a node key without one is the kind of thing a person should have to type.
-5. **The rc-block removal rule**: delete the sentinel line (`# kannaka` or `# kannaka swarm credentials`) and every following line up to the next blank line or end of file. Both blocks the installer writes are exactly one sentinel plus one line; the rule tolerates a user having added a line inside the block.
-6. **Manifest signature verification in Rust** uses `ed25519-dalek` (already a dependency) over the raw manifest bytes, with the public key parsed from the PEM `manifest.pub` (SubjectPublicKeyInfo: the key is the last 32 bytes of the DER). A signature that fails means the manifest is ignored and the siblings fall back to their repos' latest releases, exactly as `install.sh` does.
+4. **`--purge` needs consent** (§6 rev 2): on a terminal it asks for the word `purge`; with no terminal and no `--yes` it prints the question and exits 3. **`--purge` moves the data dir aside** to `<data dir>.removed-<UTC timestamp>` and prints the path; `--delete-data` deletes it. Only a data dir under `$HOME` that is not `$HOME` itself is touched at all; anything else is printed.
+5. **Rc blocks are removed between the `# kannaka…` sentinel and the `# /kannaka` closer** (§5 rev 2), plus the one blank line the installer wrote before the sentinel. A legacy block with no closer loses the sentinel and only the lines the installer is known to have written (`RC_KNOWN_LINES`); any other line stays and is reported.
+6. **Manifest signature verification in Rust** uses `ed25519-dalek` (already a dependency) over the raw manifest bytes, with the public key parsed from the PEM `manifest.pub` (SubjectPublicKeyInfo: the key is the last 32 bytes of the DER). A signature that fails means the manifest is ignored and the siblings are left as they are.
 7. **The Windows self-rename is unit-tested on Windows, not in CI.** kannaka-memory CI is ubuntu-only and its sibling-checkout matrix is not worth duplicating for one rename. The test is `#[cfg(windows)]`, the implementer runs it on this Windows box, and the review package quotes the run.
+8. **The uninstall fallback is the three installer directories** (`~/.local/bin`, `~/.cargo/bin`, `%LOCALAPPDATA%\Programs\kannaka`), §6 rev 2. A kannaka anywhere else on `PATH` is named with the package manager's own command and never touched.
+9. **The Windows user PATH is edited with `reg add`, never `setx`** (setx truncates at 1024 characters). Only an entry the receipt's `path_edits` lists is removed.
+10. **Registrations are reversed in order**: `claude-statusline` (run the plugin's `statusline/setup.sh off`, which restores the previous `statusLine`) before `claude-plugin`, before `claude-marketplace`, so the setup script is still on disk when it is needed.
+11. **The npm postinstall merges** its one `files` entry into the existing receipt and writes atomically; it never rotates and never overwrites the other fields (§2 rev 2).
 
 ## File map
 
 | file | responsibility |
 |---|---|
-| `scripts/install.sh`, `scripts/install.ps1` | forwarders to the canonical installer; header stops advertising a hostname that does not exist |
-| `scripts/tests/install-forwarder.test.sh` | runs the POSIX forwarder with a stubbed `curl`, asserts the canonical URL and argument pass-through |
-| `src/install_receipt.rs` | `Receipt` and entry types, `receipt_path`, `load_from`, `write_atomic`, `write_rotated`, `installed_components` |
-| `src/uninstall.rs` | `banner_component`, `Options`, `Plan`, `plan`, `execute`, `fallback_candidates`, `strip_rc_block`, `purge_print_only` |
-| `src/update_components.rs` | `Manifest` loading + signature check, `refresh_all(agent)` |
+| `scripts/install.sh`, `scripts/install.ps1` | forwarders to the canonical installer; a failed fetch is a failure |
+| `scripts/tests/install-forwarder.test.sh` | runs the POSIX forwarder with a stubbed `curl`, asserts the canonical URL, argument and environment pass-through, failure on a failed fetch |
+| `src/install_receipt.rs` | `Receipt` and entry types (incl. `extras`, `path_edits`, `declined`), `receipt_path`, `load_from`, `write_atomic`, `write_rotated` (complete → lock → rotate → rename), `sha256_hex` |
+| `tests/fixtures/receipt-from-install-sh.json` | the receipt kannaka-plugin's `install.sh` produced in its test; parsed here so both repos test the same document |
+| `src/uninstall.rs` | `banner_component`, `Options`, `Plan`, `DataAction`, `plan`, `fallback_candidates`, `elsewhere_on_path`, `strip_rc_block`, `purge_print_only`, `execute`, `render` |
+| `src/update_components.rs` | `Manifest` loading + signature check, `swap_in`, `record_refresh`, `refresh_with` (testable core), `refresh_all` |
 | `src/cli.rs` | `uninstall` subcommand and `handle_uninstall`; `update` long_about updated |
 | `src/config.rs` | `self_update` calls `update_components::refresh_all`; `windows_swap_binary` and `platform_triple` become `pub(crate)` |
 | `src/lib.rs` | `pub mod install_receipt; pub mod uninstall; pub mod update_components;` |
-| `packaging/npm/install.js`, `packaging/npm/receipt.js`, `packaging/npm/receipt.test.js` | npm postinstall writes the receipt |
-| `.github/workflows/ci.yml` | run the forwarder test and the npm test |
+| `packaging/npm/install.js`, `packaging/npm/receipt.js`, `packaging/npm/receipt.test.js` | npm postinstall merges into the receipt |
+| `.github/workflows/ci.yml` | run the forwarder test, the npm test, and the old-owner grep guard |
 | `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` | 0.17.0 |
 
 ---
@@ -185,6 +190,7 @@ git commit -m "scripts/install: forward to the canonical kannaka-plugin installe
 
 **Files:**
 - Create: `src/install_receipt.rs`
+- Create: `tests/fixtures/receipt-from-install-sh.json` — copy `tests/fixtures/receipt-from-install-sh.json` from the kannaka-plugin checkout (produced by its lifecycle test, plan A Task 6). If that file does not exist yet, create it with the content in Step 1 below; it has the same shape.
 - Modify: `src/lib.rs` (add `pub mod install_receipt;` after `pub mod config;` at line 88)
 
 **Interfaces:**
@@ -193,21 +199,68 @@ git commit -m "scripts/install: forward to the canonical kannaka-plugin installe
 ```rust
 pub const SCHEMA: u32 = 1;
 pub const FILE_NAME: &str = "install.json";
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)] pub struct Receipt { … }
-#[derive(…)] pub struct FileEntry { pub path: PathBuf, pub sha256: String, pub component: String, pub version: String }
-#[derive(…)] pub struct RcEdit { pub file: PathBuf, pub sentinel: String }
-#[derive(…)] pub struct ConfigEdit { pub file: PathBuf, pub sections: Vec<String> }
-#[derive(…)] #[serde(untagged)] pub enum Credential { File { file: PathBuf }, UserEnv { kind: String, names: Vec<String> } }
-#[derive(…)] pub struct Registration { pub kind: String, pub name: String }
-#[derive(…)] pub struct Removed { pub path: String, pub component: String, pub reason: String }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)] pub struct Receipt { … }   // every list field #[serde(default)]
+pub struct FileEntry { pub path: PathBuf, pub sha256: String, pub component: String, pub version: String }
+pub struct Extra { pub path: PathBuf, pub kind: String }
+pub struct RcEdit { pub file: PathBuf, pub sentinel: String }
+pub struct PathEdit { pub scope: String, pub entry: String }
+pub struct ConfigEdit { pub file: PathBuf, pub sections: Vec<String> }
+#[serde(untagged)] pub enum Credential { File { file: PathBuf }, UserEnv { kind: String, names: Vec<String> } }
+pub struct Registration { pub kind: String, #[serde(default)] pub name: String }
+pub struct Removed { pub path: String, pub component: String, pub reason: String }
+pub struct Declined { pub path: String, pub reason: String }
 pub fn receipt_path() -> PathBuf                                   // KannakaConfig::data_dir().join(FILE_NAME)
 pub fn load_from(path: &Path) -> Result<Option<Receipt>, String>   // Ok(None) when absent
 pub fn write_atomic(path: &Path, r: &Receipt) -> Result<(), String>   // tmp + rename, no rotation
-pub fn write_rotated(path: &Path, r: &Receipt) -> Result<(), String>  // .2->.3, .1->.2, cur->.1, sets r.previous
+pub fn write_rotated(path: &Path, r: &Receipt) -> Result<(), String>  // complete tmp, then .2->.3, .1->.2, cur->.1, then rename
 pub fn sha256_hex(bytes: &[u8]) -> String
 ```
 
-- [ ] **Step 1: Write the failing tests** (at the bottom of the new file, inside `#[cfg(test)] mod tests`)
+- [ ] **Step 1: The fixture and the failing tests**
+
+If the plugin's fixture is not available, create `tests/fixtures/receipt-from-install-sh.json`:
+
+```json
+{
+  "schema": 1,
+  "installed_at": "2026-09-09T10:00:00Z",
+  "installer": "kannaka-labs/kannaka-plugin/install/install.sh@2",
+  "manifest": "latest",
+  "platform": "linux-x86_64",
+  "files": [
+    {"path": "/tmp/tmp.abc/home/.local/bin/kannaka", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "component": "kannaka", "version": "9.9.9"},
+    {"path": "/tmp/tmp.abc/home/.local/bin/kannaka-tui", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "component": "kannaka-tui", "version": "9.9.9"},
+    {"path": "/tmp/tmp.abc/home/.local/bin/kannaka-hdl", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "component": "kannaka-hdl", "version": "9.9.9"}
+  ],
+  "extras": [
+  ],
+  "rc_edits": [
+    {"file": "/tmp/tmp.abc/home/.bashrc", "sentinel": "# kannaka swarm credentials"}
+  ],
+  "path_edits": [],
+  "config_edits": [
+  ],
+  "credentials": [
+  ],
+  "registrations": [
+    {"kind": "claude-marketplace", "name": "kannaka-labs/kannaka-plugin"},
+    {"kind": "claude-plugin", "name": "kannaka@kannaka"}
+  ],
+  "removed": [
+    {"path": "/tmp/tmp.abc/home/.local/bin/kannaka", "component": "kannaka", "reason": "replaced"},
+    {"path": "/tmp/tmp.abc/home/.cargo/bin/kannaka", "component": "kannaka", "reason": "cargo install era"},
+    {"path": "/tmp/tmp.abc/home/shadow/kannaka", "component": "kannaka", "reason": "earlier on PATH than /tmp/tmp.abc/home/.local/bin"},
+    {"path": "brew:kannaka", "component": "kannaka", "reason": "brew formula"}
+  ],
+  "declined": [
+    {"path": "/tmp/tmp.abc/home/.cargo/bin/kannaka-hdl", "reason": "not kannaka"},
+    {"path": "/tmp/tmp.abc/outside-bin/kannaka", "reason": "outside your home; it is earlier on PATH than /tmp/tmp.abc/home/.local/bin and will shadow the new kannaka"}
+  ],
+  "previous": []
+}
+```
+
+Tests, at the bottom of the new module inside `#[cfg(test)] mod tests`:
 
 ```rust
 #[cfg(test)]
@@ -222,11 +275,14 @@ mod tests {
             manifest: "latest".into(),
             platform: "linux-x86_64".into(),
             files: vec![FileEntry { path: "/h/.local/bin/kannaka".into(), sha256: "ab".repeat(32), component: "kannaka".into(), version: "0.17.0".into() }],
+            extras: vec![Extra { path: "/h/Desktop/Link Kannaka.command".into(), kind: "launcher".into() }],
             rc_edits: vec![RcEdit { file: "/h/.bashrc".into(), sentinel: "# kannaka".into() }],
+            path_edits: vec![],
             config_edits: vec![],
             credentials: vec![Credential::File { file: "/h/.kannaka-nats.env".into() }],
-            registrations: vec![Registration { kind: "claude-plugin".into(), name: "kannaka@kannaka".into() }],
+            registrations: vec![Registration { kind: "claude-plugin".into(), name: "kannaka@kannaka".into() }, Registration { kind: "claude-statusline".into(), name: String::new() }],
             removed: vec![],
+            declined: vec![],
             previous: vec![],
         }
     }
@@ -255,28 +311,24 @@ mod tests {
     }
 
     #[test]
-    fn the_installers_receipt_parses_with_removed_and_previous() {
-        // Shape written by kannaka-plugin's install.sh (its plan, Task 3).
-        let text = r#"{
-  "schema": 1, "installed_at": "2026-09-09T04:00:00Z",
-  "installer": "kannaka-labs/kannaka-plugin/install/install.sh@2", "manifest": "library@2026-09-08T00:00:00Z",
-  "platform": "linux-x86_64",
-  "files": [{"path": "/h/.local/bin/kannaka", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "component": "kannaka", "version": "0.16.2"}],
-  "rc_edits": [], "config_edits": [], "credentials": [], "registrations": [],
-  "removed": [{"path": "/h/.cargo/bin/kannaka", "component": "kannaka", "reason": "cargo install era"}],
-  "previous": ["install.json.1"]
-}"#;
-        let r: Receipt = serde_json::from_str(text).unwrap();
-        assert_eq!(r.removed[0].reason, "cargo install era");
-        assert_eq!(r.previous, vec!["install.json.1"]);
+    fn a_receipt_the_real_installer_wrote_parses() {
+        // The document install.sh produced in kannaka-plugin's lifecycle test:
+        // the two repos are held to the same file.
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/receipt-from-install-sh.json")).unwrap();
+        let r: Receipt = serde_json::from_str(&text).unwrap();
+        assert_eq!(r.schema, 1);
+        assert!(r.installer.starts_with("kannaka-labs/kannaka-plugin/install/install.sh@"));
+        assert!(r.files.iter().any(|f| f.component == "kannaka"));
+        assert!(r.removed.iter().any(|x| x.reason == "cargo install era"));
+        assert!(r.declined.iter().any(|x| x.reason == "not kannaka"));
+        assert!(r.registrations.iter().any(|x| x.kind == "claude-plugin"));
     }
 
     #[test]
     fn missing_optional_lists_default_to_empty() {
-        // An older receipt without "removed"/"previous" must still load.
-        let text = r#"{"schema":1,"installed_at":"t","installer":"i","manifest":"m","platform":"p","files":[],"rc_edits":[],"config_edits":[],"credentials":[],"registrations":[]}"#;
+        let text = r#"{"schema":1,"installed_at":"t","installer":"i","manifest":"m","platform":"p","files":[]}"#;
         let r: Receipt = serde_json::from_str(text).unwrap();
-        assert!(r.removed.is_empty() && r.previous.is_empty());
+        assert!(r.removed.is_empty() && r.previous.is_empty() && r.extras.is_empty() && r.path_edits.is_empty() && r.declined.is_empty());
     }
 
     #[test]
@@ -294,6 +346,27 @@ mod tests {
         assert_eq!(load_from(&dir.path().join("install.json.1")).unwrap().unwrap().installed_at, "t3");
         assert_eq!(load_from(&dir.path().join("install.json.3")).unwrap().unwrap().installed_at, "t1");
         assert!(!dir.path().join("install.json.4").exists());
+        assert!(!dir.path().join("install.json.lock").exists());
+    }
+
+    #[test]
+    fn write_rotated_refuses_a_fresh_lock_and_ignores_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(FILE_NAME);
+        let lock = dir.path().join("install.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        assert!(write_rotated(&p, &sample()).is_err());
+        assert!(!p.exists());
+        // age the lock past ten minutes
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+        filetime_set(&lock, old);
+        write_rotated(&p, &sample()).unwrap();
+        assert!(p.exists() && !lock.exists());
+    }
+
+    fn filetime_set(p: &Path, t: std::time::SystemTime) {
+        let f = std::fs::File::open(p).unwrap();
+        f.set_modified(t).unwrap();
     }
 
     #[test]
@@ -325,16 +398,17 @@ Expected: compile error (module does not exist).
 //! The install receipt: what the installer wrote on this machine, so that
 //! `kannaka uninstall` can reverse exactly that and `kannaka update` can
 //! refresh exactly that. Written by the installers in kannaka-plugin, by the
-//! npm postinstall, and by this crate (`update_components`, and `uninstall`
-//! when it removes its own receipt). One shape, one file, one writer at a time.
+//! npm postinstall (merge, never rotate), and by this crate (`update_components`).
+//! One shape, one file, one writer at a time.
 //!
-//! Spec: kannaka-plugin/docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md §3.
+//! Spec: kannaka-plugin/docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md §3 (rev 2).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA: u32 = 1;
 pub const FILE_NAME: &str = "install.json";
+const LOCK_STALE_SECS: u64 = 10 * 60;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Receipt {
@@ -343,36 +417,28 @@ pub struct Receipt {
     pub installer: String,
     pub manifest: String,
     pub platform: String,
-    pub files: Vec<FileEntry>,
-    pub rc_edits: Vec<RcEdit>,
-    pub config_edits: Vec<ConfigEdit>,
-    pub credentials: Vec<Credential>,
-    pub registrations: Vec<Registration>,
-    #[serde(default)]
-    pub removed: Vec<Removed>,
-    #[serde(default)]
-    pub previous: Vec<String>,
+    #[serde(default)] pub files: Vec<FileEntry>,
+    #[serde(default)] pub extras: Vec<Extra>,
+    #[serde(default)] pub rc_edits: Vec<RcEdit>,
+    #[serde(default)] pub path_edits: Vec<PathEdit>,
+    #[serde(default)] pub config_edits: Vec<ConfigEdit>,
+    #[serde(default)] pub credentials: Vec<Credential>,
+    #[serde(default)] pub registrations: Vec<Registration>,
+    #[serde(default)] pub removed: Vec<Removed>,
+    #[serde(default)] pub declined: Vec<Declined>,
+    #[serde(default)] pub previous: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct FileEntry {
-    pub path: PathBuf,
-    pub sha256: String,
-    pub component: String,
-    pub version: String,
-}
-
+pub struct FileEntry { pub path: PathBuf, pub sha256: String, pub component: String, pub version: String }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct RcEdit {
-    pub file: PathBuf,
-    pub sentinel: String,
-}
-
+pub struct Extra { pub path: PathBuf, pub kind: String }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct ConfigEdit {
-    pub file: PathBuf,
-    pub sections: Vec<String>,
-}
+pub struct RcEdit { pub file: PathBuf, pub sentinel: String }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PathEdit { pub scope: String, pub entry: String }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ConfigEdit { pub file: PathBuf, pub sections: Vec<String> }
 
 /// POSIX installs record the credentials FILE; Windows installs record the
 /// user-environment variable NAMES (there is no file). Both must load.
@@ -384,17 +450,11 @@ pub enum Credential {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Registration {
-    pub kind: String,
-    pub name: String,
-}
-
+pub struct Registration { pub kind: String, #[serde(default)] pub name: String }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Removed {
-    pub path: String,
-    pub component: String,
-    pub reason: String,
-}
+pub struct Removed { pub path: String, pub component: String, pub reason: String }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Declined { pub path: String, pub reason: String }
 
 /// `<data dir>/install.json`, honouring `KANNAKA_DATA_DIR`.
 pub fn receipt_path() -> PathBuf {
@@ -413,32 +473,67 @@ pub fn load_from(path: &Path) -> Result<Option<Receipt>, String> {
         .map_err(|e| format!("{} is not a valid install receipt: {e}", path.display()))
 }
 
-/// Write `r` to `path` atomically: a temp file in the same directory, then
-/// a rename. No rotation — this is what `kannaka update` uses.
-pub fn write_atomic(path: &Path, r: &Receipt) -> Result<(), String> {
+fn write_tmp(path: &Path, r: &Receipt) -> Result<PathBuf, String> {
     let dir = path.parent().ok_or("receipt path has no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let tmp = dir.join(format!("{FILE_NAME}.tmp.{}", std::process::id()));
     let text = serde_json::to_string_pretty(r).map_err(|e| e.to_string())?;
     std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    Ok(tmp)
+}
+
+/// Write `r` to `path` atomically: a temp file in the same directory, then
+/// a rename. No rotation — what `kannaka update` and npm use.
+pub fn write_atomic(path: &Path, r: &Receipt) -> Result<(), String> {
+    let tmp = write_tmp(path, r)?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("cannot move receipt into place: {e}")
     })
 }
 
-/// Rotate `install.json` -> `.1` -> `.2` -> `.3` (the oldest is dropped),
-/// set `r.previous` to the rotated names that exist, then write atomically.
-/// This is what an INSTALL does; see write_atomic for an update.
+/// Take the writer lock (a directory: mkdir is atomic everywhere). A lock
+/// older than ten minutes belongs to a crashed writer and is replaced.
+fn take_lock(path: &Path) -> Result<PathBuf, String> {
+    let lock = PathBuf::from(format!("{}.lock", path.display()));
+    if let Err(e) = std::fs::create_dir(&lock) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists { return Err(format!("cannot create {}: {e}", lock.display())); }
+        let age = std::fs::metadata(&lock).and_then(|m| m.modified()).ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+        match age {
+            Some(a) if a.as_secs() > LOCK_STALE_SECS => {
+                let _ = std::fs::remove_dir_all(&lock);
+                std::fs::create_dir(&lock).map_err(|e| format!("cannot re-create {}: {e}", lock.display()))?;
+            }
+            _ => return Err(format!("another writer holds {} (younger than ten minutes); not writing the receipt", lock.display())),
+        }
+    }
+    Ok(lock)
+}
+
+/// Complete the temp file, take the lock, rotate `install.json` -> `.1` -> `.2`
+/// -> `.3` (the oldest is dropped), set `previous`, rename into place. A crash
+/// at any point leaves either the old receipt or the new one. What an INSTALL
+/// does; see write_atomic for an update.
 pub fn write_rotated(path: &Path, r: &Receipt) -> Result<(), String> {
+    let mut r = r.clone();
+    r.previous.clear();
+    let tmp = write_tmp(path, &r)?;
+    let lock = match take_lock(path) { Ok(l) => l, Err(e) => { let _ = std::fs::remove_file(&tmp); return Err(e); } };
     let s = path.to_string_lossy().to_string();
     let n = |k: u32| PathBuf::from(format!("{s}.{k}"));
-    if n(2).exists() { std::fs::rename(n(2), n(3)).map_err(|e| e.to_string())?; }
-    if n(1).exists() { std::fs::rename(n(1), n(2)).map_err(|e| e.to_string())?; }
-    if path.exists() { std::fs::rename(path, n(1)).map_err(|e| e.to_string())?; }
-    let mut r = r.clone();
-    r.previous = (1..=3).filter(|k| n(*k).exists()).map(|k| format!("{FILE_NAME}.{k}")).collect();
-    write_atomic(path, &r)
+    let result = (|| {
+        if n(2).exists() { std::fs::rename(n(2), n(3)).map_err(|e| e.to_string())?; }
+        if n(1).exists() { std::fs::rename(n(1), n(2)).map_err(|e| e.to_string())?; }
+        if path.exists() { std::fs::rename(path, n(1)).map_err(|e| e.to_string())?; }
+        r.previous = (1..=3).filter(|k| n(*k).exists()).map(|k| format!("{FILE_NAME}.{k}")).collect();
+        let text = serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot move receipt into place: {e}"))
+    })();
+    let _ = std::fs::remove_dir_all(&lock);
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -454,13 +549,13 @@ Add `pub mod install_receipt;` to `src/lib.rs` after line 88.
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib install_receipt::`
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/install_receipt.rs src/lib.rs
-git commit -m "install_receipt: the install receipt as a type, loaded and written atomically"
+git add src/install_receipt.rs src/lib.rs tests/fixtures/receipt-from-install-sh.json
+git commit -m "install_receipt: the install receipt as a type; complete-rotate-rename under a lock; the installer's own receipt as a fixture"
 ```
 
 ---
@@ -472,32 +567,42 @@ git commit -m "install_receipt: the install receipt as a type, loaded and writte
 - Modify: `src/lib.rs` (`pub mod uninstall;` after `install_receipt`)
 
 **Interfaces:**
-- Consumes: `install_receipt::{Receipt, Credential, load_from}`
+- Consumes: `install_receipt::{Receipt, Credential, Registration, Extra, PathEdit}`
 - Produces:
 
 ```rust
-pub type Banner = dyn Fn(&Path) -> Option<String>;          // returns the component name, or None
-pub fn banner_component(path: &Path) -> Option<String>;     // the real one: spawns `--version`, 5 s cap
-pub struct Options { pub purge: bool, pub dry_run: bool }
+pub const COMPONENTS: [&str; 3];
+pub const SYSTEMD_UNITS: [&str; 3];   // kannaka-attention.service, kannaka-eye.service, kannaka-hive-bridge.service
+pub const WINDOWS_TASK: &str;         // KannakaSeedBeacon
+pub const RC_OPEN: [&str; 2];         // "# kannaka", "# kannaka swarm credentials"
+pub const RC_CLOSE: &str;             // "# /kannaka"
+pub const LAUNCHER_MARK: &str;        // "Links your Constellation Pass"
+pub type Banner = dyn Fn(&Path) -> Option<String>;
+pub fn banner_component(path: &Path) -> Option<String>;     // spawns `--version`, 5 s cap, only under $HOME
+pub struct Options { pub purge: bool, pub delete_data: bool, pub dry_run: bool }
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
-    pub unlink: Vec<PathBuf>,               // files proven ours (receipt files, fallback finds, stale leftovers)
-    pub declined: Vec<(PathBuf, String)>,   // exists but did not identify — never touched, always reported
-    pub rc_blocks: Vec<(PathBuf, String)>,  // (file, sentinel) — purge only
-    pub remove_dirs: Vec<PathBuf>,          // the data dir — purge only
-    pub remove_files: Vec<PathBuf>,         // credential files, the receipt and its rotations
-    pub user_env: Vec<String>,              // Windows credential names — purge only
-    pub registrations: Vec<install_receipt::Registration>, // purge only
-    pub print_only: Vec<String>,            // system units / scheduled tasks: commands printed, never run
-    pub self_path: Option<PathBuf>,         // the running binary, removed last
+    pub unlink: Vec<PathBuf>,                 // proven ours
+    pub declined: Vec<(PathBuf, String)>,     // never touched, always reported
+    pub extras: Vec<PathBuf>,                 // launcher(s) whose content still carries LAUNCHER_MARK — purge only
+    pub rc_blocks: Vec<(PathBuf, String)>,    // purge only
+    pub path_edits: Vec<String>,              // Windows user-PATH entries to drop — purge only
+    pub data_dir: Option<(PathBuf, DataAction)>, // purge only; MoveAside(<target>) or Delete
+    pub remove_files: Vec<PathBuf>,           // credential files, the receipt and its rotations
+    pub user_env: Vec<String>,                // purge only
+    pub registrations: Vec<Registration>,     // purge only; claude-statusline first, then plugin, then marketplace
+    pub print_only: Vec<String>,              // commands printed, never run
+    pub self_path: Option<PathBuf>,           // removed last
 }
-pub fn plan(receipt: Option<&Receipt>, opts: &Options, home: &Path, data_dir: &Path, path_env: &str, current_exe: &Path, banner: &Banner) -> Plan;
-pub fn fallback_candidates(home: &Path, path_env: &str) -> Vec<PathBuf>;   // §4 table, POSIX and Windows rows
-pub fn strip_rc_block(text: &str, sentinel: &str) -> String;
+#[derive(Debug, Clone, PartialEq)] pub enum DataAction { MoveAside(PathBuf), Delete }
+pub fn plan(receipt: Option<&Receipt>, opts: &Options, home: &Path, data_dir: &Path, path_env: &str, current_exe: &Path, banner: &Banner, now: &str) -> Plan;
+pub fn fallback_candidates(home: &Path) -> Vec<PathBuf>;                 // ~/.local/bin, ~/.cargo/bin, %LOCALAPPDATA%\Programs\kannaka only
+pub fn elsewhere_on_path(home: &Path, path_env: &str) -> Vec<PathBuf>;   // kannaka* in other PATH dirs: declined with a hint, never touched
+pub fn strip_rc_block(text: &str, sentinel: &str) -> (String, Vec<String>);  // (new text, lines it declined to remove)
 pub fn purge_print_only(home: &Path, data_dir: &Path) -> Vec<String>;
-pub struct Report { pub removed: Vec<PathBuf>, pub still_present: Vec<PathBuf>, pub declined: Vec<(PathBuf, String)> }
-pub fn execute(plan: &Plan, run: &dyn Fn(&str, &[&str]) -> bool) -> Report;   // `run` executes a registration command; injected
-pub fn render(plan: &Plan) -> String;    // what --dry-run prints
+pub struct Report { pub removed: Vec<PathBuf>, pub parked: Vec<PathBuf>, pub still_present: Vec<PathBuf>, pub declined: Vec<(PathBuf, String)>, pub moved_aside: Option<PathBuf> }
+pub fn execute(plan: &Plan, run: &dyn Fn(&str, &[&str]) -> bool) -> Report;
+pub fn render(plan: &Plan) -> String;
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -511,7 +616,7 @@ mod tests {
 
     struct Fx { dir: tempfile::TempDir, banners: HashMap<PathBuf, String> }
     impl Fx {
-        fn new() -> Self { Fx { dir: tempfile::tempdir().unwrap(), banners: HashMap::new() } }
+        fn new() -> Self { let fx = Fx { dir: tempfile::tempdir().unwrap(), banners: HashMap::new() }; std::fs::create_dir_all(fx.home()).unwrap(); fx }
         fn home(&self) -> PathBuf { self.dir.path().join("home") }
         fn data(&self) -> PathBuf { self.home().join(".kannaka") }
         fn ours(&mut self, rel: &str, comp: &str, ver: &str) -> PathBuf {
@@ -531,23 +636,29 @@ mod tests {
         fn banner(&self) -> Box<Banner> {
             let b = self.banners.clone();
             Box::new(move |p: &Path| b.get(p).and_then(|l| l.split_whitespace().next()).map(|s| s.to_string())
-                .filter(|s| ["kannaka", "kannaka-tui", "kannaka-hdl"].contains(&s.as_str())))
+                .filter(|s| COMPONENTS.contains(&s.as_str())))
         }
         fn receipt(&self, files: &[PathBuf]) -> Receipt {
             Receipt {
                 schema: SCHEMA, installed_at: "t".into(), installer: "i".into(), manifest: "m".into(), platform: "p".into(),
                 files: files.iter().map(|p| FileEntry { path: p.clone(), sha256: "0".repeat(64), component: p.file_name().unwrap().to_string_lossy().trim_end_matches(".exe").to_string(), version: "1".into() }).collect(),
+                extras: vec![Extra { path: self.home().join("Desktop/Link Kannaka.command"), kind: "launcher".into() }],
                 rc_edits: vec![RcEdit { file: self.home().join(".bashrc"), sentinel: "# kannaka".into() }],
+                path_edits: vec![],
                 config_edits: vec![],
                 credentials: vec![Credential::File { file: self.home().join(".kannaka-nats.env") }],
-                registrations: vec![Registration { kind: "claude-plugin".into(), name: "kannaka@kannaka".into() }],
-                removed: vec![], previous: vec![],
+                registrations: vec![
+                    Registration { kind: "claude-plugin".into(), name: "kannaka@kannaka".into() },
+                    Registration { kind: "claude-statusline".into(), name: String::new() },
+                ],
+                removed: vec![], declined: vec![], previous: vec![],
             }
         }
     }
-    fn no_purge() -> Options { Options { purge: false, dry_run: false } }
-    fn purge() -> Options { Options { purge: true, dry_run: false } }
+    fn no_purge() -> Options { Options { purge: false, delete_data: false, dry_run: false } }
+    fn purge() -> Options { Options { purge: true, delete_data: false, dry_run: false } }
     fn noop_run(_: &str, _: &[&str]) -> bool { true }
+    const NOW: &str = "20260909T120000Z";
 
     #[test]
     fn receipt_plan_is_exactly_the_receipt_and_keeps_the_preserve_set() {
@@ -556,19 +667,19 @@ mod tests {
         let t = fx.ours(".local/bin/kannaka-tui", "kannaka-tui", "0.5.9");
         std::fs::create_dir_all(fx.data()).unwrap();
         std::fs::write(fx.data().join("node_key.ed25519"), b"IDENTITY").unwrap();
-        std::fs::write(fx.home().join(".bashrc"), "x\n\n# kannaka\nexport PATH=1\n").unwrap();
+        std::fs::write(fx.home().join(".bashrc"), "x\n\n# kannaka\nexport PATH=1\n# /kannaka\n").unwrap();
         std::fs::write(fx.home().join(".kannaka-nats.env"), "u").unwrap();
         let r = fx.receipt(&[k.clone(), t.clone()]);
-        let p = plan(Some(&r), &no_purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner());
+        let p = plan(Some(&r), &no_purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner(), NOW);
         assert_eq!(p.unlink, vec![t.clone()]);            // kannaka itself is self_path, not unlink
         assert_eq!(p.self_path, Some(k.clone()));
-        assert!(p.rc_blocks.is_empty() && p.remove_dirs.is_empty() && p.user_env.is_empty() && p.registrations.is_empty(), "{p:?}");
+        assert!(p.rc_blocks.is_empty() && p.data_dir.is_none() && p.user_env.is_empty() && p.registrations.is_empty() && p.extras.is_empty(), "{p:?}");
         assert_eq!(p.remove_files, vec![fx.data().join("install.json")]);   // only the receipt leaves the data dir
         let rep = execute(&p, &noop_run);
         assert!(!t.exists() && !k.exists());
         assert!(rep.still_present.is_empty());
         assert_eq!(std::fs::read(fx.data().join("node_key.ed25519")).unwrap(), b"IDENTITY");
-        assert_eq!(std::fs::read_to_string(fx.home().join(".bashrc")).unwrap(), "x\n\n# kannaka\nexport PATH=1\n");
+        assert_eq!(std::fs::read_to_string(fx.home().join(".bashrc")).unwrap(), "x\n\n# kannaka\nexport PATH=1\n# /kannaka\n");
         assert!(fx.home().join(".kannaka-nats.env").exists());
     }
 
@@ -578,7 +689,7 @@ mod tests {
         let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
         let x = fx.impostor(".local/bin/kannaka-tui");
         let r = fx.receipt(&[k.clone(), x.clone()]);
-        let p = plan(Some(&r), &no_purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner());
+        let p = plan(Some(&r), &no_purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner(), NOW);
         assert!(p.unlink.is_empty());
         assert_eq!(p.declined, vec![(x.clone(), "not kannaka".to_string())]);
         execute(&p, &noop_run);
@@ -586,57 +697,96 @@ mod tests {
     }
 
     #[test]
-    fn purge_widens_to_data_dir_rc_blocks_credentials_and_registrations() {
+    fn purge_moves_the_data_dir_aside_and_reverses_everything_else() {
         let mut fx = Fx::new();
         let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
         std::fs::create_dir_all(fx.data()).unwrap();
         std::fs::write(fx.data().join("kannaka.hrm"), b"HRM").unwrap();
-        std::fs::write(fx.home().join(".bashrc"), "x\n\n# kannaka\nexport PATH=1\n\n# other\n").unwrap();
+        std::fs::write(fx.home().join(".bashrc"), "x\n\n# kannaka\nexport PATH=1\n# /kannaka\n\n# other\n").unwrap();
         std::fs::write(fx.home().join(".kannaka-nats.env"), "u").unwrap();
+        std::fs::create_dir_all(fx.home().join("Desktop")).unwrap();
+        std::fs::write(fx.home().join("Desktop/Link Kannaka.command"), "#!/bin/sh\n# Links your Constellation Pass to this machine.\n").unwrap();
         let r = fx.receipt(&[k.clone()]);
-        let p = plan(Some(&r), &purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner());
-        assert_eq!(p.remove_dirs, vec![fx.data()]);
+        let p = plan(Some(&r), &purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner(), NOW);
+        let aside = fx.home().join(format!(".kannaka.removed-{NOW}"));
+        assert_eq!(p.data_dir, Some((fx.data(), DataAction::MoveAside(aside.clone()))));
         assert_eq!(p.rc_blocks, vec![(fx.home().join(".bashrc"), "# kannaka".to_string())]);
         assert!(p.remove_files.contains(&fx.home().join(".kannaka-nats.env")));
-        assert_eq!(p.registrations.len(), 1);
-        // execute takes `&dyn Fn`, so collect through a RefCell
+        assert_eq!(p.extras, vec![fx.home().join("Desktop/Link Kannaka.command")]);
+        assert_eq!(p.registrations.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(), vec!["claude-statusline", "claude-plugin"]);
         let ran = std::cell::RefCell::new(Vec::<String>::new());
         let run = |cmd: &str, args: &[&str]| { ran.borrow_mut().push(format!("{cmd} {}", args.join(" "))); true };
         let rep = execute(&p, &run);
-        assert!(!fx.data().exists());
+        assert!(!fx.data().exists() && aside.join("kannaka.hrm").exists(), "data dir moved aside, not deleted");
+        assert_eq!(rep.moved_aside, Some(aside));
         assert_eq!(std::fs::read_to_string(fx.home().join(".bashrc")).unwrap(), "x\n\n# other\n");
         assert!(!fx.home().join(".kannaka-nats.env").exists());
-        assert_eq!(ran.borrow().as_slice(), ["claude plugin uninstall kannaka@kannaka"]);
+        assert!(!fx.home().join("Desktop/Link Kannaka.command").exists());
+        let ran = ran.borrow();
+        assert!(ran.iter().any(|c| c.ends_with("off")), "statusline off not run: {ran:?}");
+        assert!(ran.iter().any(|c| c == "claude plugin uninstall kannaka@kannaka"), "{ran:?}");
         assert!(rep.still_present.is_empty());
+    }
+
+    #[test]
+    fn purge_with_delete_data_deletes() {
+        let mut fx = Fx::new();
+        let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
+        std::fs::create_dir_all(fx.data()).unwrap();
+        let r = fx.receipt(&[k.clone()]);
+        let p = plan(Some(&r), &Options { purge: true, delete_data: true, dry_run: false }, &fx.home(), &fx.data(), "", &k, &*fx.banner(), NOW);
+        assert_eq!(p.data_dir, Some((fx.data(), DataAction::Delete)));
+        execute(&p, &noop_run);
+        assert!(!fx.data().exists());
+        assert!(std::fs::read_dir(fx.home()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".kannaka.removed")));
+    }
+
+    #[test]
+    fn purge_never_touches_a_data_dir_outside_home_or_home_itself() {
+        let mut fx = Fx::new();
+        let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
+        let outside = fx.dir.path().join("srv-data"); std::fs::create_dir_all(&outside).unwrap();
+        let r = fx.receipt(&[k.clone()]);
+        let p = plan(Some(&r), &purge(), &fx.home(), &outside, "", &k, &*fx.banner(), NOW);
+        assert!(p.data_dir.is_none(), "{p:?}");
+        assert!(p.print_only.iter().any(|l| l.contains(&outside.display().to_string())), "{p:?}");
+        execute(&p, &noop_run);
+        assert!(outside.exists());
+        let p = plan(Some(&r), &purge(), &fx.home(), &fx.home(), "", &k, &*fx.banner(), NOW);
+        assert!(p.data_dir.is_none(), "KANNAKA_DATA_DIR=$HOME must never be purged: {p:?}");
+        assert!(p.print_only.iter().any(|l| l.contains("is your home directory")), "{p:?}");
     }
 
     #[test]
     fn purge_prints_rather_than_runs_system_commands() {
         let fx = Fx::new();
-        let outside = fx.dir.path().join("srv-data");          // a data dir outside $HOME
+        let outside = fx.dir.path().join("srv-data");
         let lines = purge_print_only(&fx.home(), &outside);
-        assert!(lines.iter().any(|l| l.contains("kannaka-attention.service")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("kannaka-eye.service")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("kannaka-hive-bridge.service")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("KannakaSeedBeacon")), "{lines:?}");
+        // units are listed only when present on this machine; the task and the outside dir always
+        for u in SYSTEMD_UNITS { if Path::new("/etc/systemd/system").join(u).exists() { assert!(lines.iter().any(|l| l.contains(u)), "{lines:?}"); } }
+        if cfg!(windows) { assert!(lines.iter().any(|l| l.contains(WINDOWS_TASK)), "{lines:?}"); }
         assert!(lines.iter().any(|l| l.contains(&outside.display().to_string())), "{lines:?}");
     }
 
     #[test]
-    fn no_receipt_falls_back_to_the_table_with_the_same_identity_check() {
+    fn no_receipt_falls_back_to_the_three_installer_dirs_and_names_the_rest() {
         let mut fx = Fx::new();
         let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
         let c = fx.ours(".cargo/bin/kannaka", "kannaka", "0.9");
-        let s = fx.ours("shadow/kannaka-tui", "kannaka-tui", "0.4");
+        let s = fx.ours("shadow/kannaka-tui", "kannaka-tui", "0.4");     // on PATH but NOT an installer dir
         let x = fx.impostor(".cargo/bin/kannaka-hdl");
         std::fs::write(fx.home().join(".local/bin/kannaka.bak-7"), b"stale").unwrap();
-        let path_env = format!("{}:{}", fx.home().join("shadow").display(), fx.home().join(".local/bin").display());
-        let p = plan(None, &no_purge(), &fx.home(), &fx.data(), &path_env, &k, &*fx.banner());
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path_env = format!("{}{sep}{}", fx.home().join("shadow").display(), fx.home().join(".local/bin").display());
+        let p = plan(None, &no_purge(), &fx.home(), &fx.data(), &path_env, &k, &*fx.banner(), NOW);
         let mut unlink = p.unlink.clone(); unlink.sort();
-        let mut want = vec![c.clone(), s.clone(), fx.home().join(".local/bin/kannaka.bak-7")]; want.sort();
+        let mut want = vec![c.clone(), fx.home().join(".local/bin/kannaka.bak-7")]; want.sort();
         assert_eq!(unlink, want);
         assert_eq!(p.self_path, Some(k));
-        assert_eq!(p.declined, vec![(x, "not kannaka".to_string())]);
+        assert!(p.declined.contains(&(x, "not kannaka".to_string())), "{:?}", p.declined);
+        let shadow = p.declined.iter().find(|(pp, _)| *pp == s).expect("shadow copy named");
+        assert!(shadow.1.contains("not an installer directory"), "{shadow:?}");
+        assert!(s.exists());
     }
 
     #[test]
@@ -645,7 +795,7 @@ mod tests {
         let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
         let t = fx.ours(".local/bin/kannaka-tui", "kannaka-tui", "1");
         let r = fx.receipt(&[k.clone(), t.clone()]);
-        let p = plan(Some(&r), &no_purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner());
+        let p = plan(Some(&r), &no_purge(), &fx.home(), &fx.data(), "", &k, &*fx.banner(), NOW);
         // make the tui undeletable: turn it into a non-empty directory
         std::fs::remove_file(&t).unwrap(); std::fs::create_dir(&t).unwrap(); std::fs::write(t.join("x"), b"").unwrap();
         let rep = execute(&p, &noop_run);
@@ -653,10 +803,20 @@ mod tests {
     }
 
     #[test]
-    fn strip_rc_block_removes_sentinel_through_next_blank_line() {
-        assert_eq!(strip_rc_block("a\n\n# kannaka\nl1\nl2\n\nb\n", "# kannaka"), "a\n\nb\n");
-        assert_eq!(strip_rc_block("a\n# kannaka\nl1", "# kannaka"), "a\n");
-        assert_eq!(strip_rc_block("a\n# kannaka swarm credentials\nl1\n", "# kannaka"), "a\n# kannaka swarm credentials\nl1\n", "sentinel must match the whole line");
+    fn strip_rc_block_removes_between_markers_and_keeps_user_lines() {
+        // closed block: everything between the markers goes, the blank line before it too
+        assert_eq!(strip_rc_block("a\n\n# kannaka\nl1\nl2\n# /kannaka\nb\n", "# kannaka"), ("a\nb\n".to_string(), vec![]));
+        // legacy block without a closer: only the sentinel and the line the installer wrote
+        let legacy = "a\n\n# kannaka\ncase \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) export PATH=\"$HOME/.local/bin:$PATH\" ;; esac\nexport EDITOR=vim\n";
+        let (out, kept) = strip_rc_block(legacy, "# kannaka");
+        assert_eq!(out, "a\n\nexport EDITOR=vim\n");
+        assert!(kept.is_empty());
+        // a legacy block whose next line is not ours: it is kept and reported
+        let (out, kept) = strip_rc_block("a\n# kannaka\nalias g=git\n", "# kannaka");
+        assert_eq!(out, "a\nalias g=git\n");
+        assert_eq!(kept, vec!["alias g=git"]);
+        // the sentinel must match the whole line
+        assert_eq!(strip_rc_block("a\n# kannaka swarm credentials\nl1\n", "# kannaka").0, "a\n# kannaka swarm credentials\nl1\n");
     }
 
     #[test]
@@ -668,7 +828,7 @@ mod tests {
         let k = fx.ours(".local/bin/kannaka", "kannaka", "1");
         let x = fx.impostor(".cargo/bin/kannaka-hdl");
         let accept_all: Box<Banner> = Box::new(|_| Some("kannaka".to_string()));
-        let p = plan(None, &no_purge(), &fx.home(), &fx.data(), "", &k, &*accept_all);
+        let p = plan(None, &no_purge(), &fx.home(), &fx.data(), "", &k, &*accept_all, NOW);
         assert!(p.unlink.contains(&x), "mutant did not reach the impostor: {p:?}");
     }
 
@@ -690,6 +850,7 @@ mod tests {
         assert!(!me.exists(), "exe still at its path");
         let parked: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("kannaka.exe.bak-")).collect();
         assert_eq!(parked.len(), 1);
+        assert_eq!(rep.parked.len(), 1);
         assert!(rep.still_present.is_empty());
     }
 }
@@ -706,11 +867,12 @@ Expected: compile error (module does not exist).
 
 ```rust
 //! `kannaka uninstall`: read the receipt and reverse it. Without a receipt,
-//! fall back to the spec's table of places a kannaka can live. Either way
-//! a file is removed only when its --version banner says it is one of ours.
-//! Planning is separate from execution so --dry-run is the plan, printed.
+//! fall back to the three directories our installers write into. Either way
+//! a file is removed only when its --version banner says it is one of ours,
+//! and nothing outside $HOME is ever run or removed. Planning is separate from
+//! execution so --dry-run is the plan, printed.
 //!
-//! Spec: kannaka-plugin/docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md §4-§6.
+//! Spec: kannaka-plugin/docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md §4-§6 (rev 2).
 
 use crate::install_receipt::{self as receipt, Credential, Receipt, Registration};
 use std::path::{Path, PathBuf};
@@ -718,17 +880,31 @@ use std::path::{Path, PathBuf};
 pub const COMPONENTS: [&str; 3] = ["kannaka", "kannaka-tui", "kannaka-hdl"];
 pub const SYSTEMD_UNITS: [&str; 3] = ["kannaka-attention.service", "kannaka-eye.service", "kannaka-hive-bridge.service"];
 pub const WINDOWS_TASK: &str = "KannakaSeedBeacon";
+pub const RC_OPEN: [&str; 2] = ["# kannaka", "# kannaka swarm credentials"];
+pub const RC_CLOSE: &str = "# /kannaka";
+pub const LAUNCHER_MARK: &str = "Links your Constellation Pass";
 const RC_FILES: [&str; 4] = [".bashrc", ".zshrc", ".bash_profile", ".profile"];
-const RC_SENTINELS: [&str; 2] = ["# kannaka", "# kannaka swarm credentials"];
+/// The exact lines the installers have ever written under a sentinel, for
+/// legacy blocks that have no closing marker.
+const RC_KNOWN_LINES: [&str; 2] = [
+    r#"case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac"#,
+    r#"[ -f "$HOME/.kannaka-nats.env" ] && . "$HOME/.kannaka-nats.env""#,
+];
 
 pub type Banner = dyn Fn(&Path) -> Option<String>;
 
+fn under(path: &Path, dir: &Path) -> bool {
+    let (Ok(p), Ok(d)) = (std::fs::canonicalize(path), std::fs::canonicalize(dir)) else { return path.starts_with(dir) };
+    p.starts_with(&d)
+}
+
 /// The real identity check: run `<path> --version`, wait at most five
-/// seconds, take the first word of the first line. Anything else is None.
+/// seconds, take the first word of the first line. Only under $HOME.
 pub fn banner_component(path: &Path) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    if !path.is_file() { return None; }
+    let home = dirs::home_dir()?;
+    if !path.is_file() || !under(path, &home) { return None; }
     let mut child = Command::new(path).arg("--version")
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().ok()?;
@@ -745,22 +921,23 @@ pub fn banner_component(path: &Path) -> Option<String> {
     let line = out.lines().next()?;
     let mut words = line.split_whitespace();
     let name = words.next()?;
-    let ver = words.next()?;
-    if COMPONENTS.contains(&name) && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        Some(name.to_string())
-    } else {
-        None
-    }
+    let ver = words.next()?.trim_start_matches('v');
+    if COMPONENTS.contains(&name) && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) { Some(name.to_string()) } else { None }
 }
 
-pub struct Options { pub purge: bool, pub dry_run: bool }
+pub struct Options { pub purge: bool, pub delete_data: bool, pub dry_run: bool }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataAction { MoveAside(PathBuf), Delete }
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     pub unlink: Vec<PathBuf>,
     pub declined: Vec<(PathBuf, String)>,
+    pub extras: Vec<PathBuf>,
     pub rc_blocks: Vec<(PathBuf, String)>,
-    pub remove_dirs: Vec<PathBuf>,
+    pub path_edits: Vec<String>,
+    pub data_dir: Option<(PathBuf, DataAction)>,
     pub remove_files: Vec<PathBuf>,
     pub user_env: Vec<String>,
     pub registrations: Vec<Registration>,
@@ -769,10 +946,7 @@ pub struct Plan {
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
-    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) { (Ok(x), Ok(y)) => x == y, _ => a == b }
 }
 
 /// Stale swap leftovers beside a binary that IS ours: <name>.bak-*, .old, .new.
@@ -798,19 +972,19 @@ fn consider(path: &Path, current_exe: &Path, banner: &Banner, out: &mut Plan) {
     }
 }
 
-/// §4's table, both platforms' rows, minus the package managers (those are
-/// the installer's business: an uninstall reverses what THIS binary's
-/// receipt says, and a brew/npm install has its own uninstall).
-pub fn fallback_candidates(home: &Path, path_env: &str) -> Vec<PathBuf> {
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let mut dirs: Vec<PathBuf> = vec![home.join(".local").join("bin"), home.join(".cargo").join("bin")];
+fn installer_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![home.join(".local").join("bin"), home.join(".cargo").join("bin")];
     if cfg!(windows) {
         if let Ok(lap) = std::env::var("LOCALAPPDATA") { dirs.push(PathBuf::from(lap).join("Programs").join("kannaka")); }
     }
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    for d in path_env.split(sep).filter(|d| !d.is_empty()) { dirs.push(PathBuf::from(d)); }
+    dirs
+}
+
+/// The narrow fallback (§6): only the directories our installers write into.
+pub fn fallback_candidates(home: &Path) -> Vec<PathBuf> {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
     let mut out = Vec::new();
-    for d in dirs {
+    for d in installer_dirs(home) {
         for c in COMPONENTS {
             let p = d.join(format!("{c}{ext}"));
             if p.exists() && !out.contains(&p) { out.push(p); }
@@ -819,21 +993,55 @@ pub fn fallback_candidates(home: &Path, path_env: &str) -> Vec<PathBuf> {
     out
 }
 
-pub fn plan(receipt_: Option<&Receipt>, opts: &Options, home: &Path, data_dir: &Path, path_env: &str, current_exe: &Path, banner: &Banner) -> Plan {
+/// A kannaka in any OTHER PATH directory is named, never touched: it belongs
+/// to a package manager or to an admin.
+pub fn elsewhere_on_path(home: &Path, path_env: &str) -> Vec<PathBuf> {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let ours = installer_dirs(home);
+    let mut out = Vec::new();
+    for d in path_env.split(sep).filter(|d| !d.is_empty()).map(PathBuf::from) {
+        if ours.iter().any(|o| same_file(o, &d)) { continue; }
+        for c in COMPONENTS {
+            let p = d.join(format!("{c}{ext}"));
+            if p.exists() && !out.contains(&p) { out.push(p); }
+        }
+    }
+    out
+}
+
+fn hint_for(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.contains("/opt/homebrew/") || s.contains("/usr/local/Cellar/") || s.contains("/home/linuxbrew/") { return "brew uninstall kannaka".into(); }
+    if s.contains("node_modules") || s.contains("/lib/node") { return "npm rm -g kannaka".into(); }
+    "remove it with the tool that installed it".into()
+}
+
+pub fn plan(receipt_: Option<&Receipt>, opts: &Options, home: &Path, data_dir: &Path, path_env: &str, current_exe: &Path, banner: &Banner, now: &str) -> Plan {
     let mut out = Plan::default();
     match receipt_ {
         Some(r) => for f in &r.files { consider(&f.path, current_exe, banner, &mut out); },
-        None => for p in fallback_candidates(home, path_env) { consider(&p, current_exe, banner, &mut out); },
+        None => for p in fallback_candidates(home) { consider(&p, current_exe, banner, &mut out); },
+    }
+    for p in elsewhere_on_path(home, path_env) {
+        if out.unlink.contains(&p) || out.self_path.as_deref() == Some(&p) { continue; }
+        out.declined.push((p.clone(), format!("not an installer directory; left alone ({})", hint_for(&p))));
     }
     // The receipt and its rotations always go: they describe an install that
     // no longer exists once this runs.
     let rp = data_dir.join(receipt::FILE_NAME);
-    for k in ["", ".1", ".2", ".3"] {
+    out.remove_files.push(rp.clone());
+    for k in [".1", ".2", ".3"] {
         let p = PathBuf::from(format!("{}{k}", rp.display()));
-        if p.exists() || k.is_empty() { out.remove_files.push(p); }
+        if p.exists() { out.remove_files.push(p); }
     }
     if opts.purge {
-        out.remove_dirs.push(data_dir.to_path_buf());
+        // The data dir: only under $HOME, never $HOME itself; otherwise printed.
+        let is_home = same_file(data_dir, home);
+        if data_dir.starts_with(home) && !is_home && data_dir.exists() {
+            let aside = PathBuf::from(format!("{}.removed-{now}", data_dir.display()));
+            out.data_dir = Some((data_dir.to_path_buf(), if opts.delete_data { DataAction::Delete } else { DataAction::MoveAside(aside) }));
+        }
         match receipt_ {
             Some(r) => {
                 for e in &r.rc_edits { if e.file.exists() { out.rc_blocks.push((e.file.clone(), e.sentinel.clone())); } }
@@ -843,18 +1051,26 @@ pub fn plan(receipt_: Option<&Receipt>, opts: &Options, home: &Path, data_dir: &
                         Credential::UserEnv { names, .. } => out.user_env.extend(names.iter().cloned()),
                     }
                 }
-                out.registrations = r.registrations.clone();
+                for x in &r.extras {
+                    if x.kind == "launcher" && std::fs::read_to_string(&x.path).map(|t| t.contains(LAUNCHER_MARK)).unwrap_or(false) { out.extras.push(x.path.clone()); }
+                }
+                out.path_edits = r.path_edits.iter().filter(|p| p.scope == "user").map(|p| p.entry.clone()).collect();
+                // statusline off BEFORE the plugin goes, so setup.sh is still there to run
+                let mut regs: Vec<Registration> = r.registrations.iter().filter(|x| x.kind == "claude-statusline").cloned().collect();
+                regs.extend(r.registrations.iter().filter(|x| x.kind == "claude-plugin").cloned());
+                regs.extend(r.registrations.iter().filter(|x| x.kind == "claude-marketplace").cloned());
+                out.registrations = regs;
             }
             None => {
                 for rc in RC_FILES {
                     let f = home.join(rc);
                     let Ok(text) = std::fs::read_to_string(&f) else { continue };
-                    for s in RC_SENTINELS { if text.lines().any(|l| l.trim_end() == s) { out.rc_blocks.push((f.clone(), s.to_string())); } }
+                    for s in RC_OPEN { if text.lines().any(|l| l.trim_end() == s) { out.rc_blocks.push((f.clone(), s.to_string())); } }
                 }
                 let creds = home.join(".kannaka-nats.env");
                 if creds.exists() { out.remove_files.push(creds); }
                 if cfg!(windows) { out.user_env = vec!["NATS_USER".into(), "NATS_PASSWORD".into()]; }
-                out.registrations = vec![Registration { kind: "claude-plugin".into(), name: "kannaka@kannaka".into() }];
+                out.registrations = vec![Registration { kind: "claude-statusline".into(), name: String::new() }, Registration { kind: "claude-plugin".into(), name: "kannaka@kannaka".into() }];
             }
         }
         out.print_only = purge_print_only(home, data_dir);
@@ -866,103 +1082,167 @@ pub fn plan(receipt_: Option<&Receipt>, opts: &Options, home: &Path, data_dir: &
 pub fn purge_print_only(home: &Path, data_dir: &Path) -> Vec<String> {
     let mut v = Vec::new();
     for u in SYSTEMD_UNITS {
-        if Path::new("/etc/systemd/system").join(u).exists() {
-            v.push(format!("sudo systemctl disable --now {u} && sudo rm /etc/systemd/system/{u}"));
-        }
+        if Path::new("/etc/systemd/system").join(u).exists() { v.push(format!("sudo systemctl disable --now {u} && sudo rm /etc/systemd/system/{u}")); }
     }
-    if cfg!(windows) {
-        v.push(format!("schtasks /Delete /TN {WINDOWS_TASK} /F     (only if the seed beacon task was installed)"));
-    }
-    if !data_dir.starts_with(home) {
+    if cfg!(windows) { v.push(format!("schtasks /Delete /TN {WINDOWS_TASK} /F     (only if the seed beacon task was installed)")); }
+    if cfg!(target_os = "macos") && Path::new("/var/db/receipts").exists() { v.push("sudo pkgutil --forget com.kannaka.pkg     (only if the .pkg was used)".into()); }
+    if same_file(data_dir, home) {
+        v.push(format!("KANNAKA_DATA_DIR={} is your home directory; nothing there is removed", data_dir.display()));
+    } else if !data_dir.starts_with(home) {
         v.push(format!("rm -rf {}     (KANNAKA_DATA_DIR is outside your home; not touched)", data_dir.display()));
     }
     v
 }
 
-/// Remove the sentinel line and every following line up to the next blank
-/// line (or EOF). The sentinel must match a whole line.
-pub fn strip_rc_block(text: &str, sentinel: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in text.split_inclusive('\n') {
-        let bare = line.trim_end_matches(['\n', '\r']);
-        if !skipping && bare == sentinel { skipping = true; continue; }
-        if skipping {
-            // the blank line that ends the block goes with it: the installer
-            // wrote a leading blank line before the sentinel, so this keeps
-            // the file's spacing as it was before the install
-            if bare.trim().is_empty() { skipping = false; }
-            continue;
+/// Remove an rc block. Closed block: sentinel through `# /kannaka`, plus one
+/// blank line before the sentinel (the installer wrote it). Legacy block
+/// without a closer: the sentinel and the lines the installer is known to
+/// have written; anything else stays and is returned as declined.
+pub fn strip_rc_block(text: &str, sentinel: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let bare = |l: &str| l.trim_end_matches(['\n', '\r']).to_string();
+    let Some(start) = lines.iter().position(|l| bare(l) == sentinel) else { return (text.to_string(), vec![]) };
+    let closed = lines[start + 1..].iter().position(|l| bare(l) == RC_CLOSE).map(|i| start + 1 + i);
+    let mut out: Vec<&str> = Vec::new();
+    let mut declined = Vec::new();
+    // drop one blank line immediately before the sentinel
+    let keep_before = if start > 0 && bare(lines[start - 1]).trim().is_empty() { start - 1 } else { start };
+    out.extend_from_slice(&lines[..keep_before]);
+    match closed {
+        Some(end) => out.extend_from_slice(&lines[end + 1..]),
+        None => {
+            let mut i = start + 1;
+            while i < lines.len() {
+                let b = bare(lines[i]);
+                if b.trim().is_empty() { break; }
+                if !RC_KNOWN_LINES.contains(&b.as_str()) { declined.push(b); out.push(lines[i]); }
+                i += 1;
+            }
+            out.extend_from_slice(&lines[i..]);
         }
-        out.push_str(line);
     }
+    (out.concat(), declined)
+}
+
+pub struct Report { pub removed: Vec<PathBuf>, pub parked: Vec<PathBuf>, pub still_present: Vec<PathBuf>, pub declined: Vec<(PathBuf, String)>, pub moved_aside: Option<PathBuf> }
+
+/// Remove a file; on Windows a locked (running) exe is parked instead.
+fn remove_or_park(p: &Path, rep: &mut Report) {
+    if p.is_dir() {
+        if std::fs::remove_dir_all(p).is_ok() && !p.exists() { rep.removed.push(p.to_path_buf()); } else { rep.still_present.push(p.to_path_buf()); }
+        return;
+    }
+    if std::fs::remove_file(p).is_ok() && !p.exists() { rep.removed.push(p.to_path_buf()); return; }
+    #[cfg(windows)]
+    {
+        let bak = PathBuf::from(format!("{}.bak-{}", p.display(), std::process::id()));
+        if std::fs::rename(p, &bak).is_ok() { rep.parked.push(bak); return; }
+    }
+    if p.exists() { rep.still_present.push(p.to_path_buf()); }
+}
+
+fn statusline_setup(home: &Path) -> Option<PathBuf> {
+    let cache = home.join(".claude").join("plugins").join("cache").join("kannaka");
+    let mut found: Vec<PathBuf> = walk(&cache).into_iter().filter(|p| p.file_name().is_some_and(|n| n == "setup.sh") && p.parent().is_some_and(|d| d.file_name().is_some_and(|n| n == "statusline"))).collect();
+    found.sort();
+    found.pop()
+}
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) { for e in rd.flatten() { let p = e.path(); if p.is_dir() { out.extend(walk(&p)); } else { out.push(p); } } }
     out
 }
 
-pub struct Report { pub removed: Vec<PathBuf>, pub still_present: Vec<PathBuf>, pub declined: Vec<(PathBuf, String)> }
-
-fn remove_path(p: &Path) -> bool {
-    if p.is_dir() { std::fs::remove_dir_all(p).is_ok() } else { std::fs::remove_file(p).is_ok() }
-}
-
-/// Carry out the plan. `run` executes an external command (claude) and
-/// returns whether it succeeded; injected so tests never spawn anything.
+/// Carry out the plan. `run` executes an external command and returns
+/// whether it succeeded; injected so tests never spawn anything.
 pub fn execute(plan: &Plan, run: &dyn Fn(&str, &[&str]) -> bool) -> Report {
-    let mut removed = Vec::new();
-    let mut still = Vec::new();
-    for p in &plan.unlink {
-        if remove_path(p) && !p.exists() { removed.push(p.clone()); } else if p.exists() { still.push(p.clone()); }
-    }
+    let mut rep = Report { removed: vec![], parked: vec![], still_present: vec![], declined: plan.declined.clone(), moved_aside: None };
+    for p in &plan.unlink { remove_or_park(p, &mut rep); }
     for (f, s) in &plan.rc_blocks {
         if let Ok(text) = std::fs::read_to_string(f) {
-            let new = strip_rc_block(&text, s);
+            let (new, kept) = strip_rc_block(&text, s);
             if new != text { let _ = std::fs::write(f, new); }
+            for k in kept { rep.declined.push((f.clone(), format!("kept a line you added under {s}: {k}"))); }
         }
     }
-    for p in &plan.remove_files {
-        if !p.exists() { continue; }
-        if remove_path(p) && !p.exists() { removed.push(p.clone()); } else { still.push(p.clone()); }
-    }
+    for p in &plan.extras { if p.exists() { remove_or_park(p, &mut rep); } }
+    for p in &plan.remove_files { if p.exists() { remove_or_park(p, &mut rep); } }
     for name in &plan.user_env {
-        #[cfg(windows)]
-        { let _ = run("reg", &["delete", "HKCU\\Environment", "/v", name, "/f"]); }
-        #[cfg(not(windows))]
-        { let _ = name; }
+        #[cfg(windows)] { let _ = run("reg", &["delete", "HKCU\\Environment", "/v", name, "/f"]); }
+        #[cfg(not(windows))] { let _ = name; }
     }
+    #[cfg(windows)]
+    for entry in &plan.path_edits { user_path_remove(entry, run); }
+    #[cfg(not(windows))]
+    { let _ = &plan.path_edits; }
+    let home = dirs::home_dir().unwrap_or_default();
     for r in &plan.registrations {
         match r.kind.as_str() {
+            "claude-statusline" => { if let Some(s) = statusline_setup(&home) { let _ = run("bash", &[&s.display().to_string(), "off"]); } }
             "claude-plugin" => { let _ = run("claude", &["plugin", "uninstall", &r.name]); }
             "claude-marketplace" => { let _ = run("claude", &["plugin", "marketplace", "remove", "kannaka"]); }
             _ => {}
         }
     }
-    for d in &plan.remove_dirs {
-        if !d.exists() { continue; }
-        if remove_path(d) && !d.exists() { removed.push(d.clone()); } else { still.push(d.clone()); }
+    if let Some((d, action)) = &plan.data_dir {
+        if d.exists() {
+            match action {
+                DataAction::MoveAside(aside) => { if std::fs::rename(d, aside).is_ok() { rep.moved_aside = Some(aside.clone()); rep.removed.push(d.clone()); } else { rep.still_present.push(d.clone()); } }
+                DataAction::Delete => { if std::fs::remove_dir_all(d).is_ok() && !d.exists() { rep.removed.push(d.clone()); } else { rep.still_present.push(d.clone()); } }
+            }
+        }
     }
     // Self, last.
     if let Some(me) = &plan.self_path {
         #[cfg(windows)]
         {
-            let bak = me.with_extension(format!("exe.bak-{}", std::process::id()));
-            if std::fs::rename(me, &bak).is_ok() { removed.push(me.clone()); } else { still.push(me.clone()); }
+            let bak = PathBuf::from(format!("{}.bak-{}", me.display(), std::process::id()));
+            if std::fs::rename(me, &bak).is_ok() { rep.parked.push(bak); } else { rep.still_present.push(me.clone()); }
         }
         #[cfg(not(windows))]
-        {
-            if std::fs::remove_file(me).is_ok() { removed.push(me.clone()); } else { still.push(me.clone()); }
-        }
+        { if std::fs::remove_file(me).is_ok() { rep.removed.push(me.clone()); } else { rep.still_present.push(me.clone()); } }
     }
-    Report { removed, still_present: still, declined: plan.declined.clone() }
+    rep
+}
+
+/// Drop one entry from the user PATH in the registry. `reg` rather than setx:
+/// setx truncates at 1024 characters and would eat the rest of the PATH.
+#[cfg(windows)]
+fn user_path_remove(entry: &str, run: &dyn Fn(&str, &[&str]) -> bool) {
+    let out = std::process::Command::new("reg").args(["query", "HKCU\\Environment", "/v", "Path"]).output();
+    let Ok(out) = out else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(line) = text.lines().find(|l| l.trim_start().starts_with("Path")) else { return };
+    let mut parts = line.split_whitespace();
+    let (_name, kind) = (parts.next(), parts.next().unwrap_or("REG_EXPAND_SZ"));
+    let value = line.splitn(3, char::is_whitespace).nth(2).map(|s| s.trim()).unwrap_or("");
+    let value = value.trim_start_matches(|c: char| c == 'R' || c == 'E' || c == 'G' || c == '_' || c == 'S' || c == 'Z' || c == 'X' || c == 'P' || c == 'A' || c == 'N' || c == 'D' || c.is_whitespace());
+    let keep: Vec<&str> = value.split(';').filter(|e| !e.is_empty() && e.trim_end_matches('\\') != entry.trim_end_matches('\\')).collect();
+    if keep.len() == value.split(';').filter(|e| !e.is_empty()).count() { return; }
+    let new = keep.join(";");
+    let _ = run("reg", &["add", "HKCU\\Environment", "/v", "Path", "/t", kind, "/d", &new, "/f"]);
 }
 
 pub fn render(plan: &Plan) -> String {
     let mut s = String::new();
     for p in &plan.unlink { s.push_str(&format!("remove   {}\n", p.display())); }
+    for p in &plan.extras { s.push_str(&format!("remove   {}  (launcher)\n", p.display())); }
     for p in &plan.remove_files { s.push_str(&format!("remove   {}\n", p.display())); }
     for (f, sent) in &plan.rc_blocks { s.push_str(&format!("edit     {}  (drop the '{sent}' block)\n", f.display())); }
+    for e in &plan.path_edits { s.push_str(&format!("unset    user PATH entry {e}\n")); }
     for n in &plan.user_env { s.push_str(&format!("unset    user environment {n}\n")); }
-    for r in &plan.registrations { s.push_str(&format!("run      claude plugin uninstall {}\n", r.name)); }
-    for d in &plan.remove_dirs { s.push_str(&format!("remove   {}  (everything: identity, memory, snapshots)\n", d.display())); }
+    for r in &plan.registrations {
+        match r.kind.as_str() {
+            "claude-statusline" => s.push_str("run      statusline setup.sh off  (restores your previous statusLine)\n"),
+            _ => s.push_str(&format!("run      claude plugin uninstall {}\n", r.name)),
+        }
+    }
+    if let Some((d, a)) = &plan.data_dir {
+        match a {
+            DataAction::MoveAside(x) => s.push_str(&format!("move     {}  ->  {}  (identity, memory, snapshots kept there; --delete-data to delete)\n", d.display(), x.display())),
+            DataAction::Delete => s.push_str(&format!("DELETE   {}  (everything: identity, memory, snapshots)\n", d.display())),
+        }
+    }
     if let Some(me) = &plan.self_path { s.push_str(&format!("remove   {}  (this binary, last)\n", me.display())); }
     for (p, why) in &plan.declined { s.push_str(&format!("keep     {}  ({why})\n", p.display())); }
     if !plan.print_only.is_empty() {
@@ -984,7 +1264,7 @@ Expected: all pass. Quote the Windows run in the task report.
 
 ```bash
 git add src/uninstall.rs src/lib.rs
-git commit -m "uninstall: plan from the receipt (or the fallback table) by identity, execute, report survivors"
+git commit -m "uninstall: plan from the receipt (or the three installer dirs) by identity; purge moves the data dir aside; execute; report survivors"
 ```
 
 ---
@@ -997,23 +1277,23 @@ git commit -m "uninstall: plan from the receipt (or the fallback table) by ident
 
 **Interfaces:**
 - Consumes: `uninstall::{plan, execute, render, banner_component, Options}`, `install_receipt::{receipt_path, load_from}`
-- Produces: `kannaka uninstall [--purge] [--dry-run] [--yes]`; exit 0 clean, 1 when something meant to be removed survived, 2 on a receipt that cannot be read, 3 when the purge confirmation was refused.
+- Produces: `kannaka uninstall [--purge] [--delete-data] [--dry-run] [--yes]`; exit 0 clean, 1 when something meant to be removed survived, 2 on a receipt that cannot be read, 3 when the purge was not confirmed (a refused prompt, or no terminal and no `--yes`).
 
-- [ ] **Step 1: Write the failing test** (in `src/cli.rs`'s existing `#[cfg(test)]` module, or create one at the bottom if absent)
+- [ ] **Step 1: Write the failing test** (in `src/cli.rs`'s `#[cfg(test)]` module; create one at the bottom if absent)
 
 ```rust
     #[test]
-    fn uninstall_parses_its_three_flags() {
-        let m = build_cli().get_matches_from(["kannaka", "uninstall", "--purge", "--dry-run", "--yes"]);
+    fn uninstall_parses_its_four_flags() {
+        let m = build_cli().get_matches_from(["kannaka", "uninstall", "--purge", "--delete-data", "--dry-run", "--yes"]);
         let (name, sub) = m.subcommand().unwrap();
         assert_eq!(name, "uninstall");
-        assert!(sub.get_flag("purge") && sub.get_flag("dry-run") && sub.get_flag("yes"));
+        assert!(sub.get_flag("purge") && sub.get_flag("delete-data") && sub.get_flag("dry-run") && sub.get_flag("yes"));
     }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test --lib cli::tests::uninstall_parses_its_three_flags`
+Run: `cargo test --lib cli::tests::uninstall_parses_its_four_flags`
 Expected: FAIL (clap: unrecognized subcommand).
 
 - [ ] **Step 3: Implement**
@@ -1027,17 +1307,20 @@ After the `update` subcommand's closing `)` (line 134) add:
                 .long_about(
                     "Reverse the install recorded in <data dir>/install.json: the binaries it\n\
                      wrote (each checked to be kannaka before removal), then this binary last.\n\
-                     Without a receipt, looks in the places a kannaka can live and removes\n\
-                     only what identifies itself as one.\n\n\
+                     Without a receipt, looks in the three directories the installers write\n\
+                     into and removes only what identifies itself as kannaka; a kannaka\n\
+                     anywhere else is named with the command that removes it.\n\n\
                      Flags:\n  \
-                     --purge    also remove the data dir (identity key, memory, snapshots),\n             \
-                                the shell rc blocks, the swarm credentials and the Claude\n             \
-                                plugin registration. System units and scheduled tasks are\n             \
-                                printed, never run.\n  \
-                     --dry-run  print the plan, change nothing\n  \
-                     --yes      skip the --purge confirmation",
+                     --purge        also move the data dir aside (identity key, memory,\n                 \
+                                    snapshots), remove the shell rc blocks, the swarm\n                 \
+                                    credentials, the launcher and the Claude registrations.\n                 \
+                                    System units and scheduled tasks are printed, never run.\n  \
+                     --delete-data  with --purge: delete the data dir instead of moving it aside\n  \
+                     --dry-run      print the plan, change nothing\n  \
+                     --yes          do not ask before --purge (required when stdin is not a terminal)",
                 )
-                .arg(Arg::new("purge").long("purge").action(ArgAction::SetTrue).help("Also remove the data dir, rc blocks, credentials and registrations"))
+                .arg(Arg::new("purge").long("purge").action(ArgAction::SetTrue).help("Also move the data dir aside and remove rc blocks, credentials, launcher and registrations"))
+                .arg(Arg::new("delete-data").long("delete-data").action(ArgAction::SetTrue).help("With --purge: delete the data dir rather than moving it aside"))
                 .arg(Arg::new("dry-run").long("dry-run").action(ArgAction::SetTrue).help("Print the plan and change nothing"))
                 .arg(Arg::new("yes").long("yes").action(ArgAction::SetTrue).help("Do not ask before --purge")),
         )
@@ -1049,6 +1332,7 @@ After the `if name == "update" { … }` block (line 594) add:
     if name == "uninstall" {
         return handle_uninstall(
             sub_matches.get_flag("purge"),
+            sub_matches.get_flag("delete-data"),
             sub_matches.get_flag("dry-run"),
             sub_matches.get_flag("yes"),
         );
@@ -1060,7 +1344,7 @@ After `handle_update` add:
 ```rust
 /// `kannaka uninstall`. Exit codes: 0 clean, 1 something meant to be
 /// removed is still there, 2 unreadable receipt, 3 purge not confirmed.
-fn handle_uninstall(purge: bool, dry_run: bool, yes: bool) -> Dispatch {
+fn handle_uninstall(purge: bool, delete_data: bool, dry_run: bool, yes: bool) -> Dispatch {
     use crate::{install_receipt, uninstall};
     use std::io::IsTerminal;
     let data_dir = crate::config::KannakaConfig::data_dir();
@@ -1070,25 +1354,36 @@ fn handle_uninstall(purge: bool, dry_run: bool, yes: bool) -> Dispatch {
         Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
     };
     if receipt.is_none() {
-        eprintln!("No install receipt at {} — this install predates receipts; using the fallback table.", rpath.display());
+        eprintln!("No install receipt at {} — this install predates receipts; looking in the installer directories.", rpath.display());
     }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let current_exe = std::env::current_exe().unwrap_or_default();
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let opts = uninstall::Options { purge, dry_run };
-    let plan = uninstall::plan(receipt.as_ref(), &opts, &home, &data_dir, &path_env, &current_exe, &uninstall::banner_component);
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let opts = uninstall::Options { purge, delete_data, dry_run };
+    let plan = uninstall::plan(receipt.as_ref(), &opts, &home, &data_dir, &path_env, &current_exe, &uninstall::banner_component, &now);
     print!("{}", uninstall::render(&plan));
     if dry_run { println!("(dry run — nothing changed)"); return Dispatch::Handled; }
-    if purge && !yes && std::io::stdin().is_terminal() {
-        eprint!("This removes {} including your identity key and memory. Type 'purge' to continue: ", data_dir.display());
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        if line.trim() != "purge" { eprintln!("not confirmed; nothing changed"); std::process::exit(3); }
+    if purge && !yes {
+        let what = if delete_data { "DELETES" } else { "moves aside" };
+        let question = format!("This {what} {} including your identity key and memory. Type 'purge' to continue: ", data_dir.display());
+        if std::io::stdin().is_terminal() {
+            eprint!("{question}");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            if line.trim() != "purge" { eprintln!("not confirmed; nothing changed"); std::process::exit(3); }
+        } else {
+            eprintln!("{question}");
+            eprintln!("stdin is not a terminal; pass --yes to confirm. Nothing changed.");
+            std::process::exit(3);
+        }
     }
     let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).status().map(|s| s.success()).unwrap_or(false);
     let report = uninstall::execute(&plan, &run);
     for p in &report.removed { println!("removed  {}", p.display()); }
+    for p in &report.parked { println!("parked   {}  (was running; swept on the next kannaka run)", p.display()); }
     for (p, why) in &report.declined { println!("kept     {}  ({why})", p.display()); }
+    if let Some(a) = &report.moved_aside { println!("your data is at {}  (delete it yourself when you are sure)", a.display()); }
     if !report.still_present.is_empty() {
         for p in &report.still_present { eprintln!("STILL PRESENT  {}", p.display()); }
         eprintln!("uninstall incomplete: {} item(s) could not be removed", report.still_present.len());
@@ -1099,31 +1394,32 @@ fn handle_uninstall(purge: bool, dry_run: bool, yes: bool) -> Dispatch {
 }
 ```
 
-`Dispatch::Handled` is returned only for the paths that print; every exit path uses `std::process::exit` as `handle_update` does. In `src/bin/kannaka.rs` extend the comment at line ~1047 so it reads `completions`, `update` and `uninstall` are intentionally NOT here.
+In `src/bin/kannaka.rs` extend the comment at line ~1047 so it reads `completions`, `update` and `uninstall` are intentionally NOT here.
 
 - [ ] **Step 4: Run the tests and a real dry run**
 
-Run: `cargo test --lib cli:: && cargo run -q -- uninstall --dry-run`
-Expected: tests pass; the dry run prints a plan for this box (no receipt yet → fallback table) and ends with `(dry run — nothing changed)`; nothing on disk changed (`kannaka --version` still works).
+Run: `cargo test --lib cli:: && cargo run -q -- uninstall --dry-run && echo | cargo run -q -- uninstall --purge; echo "exit=$?"`
+Expected: tests pass; the dry run prints a plan for this box (no receipt yet → the three installer dirs) and ends with `(dry run — nothing changed)`; the piped `--purge` without `--yes` prints the question and exits 3 with nothing changed (`kannaka --version` still works).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/cli.rs src/bin/kannaka.rs
-git commit -m "cli: kannaka uninstall [--purge] [--dry-run] [--yes]"
+git commit -m "cli: kannaka uninstall [--purge] [--delete-data] [--dry-run] [--yes]; no terminal means no consent"
 ```
 
 ---
 
-### Task 5: `kannaka update` refreshes every component from the manifest
+### Task 5: `kannaka update` refreshes every sibling from the manifest, and CI guards the owner
 
 **Files:**
 - Create: `src/update_components.rs`
-- Modify: `src/config.rs` — `fn windows_swap_binary` → `pub(crate) fn` (line 935), `fn platform_triple` → `pub(crate) fn` (line 1567); in `self_update` replace both `update_sibling_tui(&agent, &body, tag, &current_exe, remote_version);` calls (lines ~1041 and ~1155) with `crate::update_components::refresh_all(&agent, &current_exe);`
+- Modify: `src/config.rs` — `fn windows_swap_binary` → `pub(crate) fn` (line 935), `fn platform_triple` → `pub(crate) fn` (line 1567); in `self_update` replace both `update_sibling_tui(&agent, &body, tag, &current_exe, remote_version);` calls (lines 1037 and 1154) with `crate::update_components::refresh_all(&agent, &current_exe);`
 - Modify: `src/lib.rs` (`pub mod update_components;`), `src/cli.rs` `update` long_about (mention kannaka-hdl and the receipt)
+- Modify: `.github/workflows/ci.yml` (old-owner grep guard)
 
 **Interfaces:**
-- Consumes: `install_receipt::{Receipt, FileEntry, load_from, write_atomic, receipt_path, sha256_hex}`, `config::{windows_swap_binary, platform_triple, fetch_and_verify_sha256, VerifyError}`, `uninstall::banner_component`
+- Consumes: `install_receipt::{Receipt, FileEntry, load_from, write_atomic, receipt_path, sha256_hex}`, `config::{windows_swap_binary, platform_triple}`, `uninstall::banner_component`
 - Produces:
 
 ```rust
@@ -1131,12 +1427,14 @@ pub const MANIFEST_URL: &str = "https://ninja-portal.com/constellation.json";
 pub const MANIFEST_FALLBACK: &str = "https://github.com/kannaka-labs/kannaka-library/releases/download/library/constellation.json";
 pub const MANIFEST_PUB_URL: &str = "https://github.com/kannaka-labs/kannaka-library/releases/download/library/manifest.pub";
 pub struct Pin { pub version: String, pub url: String, pub sha256: String }
-pub struct Manifest { pub generated: String, pub signed: bool, pins: HashMap<String, Pin> }   // keyed by component id, for THIS platform target
+pub struct Manifest { pub generated: String, pub signed: bool, pins: HashMap<String, Pin> }
 impl Manifest { pub fn parse(json: &[u8], target: &str) -> Result<Manifest, String>; pub fn pin(&self, component: &str) -> Option<&Pin>; }
 pub fn verify_signature(manifest_bytes: &[u8], sig_b64: &str, pub_pem: &str) -> Result<(), String>;
 pub fn ed25519_pub_from_pem(pem: &str) -> Result<[u8; 32], String>;
+pub fn swap_in(target: &Path, bytes: &[u8]) -> Result<(), String>;
+pub fn record_refresh(r: &mut Receipt, path: &Path, bytes: &[u8], version: &str);
+pub fn refresh_with(receipt_path: &Path, current_exe: &Path, manifest: Option<&Manifest>, fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>, local_version: &dyn Fn(&Path) -> Option<String>) -> Result<(), String>;   // testable core
 pub fn refresh_all(agent: &ureq::Agent, current_exe: &Path);   // never fails the caller; prints what it did
-pub fn swap_in(target: &Path, bytes: &[u8]) -> Result<(), String>;   // unix: .new + rename; windows: windows_swap_binary
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -1189,7 +1487,6 @@ mod tests {
     }
 
     fn b64(b: &[u8]) -> String {
-        // minimal base64 for the test; the implementation has its own decoder
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut s = String::new();
         for c in b.chunks(3) {
@@ -1214,14 +1511,70 @@ mod tests {
     }
 
     #[test]
-    fn receipt_entry_is_rewritten_after_a_refresh() {
+    fn refresh_touches_only_the_listed_siblings_and_the_receipt() {
+        use crate::install_receipt::*;
         let dir = tempfile::tempdir().unwrap();
-        let t = dir.path().join("kannaka-tui");
-        std::fs::write(&t, b"old").unwrap();
-        let mut r = crate::install_receipt::Receipt { files: vec![crate::install_receipt::FileEntry { path: t.clone(), sha256: "x".into(), component: "kannaka-tui".into(), version: "0.5.0".into() }], ..Default::default() };
-        record_refresh(&mut r, &t, b"new", "0.5.9");
-        assert_eq!(r.files[0].version, "0.5.9");
-        assert_eq!(r.files[0].sha256, crate::install_receipt::sha256_hex(b"new"));
+        let data = dir.path().join("data"); std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("node_key.ed25519"), b"IDENTITY").unwrap();
+        std::fs::write(data.join("kannaka.hrm"), b"HRM").unwrap();
+        let bin = dir.path().join("bin"); std::fs::create_dir_all(&bin).unwrap();
+        let k = bin.join("kannaka"); let t = bin.join("kannaka-tui"); let h = bin.join("kannaka-hdl");
+        std::fs::write(&k, b"engine").unwrap(); std::fs::write(&t, b"old-tui").unwrap(); std::fs::write(&h, b"old-hdl").unwrap();
+        let rp = data.join(FILE_NAME);
+        let r = Receipt { schema: SCHEMA, installer: "i".into(), files: vec![
+            FileEntry { path: k.clone(), sha256: sha256_hex(b"engine"), component: "kannaka".into(), version: "0.17.0".into() },
+            FileEntry { path: t.clone(), sha256: sha256_hex(b"old-tui"), component: "kannaka-tui".into(), version: "0.5.0".into() },
+            FileEntry { path: h.clone(), sha256: sha256_hex(b"old-hdl"), component: "kannaka-hdl".into(), version: "0.11.0".into() },
+        ], ..Default::default() };
+        write_atomic(&rp, &r).unwrap();
+        let manifest = Manifest::parse(br#"{"schema":"kannaka-constellation/1","generated":"g","components":[
+          {"id":"kannaka-tui","release":{"version":"v0.5.9"},"assets":[{"url":"https://example/t","sha256":"SHA_T","target":"T"}]},
+          {"id":"kannaka-hdl","release":{"version":"v0.11.0"},"assets":[{"url":"https://example/h","sha256":"SHA_H","target":"T"}]}]}"#
+            .to_vec().as_slice(), "T").unwrap();
+        let new_tui = b"new-tui".to_vec();
+        let manifest = { let mut m = manifest; m.pins.get_mut("kannaka-tui").unwrap().sha256 = sha256_hex(&new_tui); m };
+        let fetch = |url: &str| -> Result<Vec<u8>, String> { if url == "https://example/t" { Ok(new_tui.clone()) } else { Err(format!("unexpected fetch {url}")) } };
+        let local_version = |p: &Path| -> Option<String> { if p == t { Some("0.5.0".into()) } else if p == h { Some("0.11.0".into()) } else { None } };
+        refresh_with(&rp, &k, Some(&manifest), &fetch, &local_version).unwrap();
+        assert_eq!(std::fs::read(&t).unwrap(), b"new-tui", "tui refreshed to the pin");
+        assert_eq!(std::fs::read(&h).unwrap(), b"old-hdl", "hdl already at the pin: untouched, never fetched");
+        assert_eq!(std::fs::read(&k).unwrap(), b"engine", "the engine is not the manifest's business here");
+        let after = load_from(&rp).unwrap().unwrap();
+        let tui = after.files.iter().find(|f| f.component == "kannaka-tui").unwrap();
+        assert_eq!((tui.version.as_str(), tui.sha256.as_str()), ("0.5.9", sha256_hex(b"new-tui").as_str()));
+        assert_eq!(std::fs::read(data.join("node_key.ed25519")).unwrap(), b"IDENTITY");
+        assert_eq!(std::fs::read(data.join("kannaka.hrm")).unwrap(), b"HRM");
+        assert!(!data.join("install.json.1").exists(), "update rewrites in place, never rotates");
+    }
+
+    #[test]
+    fn a_sha_mismatch_against_the_manifest_leaves_the_sibling_alone() {
+        use crate::install_receipt::*;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data"); std::fs::create_dir_all(&data).unwrap();
+        let t = dir.path().join("kannaka-tui"); std::fs::write(&t, b"old-tui").unwrap();
+        let k = dir.path().join("kannaka"); std::fs::write(&k, b"engine").unwrap();
+        let rp = data.join(FILE_NAME);
+        write_atomic(&rp, &Receipt { schema: SCHEMA, files: vec![FileEntry { path: t.clone(), sha256: "x".into(), component: "kannaka-tui".into(), version: "0.5.0".into() }], ..Default::default() }).unwrap();
+        let manifest = Manifest::parse(br#"{"schema":"kannaka-constellation/1","generated":"g","components":[{"id":"kannaka-tui","release":{"version":"v0.5.9"},"assets":[{"url":"https://example/t","sha256":"0000","target":"T"}]}]}"#, "T").unwrap();
+        let fetch = |_: &str| -> Result<Vec<u8>, String> { Ok(b"evil".to_vec()) };
+        refresh_with(&rp, &k, Some(&manifest), &fetch, &|_| Some("0.5.0".into())).unwrap();
+        assert_eq!(std::fs::read(&t).unwrap(), b"old-tui");
+        assert_eq!(load_from(&rp).unwrap().unwrap().files[0].version, "0.5.0");
+    }
+
+    #[test]
+    fn no_receipt_synthesizes_one_from_the_siblings_beside_the_engine() {
+        use crate::install_receipt::*;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let k = dir.path().join(if cfg!(windows) { "kannaka.exe" } else { "kannaka" }); std::fs::write(&k, b"engine").unwrap();
+        let t = dir.path().join(if cfg!(windows) { "kannaka-tui.exe" } else { "kannaka-tui" }); std::fs::write(&t, b"tui").unwrap();
+        let rp = data.join(FILE_NAME);
+        refresh_with(&rp, &k, None, &|u| Err(format!("no network: {u}")), &|_| Some("1.0.0".into())).unwrap();
+        let r = load_from(&rp).unwrap().unwrap();
+        assert!(r.installer.starts_with("kannaka update@"));
+        assert_eq!(r.files.iter().map(|f| f.component.as_str()).collect::<Vec<_>>(), vec!["kannaka", "kannaka-tui"]);
     }
 }
 ```
@@ -1236,11 +1589,11 @@ Expected: compile error.
 `src/update_components.rs`:
 
 ```rust
-//! `kannaka update` beyond the engine: refresh every component the receipt
+//! `kannaka update` beyond the engine: refresh every sibling the receipt
 //! lists (kannaka-tui, kannaka-hdl) to the version the signed constellation
-//! manifest pins, with the same safe swap and sha256 check the engine uses,
-//! then rewrite the receipt. The engine itself still follows its latest
-//! release (Ruling 1 of the binary plan); this module is for the siblings.
+//! manifest pins, verifying each download against the manifest's sha256,
+//! with the same safe swap the engine uses, then rewrite the receipt in
+//! place. The engine itself still follows its release channel (spec §7 rev 2).
 //!
 //! Spec: kannaka-plugin/docs/superpowers/specs/2026-09-09-fresh-install-update-uninstall-design.md §7.
 
@@ -1254,7 +1607,7 @@ pub const MANIFEST_PUB_URL: &str = "https://github.com/kannaka-labs/kannaka-libr
 
 pub struct Pin { pub version: String, pub url: String, pub sha256: String }
 
-pub struct Manifest { pub generated: String, pub signed: bool, pins: HashMap<String, Pin> }
+pub struct Manifest { pub generated: String, pub signed: bool, pub(crate) pins: HashMap<String, Pin> }
 
 impl Manifest {
     /// Parse constellation.json, keeping only the binary pins for `target`
@@ -1305,7 +1658,7 @@ pub fn verify_signature(manifest_bytes: &[u8], sig_b64: &str, pub_pem: &str) -> 
     vk.verify(manifest_bytes, &sig).map_err(|_| "manifest signature did not verify".to_string())
 }
 
-fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
+fn fetch_url(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let resp = agent.get(url).set("User-Agent", "kannaka-update").call().map_err(|e| format!("{url}: {e}"))?;
     let mut bytes = Vec::new();
@@ -1315,12 +1668,12 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
 
 /// Load the manifest, signature-checked when the signature and key can be
 /// fetched; a manifest whose signature FAILS is refused (None). Missing
-/// signature material means unsigned, which is still used (the per-asset
-/// sha256 is the real guarantee, as in install.sh).
+/// signature material means unsigned, still used: the per-asset sha256 is
+/// the real guarantee, as in install.sh.
 fn load_manifest(agent: &ureq::Agent, target: &str) -> Option<Manifest> {
-    let (bytes, from) = match fetch(agent, MANIFEST_URL) { Ok(b) => (b, MANIFEST_URL), Err(_) => (fetch(agent, MANIFEST_FALLBACK).ok()?, MANIFEST_FALLBACK) };
-    let mut m = match Manifest::parse(&bytes, target) { Ok(m) => m, Err(e) => { eprintln!("Note: {e}; refreshing siblings from their latest releases instead."); return None; } };
-    if let (Ok(sig), Ok(pubk)) = (fetch(agent, &format!("{from}.sig")), fetch(agent, MANIFEST_PUB_URL)) {
+    let (bytes, from) = match fetch_url(agent, MANIFEST_URL) { Ok(b) => (b, MANIFEST_URL), Err(_) => (fetch_url(agent, MANIFEST_FALLBACK).ok()?, MANIFEST_FALLBACK) };
+    let mut m = match Manifest::parse(&bytes, target) { Ok(m) => m, Err(e) => { eprintln!("Note: {e}; siblings left as they are."); return None; } };
+    if let (Ok(sig), Ok(pubk)) = (fetch_url(agent, &format!("{from}.sig")), fetch_url(agent, MANIFEST_PUB_URL)) {
         match verify_signature(&bytes, &String::from_utf8_lossy(&sig), &String::from_utf8_lossy(&pubk)) {
             Ok(()) => m.signed = true,
             Err(e) => { eprintln!("Warning: {e} — ignoring the manifest."); return None; }
@@ -1355,31 +1708,26 @@ pub fn record_refresh(r: &mut Receipt, path: &Path, bytes: &[u8], version: &str)
     }
 }
 
-/// Refresh every sibling the receipt lists. Without a receipt, refresh the
-/// siblings found beside `current_exe` and write a first receipt. Never
-/// fails the caller: every problem is a printed note.
-pub fn refresh_all(agent: &ureq::Agent, current_exe: &Path) {
+/// The testable core: refresh every non-engine sibling the receipt lists
+/// (or, with no receipt, the siblings beside `current_exe`, then write a
+/// first receipt). `fetch` and `local_version` are injected.
+pub fn refresh_with(receipt_path: &Path, current_exe: &Path, manifest: Option<&Manifest>,
+                    fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>, local_version: &dyn Fn(&Path) -> Option<String>) -> Result<(), String> {
     let (os, arch, ext) = crate::config::platform_triple();
     let target = format!("{os}-{arch}");
-    let rpath = receipt::receipt_path();
-    let mut r = match receipt::load_from(&rpath) {
-        Ok(Some(r)) => r,
-        Ok(None) => synthesize_receipt(current_exe, ext, &target),
-        Err(e) => { eprintln!("Note: {e}; not refreshing siblings."); return; }
+    let mut r = match receipt::load_from(receipt_path)? {
+        Some(r) => r,
+        None => synthesize_receipt(current_exe, ext, &target, local_version),
     };
-    let manifest = load_manifest(agent, &target);
+    let synthesized = r.installer.starts_with("kannaka update@");
     let mut changed = false;
     for entry in r.files.clone() {
         if entry.component == "kannaka" { continue; }
-        let Some(m) = &manifest else {
-            eprintln!("Note: no manifest — {} left as is (re-run when ninja-portal.com is reachable).", entry.component);
-            continue;
-        };
-        let Some(pin) = m.pin(&entry.component) else { eprintln!("Note: manifest has no {} for {target}.", entry.component); continue };
-        let local = crate::uninstall::banner_component(&entry.path).and_then(|_| local_version(&entry.path));
-        if local.as_deref() == Some(pin.version.as_str()) { eprintln!("{} already at v{}.", entry.component, pin.version); continue; }
+        let Some(m) = manifest else { eprintln!("Note: no manifest — {} left as is.", entry.component); continue; };
+        let Some(pin) = m.pin(&entry.component) else { eprintln!("Note: manifest has no {} for {target}.", entry.component); continue; };
+        if local_version(&entry.path).as_deref() == Some(pin.version.as_str()) { eprintln!("{} already at v{}.", entry.component, pin.version); continue; }
         eprintln!("Downloading {} v{} (pinned)...", entry.component, pin.version);
-        let bytes = match fetch(agent, &pin.url) { Ok(b) => b, Err(e) => { eprintln!("Note: {e}"); continue } };
+        let bytes = match fetch(&pin.url) { Ok(b) => b, Err(e) => { eprintln!("Note: {e}"); continue } };
         let got = receipt::sha256_hex(&bytes);
         if got != pin.sha256 { eprintln!("Note: {} sha256 mismatch against the manifest (want {} got {got}) — skipped.", entry.component, pin.sha256); continue; }
         match swap_in(&entry.path, &bytes) {
@@ -1389,22 +1737,34 @@ pub fn refresh_all(agent: &ureq::Agent, current_exe: &Path) {
     }
     // The engine's own entry: self_update already swapped it; record what is there now.
     if let Some(me) = r.files.iter_mut().find(|f| f.component == "kannaka") {
-        if let Ok(bytes) = std::fs::read(&me.path) { let h = receipt::sha256_hex(&bytes); if h != me.sha256 { me.sha256 = h; me.version = crate::config::VERSION.to_string(); changed = true; } }
+        if let Ok(bytes) = std::fs::read(&me.path) {
+            let h = receipt::sha256_hex(&bytes);
+            if h != me.sha256 { me.sha256 = h; me.version = crate::config::VERSION.to_string(); changed = true; }
+        }
     }
-    if changed || r.installer.starts_with("kannaka update@") {
-        if let Err(e) = receipt::write_atomic(&rpath, &r) { eprintln!("Note: receipt not updated: {e}"); }
+    if changed || synthesized { receipt::write_atomic(receipt_path, &r)?; }
+    Ok(())
+}
+
+/// Never fails the caller: every problem is a printed note.
+pub fn refresh_all(agent: &ureq::Agent, current_exe: &Path) {
+    let (os, arch, _) = crate::config::platform_triple();
+    let manifest = load_manifest(agent, &format!("{os}-{arch}"));
+    let fetch = |url: &str| fetch_url(agent, url);
+    if let Err(e) = refresh_with(&receipt::receipt_path(), current_exe, manifest.as_ref(), &fetch, &local_version) {
+        eprintln!("Note: {e}; siblings not refreshed.");
     }
 }
 
 fn local_version(path: &Path) -> Option<String> {
+    crate::uninstall::banner_component(path)?;   // identity first: never run a stranger
     let out = std::process::Command::new(path).arg("--version").output().ok()?;
-    String::from_utf8_lossy(&out.stdout).lines().next()?.split_whitespace().nth(1).map(|s| s.to_string())
+    String::from_utf8_lossy(&out.stdout).lines().next()?.split_whitespace().nth(1).map(|s| s.trim_start_matches('v').to_string())
 }
 
 /// An install older than receipts: the engine plus whichever siblings sit
-/// beside it. Written after the first refresh so the next uninstall has
-/// something to read.
-fn synthesize_receipt(current_exe: &Path, ext: &str, target: &str) -> Receipt {
+/// beside it.
+fn synthesize_receipt(current_exe: &Path, ext: &str, target: &str, local_version: &dyn Fn(&Path) -> Option<String>) -> Receipt {
     let dir = current_exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut files = Vec::new();
     for c in crate::uninstall::COMPONENTS {
@@ -1424,23 +1784,33 @@ fn synthesize_receipt(current_exe: &Path, ext: &str, target: &str) -> Receipt {
 }
 ```
 
-In `src/config.rs`: make `windows_swap_binary` and `platform_triple` `pub(crate)`; replace the two `update_sibling_tui(...)` calls in `self_update` with `crate::update_components::refresh_all(&agent, &current_exe);` (in the "already up to date" branch `current_exe` comes from the existing `if let Ok(current_exe) = std::env::current_exe()`); leave `update_sibling_tui` in place for `bootstrap_install_tui`, which still uses it, and add `#[allow(dead_code)]` if the compiler complains. Add `pub mod update_components;` to `src/lib.rs`. In `src/cli.rs` the `update` long_about's "Also updates the kannaka-tui sibling binary…" sentence becomes "Then refreshes every component the install receipt lists (kannaka-tui, kannaka-hdl) to the version the signed constellation manifest pins, and rewrites the receipt."
+In `src/config.rs`: make `windows_swap_binary` and `platform_triple` `pub(crate)`; replace the two `update_sibling_tui(...)` calls in `self_update` with `crate::update_components::refresh_all(&agent, &current_exe);` (in the "already up to date" branch `current_exe` comes from the existing `if let Ok(current_exe) = std::env::current_exe()`); leave `update_sibling_tui` in place for `bootstrap_install_tui`, which still uses it. Add `pub mod update_components;` to `src/lib.rs`. In `src/cli.rs` the `update` long_about's "Also updates the kannaka-tui sibling binary…" sentence becomes "Then refreshes every sibling the install receipt lists (kannaka-tui, kannaka-hdl) to the version the signed constellation manifest pins, verifying each against the manifest's sha256, and rewrites the receipt."
+
+CI guard, in `.github/workflows/ci.yml` `check` job after the `Test` step:
+
+```yaml
+      - name: no old-owner strings in src/ (the update URLs must point at kannaka-labs)
+        working-directory: kannaka-memory
+        run: |
+          if grep -rni 'nickflach' src/ packaging/ scripts/; then echo "old owner found above"; exit 1; fi
+          echo "clean"
+```
 
 - [ ] **Step 4: Run the tests and one real update**
 
-Run: `cargo test --lib update_components:: && cargo test --lib && cargo run -q -- update`
-Expected: unit tests pass; the real `update` on this box prints `Manifest loaded (signed, generated …)` (or `unsigned` if LibreSSL-style PEM parsing surprises us — that is a finding, report it), refreshes or reports `already at` for kannaka-tui, and writes a receipt at `~/.kannaka/install.json` with `installer: "kannaka update@0.17.0"` because this box predates receipts.
+Run: `cargo test --lib update_components:: && cargo test --lib && grep -rni nickflach src/ packaging/ scripts/ || echo clean && cargo run -q -- update`
+Expected: unit tests pass; the grep is clean; the real `update` on this box prints `Manifest loaded (signed, generated …)` (or `unsigned` if the PEM layout surprises us — report it as a finding), refreshes or reports `already at` for kannaka-tui, and writes a receipt at `~/.kannaka/install.json` with `installer: "kannaka update@0.17.0"` because this box predates receipts.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/update_components.rs src/config.rs src/lib.rs src/cli.rs
-git commit -m "update: refresh every receipt component from the signed manifest, rewrite the receipt"
+git add src/update_components.rs src/config.rs src/lib.rs src/cli.rs .github/workflows/ci.yml
+git commit -m "update: refresh every receipt sibling from the signed manifest, rewrite the receipt in place; CI guards the owner"
 ```
 
 ---
 
-### Task 6: The npm postinstall writes the receipt
+### Task 6: The npm postinstall merges into the receipt
 
 **Files:**
 - Create: `packaging/npm/receipt.js`, `packaging/npm/receipt.test.js`
@@ -1448,7 +1818,7 @@ git commit -m "update: refresh every receipt component from the signed manifest,
 - Modify: `.github/workflows/ci.yml` (node test step)
 
 **Interfaces:**
-- Produces: `writeReceipt({ dataDir, files, installer, platform })` → rotates `install.json` three deep and writes atomically; returns the receipt path.
+- Produces: `mergeReceipt({ dataDir, file, installer, platform })` → loads an existing receipt if present, replaces or adds the one `files` entry with the same path, keeps every other field, writes atomically, **never rotates**; with no receipt, creates one with empty lists. Returns the receipt path.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1461,28 +1831,41 @@ const assert = require("node:assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { writeReceipt, receiptDir } = require("./receipt");
+const { mergeReceipt, receiptDir } = require("./receipt");
 
-test("writes the receipt shape the installers write", () => {
+const entry = { path: "/n/bin/kannaka-bin", sha256: "ab".repeat(32), component: "kannaka", version: "0.17.0" };
+
+test("with no receipt, writes one with the installers' shape", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kr-"));
-  const p = writeReceipt({ dataDir: dir, installer: "npm:kannaka@0.17.0", platform: "linux-x86_64",
-    files: [{ path: "/n/bin/kannaka-bin", sha256: "ab".repeat(32), component: "kannaka", version: "0.17.0" }] });
+  const p = mergeReceipt({ dataDir: dir, installer: "npm:kannaka@0.17.0", platform: "linux-x86_64", file: entry });
   const r = JSON.parse(fs.readFileSync(p, "utf8"));
   assert.strictEqual(r.schema, 1);
-  assert.deepStrictEqual(Object.keys(r), ["schema", "installed_at", "installer", "manifest", "platform", "files", "rc_edits", "config_edits", "credentials", "registrations", "removed", "previous"]);
-  assert.strictEqual(r.files[0].component, "kannaka");
-  assert.deepStrictEqual(r.previous, []);
-  assert.ok(!fs.existsSync(path.join(dir, "install.json.tmp")));
+  assert.deepStrictEqual(Object.keys(r), ["schema", "installed_at", "installer", "manifest", "platform", "files", "extras", "rc_edits", "path_edits", "config_edits", "credentials", "registrations", "removed", "declined", "previous"]);
+  assert.deepStrictEqual(r.files, [entry]);
+  assert.ok(!fs.existsSync(path.join(dir, "install.json.1")));
 });
 
-test("rotates three deep", () => {
+test("merges into an existing receipt and rotates nothing", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kr-"));
-  for (let i = 0; i < 5; i++) writeReceipt({ dataDir: dir, installer: `i${i}`, platform: "p", files: [] });
+  const existing = { schema: 1, installed_at: "t", installer: "kannaka-labs/kannaka-plugin/install/install.sh@2", manifest: "latest", platform: "linux-x86_64",
+    files: [{ path: "/h/.local/bin/kannaka", sha256: "cd".repeat(32), component: "kannaka", version: "0.17.0" }],
+    extras: [], rc_edits: [{ file: "/h/.bashrc", sentinel: "# kannaka" }], path_edits: [], config_edits: [],
+    credentials: [{ file: "/h/.kannaka-nats.env" }], registrations: [{ kind: "claude-plugin", name: "kannaka@kannaka" }], removed: [], declined: [], previous: ["install.json.1"] };
+  fs.writeFileSync(path.join(dir, "install.json"), JSON.stringify(existing));
+  mergeReceipt({ dataDir: dir, installer: "npm:kannaka@0.17.0", platform: "linux-x86_64", file: entry });
   const r = JSON.parse(fs.readFileSync(path.join(dir, "install.json"), "utf8"));
-  assert.strictEqual(r.installer, "i4");
-  assert.deepStrictEqual(r.previous, ["install.json.1", "install.json.2", "install.json.3"]);
-  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, "install.json.3"), "utf8")).installer, "i1");
-  assert.ok(!fs.existsSync(path.join(dir, "install.json.4")));
+  assert.strictEqual(r.installer, existing.installer, "the machine's install record keeps its author");
+  assert.deepStrictEqual(r.rc_edits, existing.rc_edits);
+  assert.deepStrictEqual(r.credentials, existing.credentials);
+  assert.deepStrictEqual(r.registrations, existing.registrations);
+  assert.deepStrictEqual(r.previous, existing.previous);
+  assert.strictEqual(r.files.length, 2);
+  assert.ok(!fs.existsSync(path.join(dir, "install.json.1")), "npm must never rotate");
+  // a second npm install of the same package replaces its own entry, not duplicates it
+  mergeReceipt({ dataDir: dir, installer: "npm:kannaka@0.17.1", platform: "linux-x86_64", file: { ...entry, version: "0.17.1" } });
+  const r2 = JSON.parse(fs.readFileSync(path.join(dir, "install.json"), "utf8"));
+  assert.strictEqual(r2.files.length, 2);
+  assert.strictEqual(r2.files.find((f) => f.path === entry.path).version, "0.17.1");
 });
 
 test("receiptDir honours KANNAKA_DATA_DIR", () => {
@@ -1505,9 +1888,11 @@ Expected: "Cannot find module './receipt'".
 ```js
 "use strict";
 /**
- * The install receipt (~/.kannaka/install.json): what this install wrote, so
- * `kannaka uninstall` can reverse exactly it. Same shape as the shell and
- * PowerShell installers write; rotated three deep; written last, atomically.
+ * The install receipt (~/.kannaka/install.json): what was installed on this
+ * machine, so `kannaka uninstall` can reverse exactly it. The npm postinstall
+ * MERGES its one binary into whatever receipt exists — it never rotates, so a
+ * project's `npm install` cannot push the machine's real install record off
+ * the end — and writes atomically.
  */
 const fs = require("fs");
 const os = require("os");
@@ -1517,45 +1902,51 @@ function receiptDir() {
   return process.env.KANNAKA_DATA_DIR || path.join(os.homedir(), ".kannaka");
 }
 
-function writeReceipt({ dataDir, installer, platform, files, manifest = "latest", removed = [] }) {
-  fs.mkdirSync(dataDir, { recursive: true });
-  const p = path.join(dataDir, "install.json");
-  // rotate: .2 -> .3, .1 -> .2, current -> .1
-  for (const [from, to] of [[`${p}.2`, `${p}.3`], [`${p}.1`, `${p}.2`], [p, `${p}.1`]]) {
-    if (fs.existsSync(from)) fs.renameSync(from, to);
-  }
-  const previous = [1, 2, 3].filter((n) => fs.existsSync(`${p}.${n}`)).map((n) => `install.json.${n}`);
-  const doc = {
+function emptyReceipt(installer, platform) {
+  return {
     schema: 1,
     installed_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-    installer, manifest, platform, files,
-    rc_edits: [], config_edits: [], credentials: [], registrations: [],
-    removed, previous,
+    installer, manifest: "latest", platform,
+    files: [], extras: [], rc_edits: [], path_edits: [], config_edits: [], credentials: [], registrations: [],
+    removed: [], declined: [], previous: [],
   };
+}
+
+function mergeReceipt({ dataDir, installer, platform, file }) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const p = path.join(dataDir, "install.json");
+  let doc = null;
+  try { doc = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { doc = null; }
+  if (!doc || doc.schema !== 1) doc = emptyReceipt(installer, platform);
+  for (const k of ["files", "extras", "rc_edits", "path_edits", "config_edits", "credentials", "registrations", "removed", "declined", "previous"]) {
+    if (!Array.isArray(doc[k])) doc[k] = [];
+  }
+  doc.files = doc.files.filter((f) => f.path !== file.path);
+  doc.files.push(file);
   const tmp = `${p}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
   fs.renameSync(tmp, p);
   return p;
 }
 
-module.exports = { writeReceipt, receiptDir };
+module.exports = { mergeReceipt, receiptDir };
 ```
 
-In `packaging/npm/install.js`, add near the top `const { writeReceipt, receiptDir } = require("./receipt");` and after line 101 (`console.log(\`kannaka: installed ${dest}\`)`):
+In `packaging/npm/install.js`, add near the top `const { mergeReceipt, receiptDir } = require("./receipt");` and after line 101 (`console.log(\`kannaka: installed ${dest}\`)`):
 
 ```js
   // The receipt: this is an install like any other, so `kannaka uninstall`
-  // can find and reverse it. Written last.
-  const receipt = writeReceipt({
+  // can find and reverse it. Merged, never rotated; written last.
+  const receipt = mergeReceipt({
     dataDir: receiptDir(),
     installer: `npm:kannaka@${VERSION}`,
     platform: `${os}-${arch}`,
-    files: [{ path: dest, sha256: crypto.createHash("sha256").update(bin).digest("hex"), component: "kannaka", version: VERSION }],
+    file: { path: dest, sha256: crypto.createHash("sha256").update(bin).digest("hex"), component: "kannaka", version: VERSION },
   });
   console.log(`kannaka: receipt ${receipt}`);
 ```
 
-Also fix the failure hint at line 108 of `install.js`: replace `curl -sSf https://install.ninja-portal.com/kannaka | sh` with `curl -fsSL https://raw.githubusercontent.com/kannaka-labs/kannaka-plugin/master/install/install.sh | sh` (the hostname does not exist; §8 is Nick's decision and until then the hint must be a working address).
+Also fix the failure hint at line 108 of `install.js`: replace `curl -sSf https://install.ninja-portal.com/kannaka | sh` with `curl -fsSL https://raw.githubusercontent.com/kannaka-labs/kannaka-plugin/master/install/install.sh | sh` (the hostname serves nothing yet; §8 is Nick's decision and until then the hint must be a working address).
 
 Ensure `packaging/npm/package.json`'s `"files"` array lists `receipt.js` beside `install.js`.
 
@@ -1572,14 +1963,14 @@ In `.github/workflows/ci.yml` `check` job, after the forwarder step:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: npm postinstall — receipt writer
+      - name: npm postinstall — receipt merge
         working-directory: kannaka-memory
         run: node --test packaging/npm/receipt.test.js && node --check packaging/npm/install.js
 ```
 
 ```bash
 git add packaging/npm/receipt.js packaging/npm/receipt.test.js packaging/npm/install.js packaging/npm/package.json .github/workflows/ci.yml
-git commit -m "npm: postinstall writes the install receipt; failure hint points at a real address"
+git commit -m "npm: postinstall merges its binary into the install receipt (never rotates); failure hint points at a real address"
 ```
 
 ---
@@ -1598,24 +1989,28 @@ Insert after `## [Unreleased]`:
 
 ### Added — an install can be reversed
 
-- `kannaka uninstall [--purge] [--dry-run] [--yes]`. Reads the install receipt
-  (`<data dir>/install.json`, written by the constellation installer) and
-  reverses exactly it, removing each binary only after its `--version` banner
-  proves it is kannaka, and this binary last. Without a receipt it looks in the
-  places a kannaka can live and applies the same identity check. Data, shell rc
-  blocks and credentials are kept unless `--purge`; system units and scheduled
-  tasks are printed, never run. Exits non-zero if anything meant to be removed
-  is still there.
+- `kannaka uninstall [--purge] [--delete-data] [--dry-run] [--yes]`. Reads the
+  install receipt (`<data dir>/install.json`, written by the constellation
+  installer) and reverses exactly it, removing each binary only after its
+  `--version` banner proves it is kannaka, and this binary last. Without a
+  receipt it looks in the three directories the installers write into and
+  applies the same identity check; a kannaka anywhere else is named with the
+  command that removes it and left alone. Data, shell rc blocks and credentials
+  are kept unless `--purge`, which moves the data dir aside (`--delete-data`
+  deletes it), asks for the word `purge` on a terminal and refuses without
+  `--yes` when there is none. System units and scheduled tasks are printed,
+  never run. Exits non-zero if anything meant to be removed is still there.
 
 ### Changed
 
-- `kannaka update` now refreshes every component the receipt lists —
+- `kannaka update` now refreshes every sibling the receipt lists —
   `kannaka-tui` and `kannaka-hdl`, not only the TUI — to the version the signed
   constellation manifest pins, verifying each download against the manifest's
-  sha256, and rewrites the receipt. An install older than receipts gets one.
+  sha256, and rewrites the receipt in place. An install older than receipts
+  gets one. The engine itself keeps following its release channel.
 - `scripts/install.sh` and `scripts/install.ps1` are forwarders to the one
   installer in `kannaka-labs/kannaka-plugin`; every published one-liner keeps
-  working. The npm postinstall writes the same receipt.
+  working. The npm postinstall merges its binary into the same receipt.
 ```
 
 - [ ] **Step 2: Version bump and lockfile**
@@ -1644,10 +2039,10 @@ The tag `v0.17.0` is pushed by the controller after the PR merges and CI is gree
 
 ## Self-review
 
-**Spec coverage.** §2 forwarders → Task 1; npm as an install like any other → Task 6. §3 receipt → Task 2 (both credential shapes; `removed`/`previous` default). §4 fallback table with the identity check → Task 3 (`fallback_candidates`, `consider`); the brew/npm/marketplace rows are the installer's (plugin plan) — an uninstall reverses the receipt, and a brew or npm install has its own uninstall, stated in the module comment. §5 preserve set → Task 3's first test asserts it byte-for-byte for the identity key and rc; `--purge` widening and the print-only list with the exact unit and task names → Task 3. §6 all three forms, exit non-zero on survivors, self last with the Windows rename → Tasks 3, 4. §7 whole-install update, manifest, receipt rewrite → Task 5 (Ruling 1 keeps the engine on latest; stated). §8 → Nick; the npm hint stops advertising the dead hostname meanwhile. §9: receipt round trip (install half in the plugin plan; `--dry-run` = plan, uninstall leaves the preserve set, `--purge` leaves nothing and prints the system commands) → Task 3; no-receipt fallback → Task 3; Windows self-rename → Task 3 (`#[cfg(windows)]`, run on this box per Ruling 7); mutation → Task 3 (`mutation_guard_removed_deletes_the_impostor`). §10 order: Task 1 is step 1, Tasks 2-7 are step 3.
+**Spec coverage (rev 2).** §2 forwarders → Task 1; npm merges, never rotates → Task 6. §3 receipt with `extras`, `path_edits`, `declined`, both credential shapes, complete-rotate-rename under a lock → Task 2; the installer's own receipt as a fixture → Task 2 (from plan A Task 6). §4 identity check bounded to `$HOME` with a five-second cap and a leading-`v` version → Task 3 `banner_component`. §5 preserve set → Task 3's first test byte-checks the identity key and rc; `--purge` widening, data dir moved aside, outside-`$HOME` and `$HOME`-itself refusals, print-only list with the exact unit and task names → Task 3. §6 all flags, exit codes, consent on a terminal and refusal without one, self last with the Windows rename, parked files reported as parked, statusline off before plugin uninstall, launcher and Windows PATH entry reversed, legacy rc blocks → Tasks 3, 4. §7 siblings from the manifest, receipt rewritten in place, engine on its release channel, CI grep for the old owner, data dir byte-identical around a refresh → Task 5. §8 → Nick; the npm hint stops advertising the dead hostname meanwhile. §9: receipt round trip (install half in plan A; `--dry-run` = plan; uninstall leaves the preserve set; `--purge` leaves the moved-aside dir and prints the system commands) → Task 3; no-receipt fallback → Task 3; Windows self-rename → Task 3 (`#[cfg(windows)]`, run on this box per Ruling 7); mutation → Task 3; cross-repo fixture → Task 2. §10 order: Task 1 is step 1, Tasks 2-7 are step 3.
 
-**Placeholders.** None. One deliberate trap is flagged inline (the duplicated `ran`/`run` lines in the purge test) so the implementer reads the `&dyn Fn` contract.
+**Placeholders.** None.
 
-**Type consistency.** `Banner = dyn Fn(&Path) -> Option<String>` is what `plan` takes and what `banner_component` is (`&uninstall::banner_component` coerces). `execute`'s `run: &dyn Fn(&str, &[&str]) -> bool` matches the closure in `handle_uninstall`. `Receipt` fields used in `update_components` (`files`, `installer`) exist in Task 2. `windows_swap_binary(target, new_file) -> Result<PathBuf, String>` is called with `(target, &tmp)` and its `Ok` is discarded.
+**Type consistency.** `Banner = dyn Fn(&Path) -> Option<String>` is what `plan` takes and what `banner_component` is (`&uninstall::banner_component` coerces). `execute`'s `run: &dyn Fn(&str, &[&str]) -> bool` matches the closure in `handle_uninstall`. `Plan.data_dir: Option<(PathBuf, DataAction)>` is what the tests compare. `Receipt` fields used in `update_components` (`files`, `installer`) and in `uninstall` (`extras`, `path_edits`, `registrations`) exist in Task 2. `refresh_with`'s injected `fetch`/`local_version` are the two things `refresh_all` supplies from the network and the process table. `windows_swap_binary(target, new_file) -> Result<PathBuf, String>` is called with `(target, &tmp)` and its `Ok` is discarded.
 
-**Known gaps, stated.** (1) `banner_component` reads stdout only after the child exits; a component that prints more than the pipe buffer before exiting would block — none does (one line). (2) The manifest PEM parser assumes the fixed Ed25519 SPKI layout; a key in any other encoding reads as "unsigned", never as "signed". (3) `local_version` spawns the sibling without the 5-second cap that `banner_component` has; it runs only on a path that already passed `banner_component`.
+**Known gaps, stated.** (1) `banner_component` reads stdout only after the child exits; a component that prints more than the pipe buffer before exiting would block — none does (one line). (2) The manifest PEM parser assumes the fixed Ed25519 SPKI layout; a key in any other encoding reads as "unsigned", never as "signed". (3) `user_path_remove` parses `reg query` output by whitespace; a PATH containing a value with the literal text `REG_` at the start is not a case Windows produces. (4) `hint_for` recognises brew and npm prefixes by path fragments; anything else gets the generic "the tool that installed it".
