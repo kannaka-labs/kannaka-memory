@@ -9,7 +9,7 @@
 
 ```bash
 # Clone and build
-git clone https://github.com/NickFlach/kannaka-memory.git
+git clone https://github.com/kannaka-labs/kannaka-memory.git
 cd kannaka-memory
 cargo build --release
 ```

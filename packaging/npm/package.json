@@ -24,13 +24,13 @@
     "vector",
     "cli"
   ],
-  "homepage": "https://github.com/NickFlach/kannaka-memory#readme",
+  "homepage": "https://github.com/kannaka-labs/kannaka-memory#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NickFlach/kannaka-memory.git"
+    "url": "git+https://github.com/kannaka-labs/kannaka-memory.git"
   },
   "bugs": {
-    "url": "https://github.com/NickFlach/kannaka-memory/issues"
+    "url": "https://github.com/kannaka-labs/kannaka-memory/issues"
   },
   "license": "MIT",
   "engines": {

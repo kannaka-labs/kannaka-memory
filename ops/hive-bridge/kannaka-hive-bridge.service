@@ -28,7 +28,7 @@
 
 [Unit]
 Description=Kannaka Hive Bridge — buzz relay -> NATS (ADR-0045)
-Documentation=https://github.com/NickFlach/kannaka-memory
+Documentation=https://github.com/kannaka-labs/kannaka-memory
 # network-online, not just network: the relay connect at startup is a hard
 # `expect()`, so starting before DNS/routing is up just burns a restart.
 After=network-online.target nats.service

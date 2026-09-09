@@ -1,5 +1,5 @@
 //! `kannaka compute` — operator commands for the KAX Compute District
-//! (the machines run by NickFlach/kax-computer on skywave).
+//! (the machines run by kannaka-labs/kax-computer on skywave).
 //!
 //! Sub-verbs:
 //!   list      GET the public KAX roster (HTTP, no NATS needed)

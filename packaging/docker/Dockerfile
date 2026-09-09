@@ -20,12 +20,12 @@ RUN apk add --no-cache curl ca-certificates \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac \
  && curl -fsSL -o /kannaka \
-      "https://github.com/NickFlach/kannaka-memory/releases/download/v${VERSION}/kannaka-linux-${A}" \
+      "https://github.com/kannaka-labs/kannaka-memory/releases/download/v${VERSION}/kannaka-linux-${A}" \
  && chmod +x /kannaka \
  && /kannaka --version
 
 FROM alpine:3.20
-LABEL org.opencontainers.image.source="https://github.com/NickFlach/kannaka-memory"
+LABEL org.opencontainers.image.source="https://github.com/kannaka-labs/kannaka-memory"
 LABEL org.opencontainers.image.description="Kannaka — wave-interference (HRM) memory for AI agents"
 LABEL org.opencontainers.image.licenses="MIT"
 COPY --from=fetch /kannaka /usr/local/bin/kannaka

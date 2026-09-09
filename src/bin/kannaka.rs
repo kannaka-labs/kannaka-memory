@@ -1482,7 +1482,7 @@ fn main() {
             config::CONSCIOUSNESS_CORE_VERSION
         );
         println!("Wave-Interference Memory System");
-        println!("https://github.com/NickFlach/kannaka-memory");
+        println!("https://github.com/kannaka-labs/kannaka-memory");
         return;
     }
 

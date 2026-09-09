@@ -4,6 +4,6 @@
   "command": "kannaka-acp",
   "args": ["--top-k", "5"],
   "env": {},
-  "installInstructionsUrl": "https://github.com/NickFlach/kannaka-plugin",
+  "installInstructionsUrl": "https://github.com/kannaka-labs/kannaka-plugin",
   "installHint": "cargo install --path . --bin kannaka-acp (must resolve on PATH)"
 }
