@@ -43,7 +43,7 @@ Multi-arch + push to GHCR:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t ghcr.io/nickflach/kannaka:0.11.1 -t ghcr.io/nickflach/kannaka:latest \
+  -t ghcr.io/kannaka-labs/kannaka:0.11.1 -t ghcr.io/kannaka-labs/kannaka:latest \
   --build-arg VERSION=0.11.1 -f packaging/docker/Dockerfile --push .
 ```
 
@@ -52,7 +52,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 Tap: [`kannaka-labs/homebrew-kannaka`](https://github.com/kannaka-labs/homebrew-kannaka)
 
 ```sh
-brew install nickflach/kannaka/kannaka
+brew install kannaka-labs/kannaka/kannaka
 ```
 
 Binary formula (macOS + Linux, arm64 + x86_64) with sha256 digests pinned from

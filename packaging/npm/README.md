@@ -34,7 +34,7 @@ Supported platforms: **linux**, **macOS**, **windows** on **x86_64** and
 ## Alternatives
 
 - Direct install script: `curl -sSf https://install.ninja-portal.com/kannaka | sh`
-- Docker: `docker run --rm ghcr.io/nickflach/kannaka --version`
+- Docker: `docker run --rm ghcr.io/kannaka-labs/kannaka --version`
 - Build from source: <https://github.com/kannaka-labs/kannaka-memory>
 
 MIT licensed. The version of this package tracks the kannaka release it installs.
