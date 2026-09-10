@@ -59,3 +59,39 @@ Git-Bash's MSYS ssh mangles the backslash paths it writes into
 `~/.kannaka-corpus/runs/` there — which is where they get served anyway.
 
 Everything under `~/.kannaka-corpus/` is private until the ADR-0057 decision.
+
+## A second base: Qwen3.8-27B (DavidAU TURBO Fable Cold Fusion)
+
+Requested 2026-09-10. Nothing above changes; the base is a flag. What is
+different about this one, and where it bites:
+
+| fact | consequence |
+|---|---|
+| Source weights: `DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU` (55.5 GB bf16 safetensors, Apache-2.0, `base_model: Qwen/Qwen3.8-27B`). The `…-NEO-CODER-MAX-MTP-GGUF` repo is quants only and cannot be trained on. | `--base` is the NM-DAU id. Licence passes ADR-0057's Apache/MIT rule. Provenance caveat: a community multi-stage merge whose full recipe "will be disclosed upon final release" — record it in the registry note. |
+| Architecture `Qwen3_5ForConditionalGeneration` (vision-language wrapper), text model 64 layers: 48 `linear_attn` (GatedDeltaNet: `in_proj_qkv`, `in_proj_z`, `in_proj_a/b`, `out_proj`) + 16 `self_attn` (q/k/v/o), MLP gate/up/down on all; 333 `model.visual.*` tensors; 15 `mtp.*` tensors. | transformers ≥ 5.17 maps `qwen3_5` → `Qwen3_5ForCausalLM` under `AutoModelForCausalLM` and drops `model.visual.*` / `mtp.*` on load, so `train_lora.py` and `merge_gguf.py` load it text-only unchanged. LoRA targets come from `base_info.LORA_TARGET_REGEX` and include the linear-attention projections; vision never. `--max-sane-ppl` refuses to spend if the load produced garbage. |
+| Thinking-mode chat template (`reasoning_effort` injection, `<think>`). | Train and prompt with `--chat-template-kwargs '{"enable_thinking": false}'`; the manifest records it and the card repeats it. |
+| llama.cpp `conversion/qwen.py` registers `Qwen3_5ForCausalLM` (text) and `qwen3vl.py` the mmproj. | `merge_gguf.py` unchanged: merged text-only dir → `convert_hf_to_gguf.py` → `llama-quantize`. No mmproj is produced or needed (voice only). MTP export is optional (`--mtp`) and not part of the serve path. |
+| Size. | Pod: nf4 weights ≈ 15 GB + LoRA + activations at `--max-len 2048` with checkpointing fits an A100-80GB (`gpu-a100-sxm`, $2.49/h). debain2 disk for the merge: base cache 56 GB + merged 55 GB + q8 intermediate 29 GB + q4 ≈ 16 GB — use `--intermediate q8_0 --purge-base-cache` and check `df` first. Serving: q4_K_S/q4_K_M ≈ 15–16 GB RAM on the 196 GB box; expect a few tok/s on 20 CPU cores. |
+
+Exact commands, from debain2 (the runner; see *Run it from Linux*):
+
+```
+# 1. train (adapter only; ceiling = 150 min × $2.49 ≈ $6.2, refuses above the credit balance)
+python run_qbraid.py --profile gpu-a100-sxm --data ~/.kannaka-corpus/sft \
+    --base DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU \
+    --max-minutes 150 --allow-spend -- --qlora --epochs 2 --r 32 --max-len 2048 --batch 1 --grad-accum 16 \
+    --chat-template-kwargs '{"enable_thinking": false}'
+# 2. merge + quantize on debain2 (free)
+~/merge-venv/bin/python merge_gguf.py --base DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU \
+    --adapter ~/.kannaka-corpus/runs/<run>/adapter --out ~/.kannaka-corpus/runs/<run> \
+    --quant q4_K_M --intermediate q8_0 --purge-base-cache
+# 3. serve under the fleet family name (arena reports model_id=kannaka-brain from every tag)
+bash serve_debain2.sh ~/.kannaka-corpus/runs/<run>/gguf/kannaka-brain-q4_K_M.gguf kannaka-brain-27b-v1
+# 4. judge before anyone promotes it (ADR-0057 / kannaka-wave adoption rule), then
+python publish_hf.py --run ~/.kannaka-corpus/runs/<run> --namespace flaukowski --version 27b-v1 --stage-only
+```
+
+The weekly gate does not adopt it: a candidate is served beside `kannaka-brain-7b-v1`
+and replaces it only when the controlled judge prefers it and the external evaluator
+agrees (`kannaka-wave/src/adoption.rs`). kannaka-wave E-006 adds the check to run before
+that: two instances of the candidate against each other, no more lock-in than its base.

@@ -6,6 +6,10 @@ trains and saves the adapter, so no cmake or llama.cpp on the meter.
   python merge_gguf.py --base Qwen/Qwen2.5-14B-Instruct --adapter <run>/adapter \
       --out <run> --quant q4_K_M [--llama-cpp ~/llama.cpp]
 
+Any base AutoModelForCausalLM can load works, including a vision-language checkpoint
+(transformers >= 5 unwraps qwen3_5 to its text model; the merged dir is text-only and
+llama.cpp converts it as Qwen3_5ForCausalLM).
+
 Writes <out>/gguf/kannaka-brain-<quant>.gguf and removes the bf16 merge and
 the f16 GGUF once the quantized file exists (disk hygiene).
 """
@@ -35,7 +39,8 @@ def main(argv=None) -> int:
     ap.add_argument("--intermediate", default="f16", choices=["f16", "bf16", "q8_0"],
                     help="convert outtype before quantizing; q8_0 halves the intermediate (32B: 64G -> 32G)")
     ap.add_argument("--purge-base-cache", action="store_true",
-                    help="delete the HF cache snapshot of --base after merging (disk: base 30G + merged 28G + f16 28G + q4 9G)")
+                    help="delete the HF cache snapshot of --base after merging (disk, 14B: base 30G + merged 28G + f16 28G + q4 9G; "
+                         "27B Qwen3.8: base 56G + merged 55G + q8 29G + q4 16G, so pair with --intermediate q8_0)")
     a = ap.parse_args(argv)
 
     import torch
