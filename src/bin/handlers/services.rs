@@ -707,8 +707,16 @@ pub(crate) fn handle_market(cfg: &KannakaConfig, args: &[String]) {
                 }
                 Err(e) => {
                     eprintln!("  Trade failed: {e}");
-                    if e.contains("401") {
+                    if e.contains("401") || e.contains("403") {
+                        // Two credentials reach this route (kannaka-radio#304):
+                        // a KAX identity token for labs tier, and the row's own
+                        // hub bearer for play tier. Naming only the first sent
+                        // operators to re-mint a JWT when the real problem was a
+                        // stale `ghostsignals.token`.
                         eprintln!("  (labs-tier markets need a KAX identity token: kannaka market auth <jwt>)");
+                        eprintln!("  (play-tier needs THIS row's hub bearer in ghostsignals.token; once a row holds one,");
+                        eprintln!("   naming the trader is no longer enough. If the stored token is not the row's, only");
+                        eprintln!("   an operator can clear it: POST /api/agents/{}/bearer/reset, then `kannaka init`)", cfg.agent.id);
                     } else if e.contains("409") {
                         eprintln!("  (insufficient credits, or you proposed this market — proposers can't trade their own markets)");
                     }
