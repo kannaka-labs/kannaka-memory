@@ -2160,8 +2160,17 @@ impl SwarmTransport {
         // connection already refused never attempts it again.
         let stream_absent = !authenticated && !denied_here && !self.presence_stream_exists();
         if !should_attempt_presence_create(authenticated, denied_here, stream_absent) {
+            // Name the actual reason: since the open-broker bootstrap landed,
+            // an anonymous connection skips the create because the stream is
+            // already there, OR because this connection has been refused once.
+            // "not available to an anonymous connection" covered only the
+            // second and read as a permissions verdict in both cases.
             return Err(NatsError::Protocol(
-                "stream create is not available to an anonymous connection".to_string(),
+                if denied_here {
+                    "this connection was refused $JS.API.STREAM.CREATE; not retrying".to_string()
+                } else {
+                    "presence stream already exists; no create needed".to_string()
+                },
             ));
         }
         self.ensure_js_stream(
