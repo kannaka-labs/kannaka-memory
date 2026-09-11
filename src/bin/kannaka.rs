@@ -4445,17 +4445,22 @@ fn main() {
                     }
                     // #572: this was `let _ = transport.ensure_presence_stream();`.
                     // `swarm peers` reads presence ONLY from the JetStream-backed
-                    // KANNAKA_PRESENCE stream, so if creation is denied on this
-                    // broker the agent never becomes discoverable — while join
-                    // happily reported success. Not fatal (a read-only JS identity
-                    // is a legitimate deployment), but it must be LOUD, because
-                    // the symptom otherwise is a node that looks healthy in its own
-                    // logs and is invisible to every peer.
+                    // KANNAKA_PRESENCE stream, so if the stream is ABSENT the agent
+                    // never becomes discoverable — while join happily reported
+                    // success. That must be LOUD. But a refused create says only
+                    // that THIS identity cannot create the stream (#928): on a
+                    // running swarm it already exists, presence publishes are
+                    // retained, and the node is listed by other hosts — so check
+                    // before warning, and keep the warning for the absent case.
                     if let Err(e) = transport.ensure_presence_stream() {
+                        let exists = transport.presence_stream_exists();
                         eprintln!(
-                            "[nats] WARNING: presence stream unavailable ({e}) — this agent will \
-                             NOT appear in `swarm peers`. Presence publishes will be accepted by \
-                             the broker and dropped."
+                            "{}",
+                            kannaka_memory::nats::presence_stream_notice(
+                                &e.to_string(),
+                                exists,
+                                transport.is_authenticated(),
+                            )
                         );
                     }
 

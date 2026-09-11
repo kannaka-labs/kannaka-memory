@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+### Fixed — `kannaka init` merges, saves atomically, and tells the truth (#930, #928)
+
+`kannaka init` now MERGES into an existing `config.toml` instead of starting from
+defaults: the agent id, persona, retention rules, `swarm_trust` and every table the
+wizard does not ask about survive a re-run (a non-interactive re-run is a no-op on
+identity; a config that exists but does not parse is refused, not replaced).
+`config.toml` and every other owner-only file are written temp-and-rename in their
+own directory, 0600 from creation, never truncated in place. `ghostsignals.enabled`
+is set only after the hub actually returned a token (the failure line no longer
+names the non-existent `kannaka ghostsignals register`), and the registration body
+carries the id as both `agent_id` and `id` so the hub creates the trader row today.
+`swarm.enabled = true` is written only when credentials exist or the operator
+explicitly chose anonymous membership (`--anonymous`; the config header says so).
+Member defaults are `[swarm] role = "worker"` and `[agent] kind = "agent"`; `queen`
+is never a default. The Kannaktopus install prompt is gone. `swarm join` no longer
+claims an anonymous node "will NOT appear in swarm peers" when the presence stream
+already exists: it checks (STREAM.INFO, or the MSG.GET probe anonymous users are
+granted) and warns only when the stream is genuinely absent; anonymous connections
+also stop issuing the create they are structurally denied. ADR-0059 §1.
+
+Behaviour changes in `kannaka init` worth naming explicitly:
+
+- **The confirmation gate is opt-in and now needs a terminal.** Enter at
+  `Update it? ... [y/N]` aborts, as it always did, and the interactive wizard
+  refuses a stdin that is not a terminal outright — end-of-file is not consent,
+  and a cron entry, a provisioning script or a piped `kannaka init` must not run
+  a wizard that rewrites tables and can write into the store. The error points
+  at `--non-interactive`, which re-runs against the existing config without
+  prompting.
+- **`[llm]` is left alone unless you ask.** A non-interactive run without
+  `--llm-provider` no longer forces `provider = "none"`; interactively, Enter
+  keeps a configured provider (the prompt says `[default: keep anthropic]`) and
+  Enter at an API-key prompt keeps the key on file. Choosing `5) None` is now an
+  explicit act and clears `model`, `base_url` and `api_key` with it, so the
+  table cannot say "none" beside a live model.
+- **An interactive re-run does not re-seed a populated HRM.** When the store
+  already holds memories, step 4 offers keep-as-is / add constellation / add
+  from folder, defaulting to keep. It previously wrote a `born on <today>`
+  identity memory and 15 duplicate constellation memories into the live store.
+- **`swarm.enabled` is a declaration, not a gate.** Nothing reads it at join
+  time: `swarm join`, `swarm listen` and `swarm serve` never consult it. It
+  records what the operator chose; it does not enforce it.
+- **A fresh non-interactive init with no credentials writes
+  `[swarm] enabled = false`** where it previously wrote `true`. Nodes built by
+  `provision.sh` are unaffected — it writes `config.toml` itself and never calls
+  `kannaka init`.
+- **`--no-claim`** is an alias for `--anonymous`, and is now listed by
+  `kannaka init --help`.
+- **The ANONYMOUS header is written by `init`, not recomputed by every save.**
+  `config.toml`'s "ANONYMOUS membership" comment block records the decision the
+  init step made; `kannaka config set` and the other ~20 `save()` callers no
+  longer re-derive it from whatever credentials their own process happens to
+  see. On a node whose credentials arrive via `EnvironmentFile=` that guess was
+  wrong, and the false block appeared and vanished with each save.
+- **The presence stream can still be bootstrapped on an open broker.** An
+  anonymous connection attempts `STREAM.CREATE` when the stream is genuinely
+  absent, and stops only once the broker has actually refused it on that
+  connection. The production swarm is unchanged: the stream is already there, so
+  nothing is issued and the denial noise stays gone.
+
 ## [0.16.2] — 2026-09-09
 
 ### Changed — the constellation lives at kannaka-labs
