@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed — GhostSignals: present the stored bearer, and tell the truth about a 409 (#930)
+
+The hub now mints a per-row bearer and returns the plaintext token once
+(kannaka-radio#304, deployed). The client presents the token already on file as
+`Authorization: Bearer <token>` on the register POST, so a re-register ROTATES it
+instead of colliding; a 200 carrying a different token is recognised as a rotation
+and the new token replaces the old. Each outcome of that call is now distinct
+rather than one error string: a first registration, a rotation, a 409 with no token
+on file (the id is taken by someone else — register under a different `--agent-id`,
+or have an operator clear the row with `POST /api/agents/:id/bearer/reset`), a 409
+with a token on file (the stored token is stale, and it is KEPT), a 200 naming a
+pre-existing row that holds no bearer (true of every row on the live hub today —
+not a failure, and it changes neither the stored token nor `enabled`), and a
+transport failure. The retry hint follows the outcome: "re-run `kannaka init`" is
+printed only where re-running can actually change the answer, never for an existing
+row that only the hub oracle can give a bearer to. **No path writes an empty token
+over a stored one** — only the success arm assigns `ghostsignals.token` at all.
+`kannaka init` on an already-registered node offers rotation (default no), and a
+rejected trade names the hub bearer alongside the KAX identity token.
+
 ## [0.16.3] — 2026-09-11
 
 ### Fixed — `kannaka init` merges, saves atomically, and tells the truth (#930, #928)

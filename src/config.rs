@@ -938,6 +938,18 @@ pub(crate) fn llm_choice_clears(choice: u32, configured: bool) -> bool {
     choice == 5 || !configured
 }
 
+/// Does this answer at the rotate prompt mean "rotate the hub token"?
+///
+/// Only an explicit yes. Enter, end-of-file (`read_line` returns Ok(0) and
+/// leaves the line empty, which is exactly what a pipe or a cron entry looks
+/// like) and anything else KEEP the token on file. Rotating destroys the
+/// credential the node is currently trading with, so like the #933 update
+/// gate it is opt-in, never the default and never something a non-answer can
+/// trigger.
+pub(crate) fn rotate_requested(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 fn ghostsignals_hub(config: &KannakaConfig) -> String {
     if config.ghostsignals.hub_url.is_empty() {
         config.constellation.radio_url.clone()
@@ -946,30 +958,147 @@ fn ghostsignals_hub(config: &KannakaConfig) -> String {
     }
 }
 
-/// Apply the hub's answer to the config (ADR-0059 §1, #930): `enabled`
-/// becomes true ONLY with a token in hand. On failure the flag is left
-/// false — `enabled = true` with an empty token was the silently-broken
-/// identity of #111, and the wizard used to set it BEFORE calling the hub.
+/// What the hub actually answered a register POST with (kannaka-radio#304).
+///
+/// The register route has three distinct successful shapes, and collapsing
+/// them into "a token or an error string" made the client print the same
+/// wrong advice for all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GsRegistered {
+    /// 200 with a plaintext `token`: the row was created now, or an existing
+    /// row's bearer was rotated because we presented the current one.
+    Token(String),
+    /// 200, `ok: true`, a trader row, and NO `token`. The row already exists
+    /// and holds no bearer — true of every row minted before #304, which is
+    /// all 44 live rows today (`kannaka-01`, `kannaka-witness-01`,
+    /// `kannaktopus-01`, …). Only a caller holding the hub's oracle token can
+    /// make such a row mint one, so this is normal, not a failure.
+    NoTokenExistingRow,
+}
+
+/// Why a register POST yielded no usable token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GsRegisterError {
+    /// 409: the row already holds a bearer and the request did not present
+    /// it (kannaka-radio#304). With no token on this machine the id is taken
+    /// by someone else; with one, the stored token is stale.
+    IdTaken,
+    /// The request never reached the hub (DNS, refused, timeout). Retrying
+    /// is the right advice for this one, and only this one.
+    Transport(String),
+    /// Any other HTTP status, or a 200 whose body cannot be read as a
+    /// registration.
+    Other(String),
+}
+
+impl std::fmt::Display for GsRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GsRegisterError::IdTaken => {
+                write!(f, "409 Conflict: that row already holds a hub bearer")
+            }
+            GsRegisterError::Transport(e) | GsRegisterError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The one path that may reset the bearer on a row, quoted in the notes below.
+fn bearer_reset_hint(agent_id: &str) -> String {
+    format!("an operator holding the hub oracle token can clear it: POST /api/agents/{agent_id}/bearer/reset")
+}
+
+/// Apply the hub's answer to the config (ADR-0059 §1, #930; contract from
+/// kannaka-radio#304): `enabled` becomes true ONLY with a token in hand. On
+/// failure the flag is left false — `enabled = true` with an empty token was
+/// the silently-broken identity of #111, and the wizard used to set it BEFORE
+/// calling the hub.
+///
+/// A 200 carrying a token different from the one on file is a ROTATION (the
+/// hub rotates when the caller presents the current bearer); the new token
+/// replaces the old. **No arm ever writes an empty token over a stored one** —
+/// only the `Token` arm assigns `ghostsignals.token` at all, so a 409, a
+/// transport failure or a token-less 200 leave what is on disk untouched.
+///
 /// Returns the one factual line the caller prints.
 pub fn apply_ghostsignals_registration(
     config: &mut KannakaConfig,
-    result: Result<String, String>,
+    result: Result<GsRegistered, GsRegisterError>,
 ) -> String {
+    let stored = config.ghostsignals.token.trim().to_string();
+    let had_token = !stored.is_empty();
     match result {
-        Ok(token) if !token.trim().is_empty() => {
+        Ok(GsRegistered::Token(token)) if !token.trim().is_empty() => {
+            let rotated = had_token && stored != token.trim();
             config.ghostsignals.token = token;
             config.ghostsignals.enabled = true;
-            format!("Registered '{}' with GhostSignals.", config.agent.id)
+            if rotated {
+                format!(
+                    "Rotated the GhostSignals token for '{}': the hub replaced the one on file.",
+                    config.agent.id
+                )
+            } else {
+                format!("Registered '{}' with GhostSignals.", config.agent.id)
+            }
+        }
+        // Defensive: a 200 whose `token` is present but blank is a malformed
+        // answer, not a registration (#111). `register_ghostsignals` refuses
+        // it before this point; if it ever arrives it is a failure, and one
+        // that still leaves whatever is on disk alone.
+        Ok(GsRegistered::Token(_)) => {
+            config.ghostsignals.enabled = false;
+            format!(
+                "GhostSignals returned an empty token for '{}'; left disabled, token on file untouched.",
+                config.agent.id
+            )
+        }
+        Ok(GsRegistered::NoTokenExistingRow) if had_token => {
+            // The row predates the bearer contract and holds none, so the hub
+            // minted nothing. Nothing changes: not the token, not the flag.
+            format!(
+                "GhostSignals already knows '{}' and issued no new token (the row holds no bearer); \
+                 the token on file is unchanged.",
+                config.agent.id
+            )
         }
         Ok(_) => {
+            // No token on file and none coming. `enabled` cannot be true
+            // without a token, and re-running init will never change this
+            // answer — say what actually would.
             config.ghostsignals.enabled = false;
-            "GhostSignals registration returned no token; left disabled. Re-run `kannaka init` \
-             to try again."
-                .to_string()
+            format!(
+                "GhostSignals already has a row for '{}' with no bearer, and only the hub oracle can \
+                 mint one for an existing row: an operator must re-register it with the oracle token, \
+                 or register under a different id (--agent-id). Left disabled; re-running `kannaka \
+                 init` returns the same answer.",
+                config.agent.id
+            )
         }
-        Err(e) => {
+        Err(GsRegisterError::IdTaken) if had_token => {
+            config.ghostsignals.enabled = false;
+            format!(
+                "GhostSignals refused the stored token for '{}' (409): it is stale — the row's bearer \
+                 is not this one. The token on file is kept; {}, then re-run `kannaka init`.",
+                config.agent.id,
+                bearer_reset_hint(&config.agent.id)
+            )
+        }
+        Err(GsRegisterError::IdTaken) => {
+            config.ghostsignals.enabled = false;
+            format!(
+                "GhostSignals: '{}' is already registered and its bearer is not on this machine (409). \
+                 Left disabled; register under a different id (--agent-id), or {}, then re-run \
+                 `kannaka init`.",
+                config.agent.id,
+                bearer_reset_hint(&config.agent.id)
+            )
+        }
+        Err(GsRegisterError::Transport(e)) => {
             config.ghostsignals.enabled = false;
             format!("GhostSignals registration failed: {e}. Left disabled; re-run `kannaka init` to try again.")
+        }
+        Err(GsRegisterError::Other(e)) => {
+            config.ghostsignals.enabled = false;
+            format!("GhostSignals registration failed: {e}. Left disabled; re-run `kannaka init` once the hub answers properly.")
         }
     }
 }
@@ -2507,17 +2636,22 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
 
     // --- Step 6: GhostSignals ---
     let already_registered = !config.ghostsignals.token.trim().is_empty();
-    let register_gs = if overrides.no_ghostsignals || already_registered {
-        if already_registered && !non_interactive {
-            eprintln!();
-            eprintln!(
-                "  GhostSignals: already registered as '{}' (token on file) — keeping it.",
-                config.agent.id
-            );
-        }
+    let register_gs = if overrides.no_ghostsignals || non_interactive {
         false
-    } else if non_interactive {
-        false
+    } else if already_registered {
+        // #304: re-registering while presenting the stored bearer ROTATES the
+        // token. That is now reachable, so it is offered — defaulted to no, so
+        // a plain re-run of `init` still keeps the token exactly as it is.
+        eprintln!();
+        eprintln!(
+            "  GhostSignals: already registered as '{}' (token on file).",
+            config.agent.id
+        );
+        eprint!("  Rotate the hub token? [y/N] > ");
+        stdout.flush().ok();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line).ok();
+        rotate_requested(&line)
     } else {
         eprintln!();
         eprintln!("  Register with GhostSignals prediction markets?");
@@ -2533,12 +2667,7 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
     if register_gs {
         // `enabled` is set inside apply_ghostsignals_registration, and only
         // once a token has actually arrived (ADR-0059 §1).
-        let result = register_ghostsignals(
-            &ghostsignals_hub(&config),
-            &config.agent.id,
-            &config.agent.display_name,
-            &config.agent.kind,
-        );
+        let result = register_ghostsignals_for(&config);
         let note = apply_ghostsignals_registration(&mut config, result);
         eprintln!("  {note}");
     }
@@ -2681,35 +2810,98 @@ pub fn ghostsignals_register_body(agent_id: &str, display_name: &str, kind: &str
 }
 
 /// Register agent with GhostSignals via HTTP POST.
-fn register_ghostsignals(hub_url: &str, agent_id: &str, display_name: &str, kind: &str) -> Result<String, String> {
-    let url = format!("{hub_url}/api/agents/register");
+///
+/// `bearer` is the token already on file, if any. The hub (kannaka-radio#304)
+/// answers 409 when the trader row holds a bearer and the request does not
+/// present it; presenting the current one ROTATES it and returns the new
+/// token. Sending nothing when we hold a token is therefore how a re-register
+/// turns into a needless conflict.
+pub fn register_ghostsignals(
+    hub_url: &str,
+    agent_id: &str,
+    display_name: &str,
+    kind: &str,
+    bearer: Option<&str>,
+) -> Result<GsRegistered, GsRegisterError> {
+    let url = format!("{}/api/agents/register", hub_url.trim_end_matches('/'));
     let body = ghostsignals_register_body(agent_id, display_name, kind);
 
-    let resp = ureq::AgentBuilder::new()
+    let mut req = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .post(&url)
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+        .set("Content-Type", "application/json");
+    if let Some(t) = bearer.map(str::trim).filter(|t| !t.is_empty()) {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
 
-    let json: serde_json::Value = resp.into_json()
-        .map_err(|e| format!("failed to parse response: {e}"))?;
+    let resp = match req.send_json(body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(409, _)) => return Err(GsRegisterError::IdTaken),
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            let preview: String = text.chars().take(200).collect();
+            return Err(GsRegisterError::Other(format!("HTTP {code}: {preview}")));
+        }
+        Err(e) => return Err(GsRegisterError::Transport(format!("HTTP request failed: {e}"))),
+    };
+
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| GsRegisterError::Other(format!("failed to parse response: {e}")))?;
 
     // #111: a 200 OK with a missing/empty `token` is NOT success. Returning
     // an empty token here let the installer persist `ghostsignals.enabled = true`
     // with a blank token and print "Registered", leaving a silently-broken
     // identity that only fails much later on the first authenticated call.
-    let token = json["token"].as_str().unwrap_or("").to_string();
-    if token.trim().is_empty() {
-        let body = serde_json::to_string(&json).unwrap_or_default();
-        let preview: String = body.chars().take(200).collect();
-        return Err(format!(
-            "registration response missing/empty 'token' field (body: {preview})"
-        ));
+    //
+    // #304 split that case in two. `{ok: true, trader: {...}}` with no `token`
+    // key at all is the hub's documented answer for a pre-existing row that
+    // holds no bearer — every row on the live hub today. It is a real answer
+    // about a real row, so it is reported as such rather than as a parse
+    // failure; anything else with no usable token is still an error.
+    match json.get("token") {
+        Some(t) => {
+            let token = t.as_str().unwrap_or("").to_string();
+            if token.trim().is_empty() {
+                return Err(GsRegisterError::Other(format!(
+                    "registration response carries an empty 'token' field (body: {})",
+                    json_preview(&json)
+                )));
+            }
+            Ok(GsRegistered::Token(token))
+        }
+        None if json["ok"].as_bool() == Some(true) && json["trader"].is_object() => {
+            Ok(GsRegistered::NoTokenExistingRow)
+        }
+        None => Err(GsRegisterError::Other(format!(
+            "registration response missing 'token' field (body: {})",
+            json_preview(&json)
+        ))),
     }
+}
 
-    Ok(token)
+/// First 200 characters of a JSON body, for an error line.
+fn json_preview(json: &serde_json::Value) -> String {
+    serde_json::to_string(json)
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// Run the register call the way every wizard should: present the token
+/// already on file as the bearer, so a re-run ROTATES it (kannaka-radio#304)
+/// instead of colliding with 409.
+fn register_ghostsignals_for(config: &KannakaConfig) -> Result<GsRegistered, GsRegisterError> {
+    let stored = config.ghostsignals.token.trim().to_string();
+    register_ghostsignals(
+        &ghostsignals_hub(config),
+        &config.agent.id,
+        &config.agent.display_name,
+        &config.agent.kind,
+        (!stored.is_empty()).then_some(stored.as_str()),
+    )
 }
 
 use std::io::Read as IoRead;
@@ -3356,18 +3548,14 @@ fn run_init_wizard_with_installer_ui(overrides: InitOverrides, a: &Ansi, total_s
     let register_gs = if config.ghostsignals.token.trim().is_empty() {
         prompt_yn(a, "Register with GhostSignals", true)
     } else {
-        print_success(a, &format!("Already registered as '{}' (token on file) — keeping it.", config.agent.id));
-        false
+        // #304: presenting the stored bearer rotates it. Offered, default no.
+        print_success(a, &format!("Already registered as '{}' (token on file).", config.agent.id));
+        prompt_yn(a, "Rotate the hub token", false)
     };
 
     if register_gs {
         // `enabled` is set only once a token has actually arrived (ADR-0059 §1).
-        let result = register_ghostsignals(
-            &ghostsignals_hub(&config),
-            &config.agent.id,
-            &config.agent.display_name,
-            &config.agent.kind,
-        );
+        let result = register_ghostsignals_for(&config);
         let note = apply_ghostsignals_registration(&mut config, result);
         if config.ghostsignals.enabled {
             print_success(a, &note);
@@ -4065,18 +4253,14 @@ pub fn run_upgrade_installer() {
     let register_gs = if config.ghostsignals.token.trim().is_empty() {
         prompt_yn(&a, "Register with GhostSignals", true)
     } else {
-        print_success(&a, &format!("Already registered as '{}' (token on file) — keeping it.", config.agent.id));
-        false
+        // #304: presenting the stored bearer rotates it. Offered, default no.
+        print_success(&a, &format!("Already registered as '{}' (token on file).", config.agent.id));
+        prompt_yn(&a, "Rotate the hub token", false)
     };
 
     if register_gs {
         // `enabled` is set only once a token has actually arrived (ADR-0059 §1).
-        let result = register_ghostsignals(
-            &ghostsignals_hub(&config),
-            &config.agent.id,
-            &config.agent.display_name,
-            &config.agent.kind,
-        );
+        let result = register_ghostsignals_for(&config);
         let note = apply_ghostsignals_registration(&mut config, result);
         if config.ghostsignals.enabled {
             print_success(&a, &note);
@@ -4868,14 +5052,17 @@ mod config_field_tests {
         let mut cfg = KannakaConfig::default();
         cfg.agent.id = "node-a".to_string();
 
-        let note = apply_ghostsignals_registration(&mut cfg, Err("HTTP request failed: 503".into()));
+        let note = apply_ghostsignals_registration(
+            &mut cfg,
+            Err(GsRegisterError::Transport("HTTP request failed: 503".into())),
+        );
         assert!(!cfg.ghostsignals.enabled, "a failed registration must not enable ghostsignals");
         assert!(cfg.ghostsignals.token.is_empty());
         assert!(note.contains("failed"), "{note}");
         assert!(note.contains("503"), "the line must be factual: {note}");
         assert!(!note.contains("ghostsignals register"), "no phantom command hint: {note}");
 
-        let note = apply_ghostsignals_registration(&mut cfg, Ok("   ".into()));
+        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::Token("   ".into())));
         assert!(!cfg.ghostsignals.enabled, "an empty token is not a registration");
         assert!(!note.contains("ghostsignals register"), "{note}");
 
@@ -4883,13 +5070,321 @@ mod config_field_tests {
         // re-run over such a config, whose registration fails again, must
         // leave it disabled rather than keep the lie.
         cfg.ghostsignals.enabled = true;
-        apply_ghostsignals_registration(&mut cfg, Err("timeout".into()));
+        apply_ghostsignals_registration(&mut cfg, Err(GsRegisterError::Transport("timeout".into())));
         assert!(!cfg.ghostsignals.enabled);
 
-        let note = apply_ghostsignals_registration(&mut cfg, Ok("tok-123".into()));
+        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::Token("tok-123".into())));
         assert!(cfg.ghostsignals.enabled);
         assert_eq!(cfg.ghostsignals.token, "tok-123");
         assert!(note.contains("node-a"), "{note}");
+        assert!(note.contains("Registered"), "a first registration is not a rotation: {note}");
+    }
+
+    /// #933's hardening applied to the new prompt: rotating is destructive to
+    /// a live credential, so only an explicit yes does it. Enter and EOF (an
+    /// empty line, which is what a pipe or a cron entry produces) KEEP the
+    /// token on file.
+    #[test]
+    fn rotation_is_opt_in_and_eof_is_not_consent() {
+        assert!(rotate_requested("y"));
+        assert!(rotate_requested("Y"));
+        assert!(rotate_requested("yes\n"));
+        assert!(rotate_requested("  YES  "));
+        // Enter, and the empty line `read_line` leaves behind at end-of-file.
+        assert!(!rotate_requested(""), "Enter must keep the token");
+        assert!(!rotate_requested("\n"), "Enter must keep the token");
+        // Anything else is not a yes either.
+        for answer in ["n", "no", "rotate", "sure", "1", "q"] {
+            assert!(!rotate_requested(answer), "{answer:?} is not an explicit yes");
+        }
+    }
+
+    // ── kannaka-radio#304: the client presents the stored bearer ─────────
+
+    /// A config that already holds a hub token, the way every registered node
+    /// on the fleet has it.
+    fn cfg_with_token(id: &str, token: &str) -> KannakaConfig {
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = id.to_string();
+        cfg.ghostsignals.token = token.to_string();
+        cfg.ghostsignals.enabled = true;
+        cfg
+    }
+
+    /// THE invariant: no arm of the classifier may write an empty token over
+    /// a stored one. Every outcome is applied to a config that holds a token,
+    /// and the token is checked after each. Mutating
+    /// `apply_ghostsignals_registration` to clear the token on any path fails
+    /// here.
+    #[test]
+    fn no_outcome_ever_clears_a_stored_token() {
+        const TOKEN: &str = "gs1.bm9kZS1h.c3RvcmVk";
+        let outcomes: Vec<Result<GsRegistered, GsRegisterError>> = vec![
+            Ok(GsRegistered::NoTokenExistingRow),
+            Ok(GsRegistered::Token(String::new())),
+            Ok(GsRegistered::Token("   ".into())),
+            Err(GsRegisterError::IdTaken),
+            Err(GsRegisterError::Transport("connection refused".into())),
+            Err(GsRegisterError::Other("HTTP 500: boom".into())),
+        ];
+        for outcome in outcomes {
+            let mut cfg = cfg_with_token("node-a", TOKEN);
+            let note = apply_ghostsignals_registration(&mut cfg, outcome.clone());
+            assert_eq!(
+                cfg.ghostsignals.token, TOKEN,
+                "outcome {outcome:?} overwrote the stored token; note was: {note}"
+            );
+        }
+    }
+
+    /// 200 with a different token while one is on file is a rotation: the new
+    /// token replaces the old and the line says so.
+    #[test]
+    fn a_different_token_on_a_registered_node_is_a_rotation() {
+        let mut cfg = cfg_with_token("node-a", "gs1.bm9kZS1h.b2xk");
+
+        let note = apply_ghostsignals_registration(
+            &mut cfg,
+            Ok(GsRegistered::Token("gs1.bm9kZS1h.bmV3".into())),
+        );
+        assert!(cfg.ghostsignals.enabled);
+        assert_eq!(cfg.ghostsignals.token, "gs1.bm9kZS1h.bmV3", "the rotated token replaces the old");
+        assert!(note.contains("Rotated"), "{note}");
+        assert!(note.contains("node-a"), "{note}");
+
+        // The same token back is not a rotation, and says nothing about one.
+        let note = apply_ghostsignals_registration(
+            &mut cfg,
+            Ok(GsRegistered::Token("gs1.bm9kZS1h.bmV3".into())),
+        );
+        assert_eq!(cfg.ghostsignals.token, "gs1.bm9kZS1h.bmV3");
+        assert!(!note.contains("Rotated"), "{note}");
+    }
+
+    /// 409 has two readings and the remedy differs. With a token on file the
+    /// stored one is stale; with none, the id belongs to someone else.
+    #[test]
+    fn a_409_says_stale_or_taken_and_never_destroys_the_token() {
+        let mut cfg = cfg_with_token("node-a", "gs1.bm9kZS1h.c3RhbGU");
+        let note = apply_ghostsignals_registration(&mut cfg, Err(GsRegisterError::IdTaken));
+        assert!(!cfg.ghostsignals.enabled, "a refused registration is not an identity");
+        assert_eq!(cfg.ghostsignals.token, "gs1.bm9kZS1h.c3RhbGU", "a refused token is not destroyed");
+        assert!(note.contains("stale"), "{note}");
+        assert!(note.contains("409"), "{note}");
+        assert!(note.contains("bearer/reset"), "the real remedy, not a retry: {note}");
+
+        let mut fresh = KannakaConfig::default();
+        fresh.agent.id = "node-a".to_string();
+        let note = apply_ghostsignals_registration(&mut fresh, Err(GsRegisterError::IdTaken));
+        assert!(!fresh.ghostsignals.enabled);
+        assert!(fresh.ghostsignals.token.is_empty());
+        assert!(note.contains("already registered"), "{note}");
+        assert!(note.contains("--agent-id"), "{note}");
+    }
+
+    /// The live case for all 44 rows on the hub today: a 200 naming the row,
+    /// with no token. It is not a failure, and on a node that already holds a
+    /// token it must change NOTHING — not the token, not `enabled`.
+    #[test]
+    fn a_token_less_200_on_a_legacy_row_changes_nothing() {
+        let mut cfg = cfg_with_token("kannaka-01", "gs1.a2FubmFrYS0wMQ.b24tZmlsZQ");
+        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::NoTokenExistingRow));
+        assert!(cfg.ghostsignals.enabled, "a working node is not disabled by a token-less 200");
+        assert_eq!(cfg.ghostsignals.token, "gs1.a2FubmFrYS0wMQ.b24tZmlsZQ");
+        assert!(!note.contains("failed"), "this is not a failure: {note}");
+        assert!(note.contains("unchanged"), "{note}");
+    }
+
+    /// #930's retry hint was a dead end here: an existing row that holds no
+    /// bearer can never mint a token through `init`, however many times it is
+    /// run. The line must name the remedy that exists.
+    #[test]
+    fn a_token_less_200_with_nothing_on_file_prints_the_real_remedy() {
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = "kannaka-witness-01".to_string();
+
+        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::NoTokenExistingRow));
+        assert!(!cfg.ghostsignals.enabled, "no token means no identity");
+        assert!(note.contains("oracle"), "the remedy is the hub oracle: {note}");
+        assert!(note.contains("--agent-id"), "or a different id: {note}");
+        assert!(
+            note.contains("returns the same answer"),
+            "it must say a retry is pointless, not suggest one: {note}"
+        );
+    }
+
+    // ── the register call on the wire, against a stub hub ───────────────
+
+    /// A one-shot HTTP stub: answers the first request with `status`/`body`
+    /// and hands the raw request text back through the channel, so a test can
+    /// assert on the headers the client actually sent.
+    fn stub_hub(status: u16, body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(hdr_end) = text.find("\r\n\r\n") {
+                    let want: usize = text[..hdr_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= hdr_end + 4 + want {
+                        break;
+                    }
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                409 => "Conflict",
+                _ => "Status",
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+            let _ = tx.send(String::from_utf8_lossy(&raw).to_string());
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case(name) { Some(v.trim()) } else { None }
+        })
+    }
+
+    /// #304: the token on file rides on `Authorization: Bearer`, and the token
+    /// the hub answers with is the rotated one.
+    #[test]
+    fn register_presents_the_stored_bearer_and_takes_the_rotated_token() {
+        let (base, rx) = stub_hub(
+            200,
+            r#"{"ok":true,"trader":{"id":"node-a","returning":true},"token":"gs1.bm9kZS1h.bmV3"}"#,
+        );
+        let got = register_ghostsignals(&base, "node-a", "Node A", "agent", Some("gs1.bm9kZS1h.b2xk")).unwrap();
+        assert_eq!(got, GsRegistered::Token("gs1.bm9kZS1h.bmV3".to_string()));
+
+        let req = rx.recv().unwrap();
+        assert!(req.starts_with("POST /api/agents/register "), "{req}");
+        assert_eq!(header_value(&req, "authorization"), Some("Bearer gs1.bm9kZS1h.b2xk"));
+        let body_start = req.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&req[body_start..]).unwrap();
+        assert_eq!(body["agent_id"], "node-a");
+        assert_eq!(body["id"], "node-a");
+    }
+
+    /// With nothing on file there is no bearer to present — and an empty
+    /// `Authorization: Bearer` header would be a malformed token, not none.
+    #[test]
+    fn register_without_a_stored_token_sends_no_bearer() {
+        let (base, rx) = stub_hub(200, r#"{"ok":true,"trader":{"id":"node-b"},"token":"gs1.x.y"}"#);
+        let got = register_ghostsignals(&base, "node-b", "Node B", "agent", None).unwrap();
+        assert_eq!(got, GsRegistered::Token("gs1.x.y".to_string()));
+        let req = rx.recv().unwrap();
+        assert!(header_value(&req, "authorization").is_none(), "no bearer to present: {req}");
+
+        let (base, rx) = stub_hub(200, r#"{"ok":true,"trader":{"id":"node-b"},"token":"gs1.x.y"}"#);
+        register_ghostsignals(&base, "node-b", "Node B", "agent", Some("   ")).unwrap();
+        let req = rx.recv().unwrap();
+        assert!(header_value(&req, "authorization").is_none(), "blank is not a bearer: {req}");
+    }
+
+    /// 409 is its own outcome, not a generic HTTP error.
+    #[test]
+    fn register_409_is_id_taken() {
+        let (base, rx) = stub_hub(
+            409,
+            r#"{"ok":false,"error":"trader 'node-a' already has a bearer token; present it"}"#,
+        );
+        let err = register_ghostsignals(&base, "node-a", "Node A", "agent", None).unwrap_err();
+        assert_eq!(err, GsRegisterError::IdTaken);
+        let _ = rx.recv().unwrap();
+    }
+
+    /// The hub's answer for a pre-existing row that holds no bearer: 200,
+    /// `ok: true`, the row, and no `token` key. Not a parse failure.
+    #[test]
+    fn register_200_without_a_token_key_is_the_legacy_row_outcome() {
+        let (base, rx) = stub_hub(
+            200,
+            r#"{"ok":true,"trader":{"id":"kannaka-01","capital":100,"returning":true}}"#,
+        );
+        let got = register_ghostsignals(&base, "kannaka-01", "Kannaka", "agent", Some("gs1.a.b")).unwrap();
+        assert_eq!(got, GsRegistered::NoTokenExistingRow);
+        let _ = rx.recv().unwrap();
+    }
+
+    /// #111 still holds: a `token` key that is present but blank is refused.
+    #[test]
+    fn register_200_with_a_blank_token_is_still_an_error() {
+        let (base, rx) = stub_hub(200, r#"{"ok":true,"trader":{"id":"node-a"},"token":"  "}"#);
+        let err = register_ghostsignals(&base, "node-a", "Node A", "agent", None).unwrap_err();
+        match err {
+            GsRegisterError::Other(e) => assert!(e.contains("empty 'token'"), "{e}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+        let _ = rx.recv().unwrap();
+    }
+
+    #[test]
+    fn register_other_status_is_reported_with_the_body() {
+        let (base, rx) = stub_hub(500, r#"{"ok":false,"error":"boom"}"#);
+        let err = register_ghostsignals(&base, "node-a", "Node A", "agent", None).unwrap_err();
+        match err {
+            GsRegisterError::Other(e) => {
+                assert!(e.contains("500"), "{e}");
+                assert!(e.contains("boom"), "{e}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+        let _ = rx.recv().unwrap();
+    }
+
+    /// Nothing listening: a transport failure, which is the one outcome whose
+    /// remedy really is "try again".
+    #[test]
+    fn register_transport_failure_is_its_own_outcome() {
+        // Bind and drop, so the port is (almost certainly) closed.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = register_ghostsignals(
+            &format!("http://127.0.0.1:{port}"),
+            "node-a",
+            "Node A",
+            "agent",
+            Some("gs1.a.b"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, GsRegisterError::Transport(_)), "{err:?}");
+
+        let mut cfg = cfg_with_token("node-a", "gs1.a.b");
+        let note = apply_ghostsignals_registration(&mut cfg, Err(err));
+        assert_eq!(cfg.ghostsignals.token, "gs1.a.b", "an unreachable hub does not cost a token");
+        assert!(note.contains("re-run `kannaka init` to try again"), "{note}");
     }
 
     /// The hub reads `id` today (kannaka-radio#303 aligns it to `agent_id`);
