@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.3] — 2026-09-11
+
 ### Fixed — `kannaka init` merges, saves atomically, and tells the truth (#930, #928)
 
 `kannaka init` now MERGES into an existing `config.toml` instead of starting from
