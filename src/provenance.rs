@@ -641,9 +641,16 @@ fn fill_os_random(buf: &mut [u8]) {
 /// the new one, whole. On non-Unix the mode is ignored (Windows secret ACLs
 /// are applied separately, e.g. via `restrict_key_permissions`).
 pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    crate::fs_util::atomic_write_bytes_mode(path, bytes, Some(0o600))
+    crate::fs_util::atomic_write_bytes_mode(path, bytes, Some(OWNER_ONLY_MODE))
         .map_err(std::io::Error::other)
 }
+
+/// The unix mode every secret this module writes is created with. Named so
+/// the test can assert both halves of the claim (#933): that `write_owner_only`
+/// requests owner-only, AND that requesting it yields an owner-only file from
+/// creation. Asserting only against the constant would be a check that moves
+/// whenever the thing it checks moves.
+pub(crate) const OWNER_ONLY_MODE: u32 = 0o600;
 
 /// Restrict a key file to the current user. Unix: `chmod 0600`. Windows:
 /// best-effort ACL via `icacls`.
@@ -779,6 +786,19 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret must be created owner-only, got {mode:o}");
         assert_eq!(std::fs::read(&path).unwrap(), b"top secret seed");
+
+        // #933: the assertions above are satisfied by a create-then-chmod
+        // implementation too, so they do not prove "created owner-only" —
+        // only "owner-only afterwards". The two halves of the real claim:
+        // the mode this function requests IS owner-only, and staging with it
+        // produces a file that is owner-only before it has the target's name.
+        assert_eq!(OWNER_ONLY_MODE, 0o600, "write_owner_only must request owner-only");
+        let staged =
+            crate::fs_util::write_temp_sibling(&path, b"top secret seed", Some(OWNER_ONLY_MODE))
+                .unwrap();
+        let smode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(smode, 0o600, "temp file before the rename, got {smode:o}");
+        std::fs::remove_file(&staged).unwrap();
     }
 
     // (a) sign -> verify round-trip returns the signer pubkey.
