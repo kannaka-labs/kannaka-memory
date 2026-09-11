@@ -927,6 +927,17 @@ pub fn apply_swarm_membership(config: &mut KannakaConfig, m: SwarmMembership) ->
 /// The hub to register with: the explicit GhostSignals hub URL, falling
 /// back to the radio URL only when `hub_url` is empty (legacy single-host
 /// configs, #97).
+/// Does this LLM-menu digit mean "clear the `[llm]` table"?
+///
+/// #933: the catch-all arm used to clear on ANY unmatched digit, so a typo at
+/// the menu wiped a configured provider's model, base URL and API key. Only an
+/// explicit 5 is "None (memory-only)"; an out-of-range digit on a node that has
+/// a provider is a typo and keeps what is there. A config with nothing to keep
+/// has nothing to lose, so it still becomes memory-only.
+pub(crate) fn llm_choice_clears(choice: u32, configured: bool) -> bool {
+    choice == 5 || !configured
+}
+
 fn ghostsignals_hub(config: &KannakaConfig) -> String {
     if config.ghostsignals.hub_url.is_empty() {
         config.constellation.radio_url.clone()
@@ -2197,6 +2208,9 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
         line.trim().parse::<u32>().unwrap_or(if keep_llm { 0 } else { 5 })
     };
 
+    // Captured before the match: arms 1-4 overwrite `provider`.
+    let llm_was_configured = !config.llm.provider.is_empty() && config.llm.provider != "none";
+
     match llm_choice {
         1 => {
             config.llm.provider = "anthropic".into();
@@ -2332,12 +2346,14 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
         _ => {
             // #933: memory-only means memory-only. Setting `provider` alone
             // left a self-contradictory table (provider = "none" beside a
-            // live model and api_key); this is now an explicit choice, never
-            // the Enter default, so clearing the rest is what was asked for.
-            config.llm.provider = "none".into();
-            config.llm.model.clear();
-            config.llm.base_url.clear();
-            config.llm.api_key.clear();
+            // live model and api_key), so an explicit 5 clears the rest too.
+            // A typo keeps: see `llm_choice_clears`.
+            if llm_choice_clears(llm_choice, llm_was_configured) {
+                config.llm.provider = "none".into();
+                config.llm.model.clear();
+                config.llm.base_url.clear();
+                config.llm.api_key.clear();
+            }
         }
     }
 
@@ -3924,10 +3940,12 @@ pub fn run_upgrade_installer() {
             config.llm.model = prompt_line(&a, "Model name", "");
         }
         _ => {
-            config.llm.provider = "none".into();
-            config.llm.model.clear();
-            config.llm.base_url.clear();
-            config.llm.api_key.clear();
+            if llm_choice_clears(llm_choice, keep_llm) {
+                config.llm.provider = "none".into();
+                config.llm.model.clear();
+                config.llm.base_url.clear();
+                config.llm.api_key.clear();
+            }
         }
     }
 
@@ -4389,6 +4407,20 @@ pub fn offer_tui_launch() {
 
 #[cfg(test)]
 mod config_field_tests {
+    use super::*;
+
+    #[test]
+    fn a_typo_at_the_llm_menu_keeps_a_configured_provider() {
+        // 5 is the only digit that means "None (memory-only)".
+        assert!(llm_choice_clears(5, true), "explicit 5 clears a configured table");
+        assert!(llm_choice_clears(5, false), "explicit 5 on a fresh config");
+        // #933: the catch-all used to clear here, wiping model/base_url/api_key.
+        assert!(!llm_choice_clears(6, true), "a typo must KEEP a configured provider");
+        assert!(!llm_choice_clears(99, true), "any out-of-range digit keeps");
+        // Nothing configured means nothing to lose; memory-only either way.
+        assert!(llm_choice_clears(6, false), "a fresh config still becomes memory-only");
+    }
+
     use super::*;
 
     // #112: swarm.role used to be a dead field — defined with a default but
