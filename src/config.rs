@@ -626,11 +626,33 @@ impl KannakaConfig {
             .filter(|s| !s.is_empty())
     }
 
-    /// Save config to `~/.kannaka/config.toml`.
+    /// Save config to `~/.kannaka/config.toml` with the plain header.
     ///
     /// Creates the data directory if it does not exist.
     /// On Unix, sets file permissions to 0600 (owner-only) for API key safety.
+    ///
+    /// #933: this does NOT re-derive whether the node is an anonymous swarm
+    /// member. `save()` has around twenty callers — `kannaka config set`,
+    /// the gate, identity, services handlers — and each would otherwise
+    /// answer "are we anonymous?" from the credentials visible to THAT
+    /// process at THAT moment. `swarm_credentials_present()` sees only
+    /// NATS_USER/NATS_PASSWORD in the environment or `~/.kannaka-nats.env`,
+    /// so on a node whose credentials arrive from elsewhere (the witness and
+    /// hive-bridge units use `EnvironmentFile=/etc/kannaka-*.env`) a
+    /// hand-run `config set` stamped a false "ANONYMOUS membership" block
+    /// onto a fully credentialed config, which the next save from the
+    /// service silently removed again. Membership is decided once, by the
+    /// init paths, and only they may state it: see [`Self::save_with_header`].
     pub fn save(&self) -> Result<(), String> {
+        self.save_with_header(false)
+    }
+
+    /// `save()` for the init paths (wizard, first-run installer, upgrade
+    /// installer). They are the callers that have just run
+    /// [`decide_swarm_membership`], so they — and only they — can truthfully
+    /// say in the header whether this node joined without credentials
+    /// (ADR-0059 §1).
+    pub fn save_with_header(&self, anonymous_swarm: bool) -> Result<(), String> {
         let dir = Self::data_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("failed to create {}: {}", dir.display(), e))?;
@@ -639,8 +661,7 @@ impl KannakaConfig {
         let text = toml::to_string_pretty(self)
             .map_err(|e| format!("failed to serialize config: {e}"))?;
 
-        let anonymous = self.swarm.enabled && !Self::swarm_credentials_present();
-        let full = format!("{}{text}", config_file_header(anonymous));
+        let full = format!("{}{text}", config_file_header(anonymous_swarm));
 
         // Owner-only (0600) from creation AND temp-and-rename in the same
         // directory (#930): the file is never truncated in place, so a crash
@@ -767,7 +788,11 @@ impl KannakaConfig {
     /// so older code that reads that file still works.
     pub fn persist_agent_id_compat(&self) -> Result<(), String> {
         let path = Self::data_dir().join("agent_id");
-        std::fs::write(&path, &self.agent.id)
+        // #933 (P6): small file, small truncation window — but this is the
+        // file `init_base_config` falls back to when config.toml is absent,
+        // i.e. the last line of defence for the node's identity. A truncated
+        // one mints a fresh random id (#595).
+        crate::fs_util::atomic_write_bytes(&path, self.agent.id.as_bytes())
             .map_err(|e| format!("failed to write agent_id: {e}"))
     }
 
@@ -2514,7 +2539,7 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
         config.hrm.path = data_dir.join("kannaka.hrm").to_string_lossy().to_string();
     }
 
-    config.save()?;
+    config.save_with_header(membership == SwarmMembership::Anonymous)?;
     config.persist_agent_id_compat()?;
 
     if !non_interactive {
@@ -3335,7 +3360,7 @@ fn run_init_wizard_with_installer_ui(overrides: InitOverrides, a: &Ansi, total_s
     }
 
     // --- Save config ---
-    config.save()?;
+    config.save_with_header(membership == SwarmMembership::Anonymous)?;
     config.persist_agent_id_compat()?;
 
     // API key warning on Windows
@@ -4047,7 +4072,7 @@ pub fn run_upgrade_installer() {
         config.hrm.path = data_dir.join("kannaka.hrm").to_string_lossy().to_string();
     }
 
-    match config.save() {
+    match config.save_with_header(membership == SwarmMembership::Anonymous) {
         Ok(()) => {
             print_success(&a, &format!("Config saved to {}", KannakaConfig::config_path().display()));
         }
