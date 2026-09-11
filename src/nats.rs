@@ -471,6 +471,44 @@ fn should_attempt_stream_create(authenticated: bool) -> bool {
     authenticated
 }
 
+/// True for a `Permissions Violation` that names the JetStream stream-create
+/// subject — the broker telling us, in its own words, that this connection may
+/// not create streams.
+fn names_denied_stream_create(msg: &str) -> bool {
+    is_permissions_error(msg) && msg.contains("$JS.API.STREAM.CREATE")
+}
+
+/// Whether to attempt `$JS.API.STREAM.CREATE` for the PRESENCE stream (#933).
+///
+/// `should_attempt_stream_create` gates on "we supplied credentials", which is
+/// not the same question as "the broker demands them". Against an OPEN broker
+/// — `nats-server -js` on a developer's laptop, a throwaway CI bus, the first
+/// boot of a new swarm — an unauthenticated client is allowed to create the
+/// stream, and refusing to try means `KANNAKA_PRESENCE` is never created at
+/// all and `swarm peers` stays empty forever.
+///
+/// So the gate is "is the create known to be denied?", not "are we anonymous?":
+///
+///   - authenticated: attempt it, as before, unless this connection has
+///     already been refused once;
+///   - anonymous and the stream is ALREADY THERE (the production swarm, where
+///     anon is denied the control lane by ADR-0042): nothing to create, and
+///     issuing it would only buy a broker-side "Permissions Violation" per
+///     join — the ~113-a-minute noise #928 removed;
+///   - anonymous and the stream is ABSENT: try. On an open broker this is the
+///     bootstrap; on a closed one it costs a single denial, which is then
+///     remembered for the life of the connection.
+fn should_attempt_presence_create(
+    authenticated: bool,
+    create_denied_here: bool,
+    stream_absent: bool,
+) -> bool {
+    if create_denied_here {
+        return false;
+    }
+    authenticated || stream_absent
+}
+
 /// JetStream API error code for "stream not found".
 const JS_ERR_STREAM_NOT_FOUND: u64 = 10059;
 
@@ -797,6 +835,14 @@ struct Conn {
     /// committed server config has drifted from deployed reality in both
     /// directions, so the broker's own answer is the only reliable source.
     authenticated: bool,
+    /// Has THIS broker refused `$JS.API.STREAM.CREATE` on THIS connection?
+    ///
+    /// The broker's own answer, which is the only reliable one (#933). Set
+    /// when a `Permissions Violation` naming the create subject arrives, and
+    /// gone when the connection is replaced by `reconnect()`. Used to stop
+    /// re-issuing a create that is known to be denied, rather than to guess
+    /// from "we supplied no credentials" that it would be.
+    stream_create_denied: bool,
 }
 
 impl Conn {
@@ -1000,6 +1046,7 @@ fn handshake(url: &str, explicit: Option<&(String, String)>) -> Result<Conn, Nat
                     reader,
                     dead: false,
                     authenticated: creds.is_some(),
+                    stream_create_denied: false,
                 })
             }
             ReadOutcome::Frame(Frame::Ping) => {
@@ -1582,6 +1629,15 @@ impl SwarmTransport {
                 }
                 Ok(ReadOutcome::Frame(Frame::ServerErr(m))) => {
                     eprintln!("[nats] server error: {m}");
+                    // #933: a denied JetStream request is answered with an
+                    // async -ERR and no reply, so the call below simply times
+                    // out. Record the refusal while we can still see it —
+                    // "the broker said no to STREAM.CREATE on this
+                    // connection" is the fact worth remembering, and it is
+                    // the only honest basis for not trying again.
+                    if names_denied_stream_create(&m) {
+                        conn.stream_create_denied = true;
+                    }
                     if is_auth_error(&m) {
                         fatal = true;
                         break Err(NatsError::Disconnected(m));
@@ -2083,14 +2139,27 @@ impl SwarmTransport {
 
     /// Ensure the KANNAKA_PRESENCE stream exists. ADR-0026 Phase 5.
     ///
-    /// #928: an anonymous connection is structurally denied STREAM.CREATE
-    /// (ADR-0042 closed anon's control lane), so the same policy as
-    /// `should_attempt_stream_create` applies here — issuing it only bought
-    /// a broker-side "Permissions Violation" per join. The `Err` says the
-    /// create was not available to this identity; whether the stream is
-    /// nevertheless THERE is `presence_stream_exists`'s question.
+    /// #928: on the production broker an anonymous connection is denied
+    /// STREAM.CREATE (ADR-0042 closed anon's control lane), and issuing it
+    /// only bought a broker-side "Permissions Violation" per join. The `Err`
+    /// says the create was not available to this identity; whether the stream
+    /// is nevertheless THERE is `presence_stream_exists`'s question.
+    ///
+    /// #933: but "anonymous" is not the same as "denied". Against an open
+    /// broker an anonymous client MAY create the stream, and skipping the
+    /// attempt left a fresh bus with no `KANNAKA_PRESENCE` at all. So an
+    /// anonymous connection probes first and attempts the create only when
+    /// the stream is genuinely absent — and stops for good once this
+    /// connection has actually been refused. See
+    /// [`should_attempt_presence_create`].
     pub fn ensure_presence_stream(&self) -> Result<(), NatsError> {
-        if !should_attempt_stream_create(self.is_authenticated()) {
+        let authenticated = self.is_authenticated();
+        let denied_here = self.stream_create_denied();
+        // The probe is skipped entirely for the cases that do not need it:
+        // an authenticated identity attempts the create regardless, and a
+        // connection already refused never attempts it again.
+        let stream_absent = !authenticated && !denied_here && !self.presence_stream_exists();
+        if !should_attempt_presence_create(authenticated, denied_here, stream_absent) {
             return Err(NatsError::Protocol(
                 "stream create is not available to an anonymous connection".to_string(),
             ));
@@ -2124,6 +2193,13 @@ impl SwarmTransport {
     /// the one case that stays `false`.
     pub fn presence_stream_exists(&self) -> bool {
         self.stream_exists("KANNAKA_PRESENCE")
+    }
+
+    /// Has the broker refused `$JS.API.STREAM.CREATE` on this connection?
+    /// Unknown (an unlockable connection) counts as "not refused" — the
+    /// safe direction is to let the attempt happen and learn the answer.
+    fn stream_create_denied(&self) -> bool {
+        self.lock_conn().map(|c| c.stream_create_denied).unwrap_or(false)
     }
 
     fn stream_exists(&self, stream_name: &str) -> bool {
@@ -3614,6 +3690,46 @@ mod tests {
         let creds = presence_stream_notice("permissions", true, true);
         assert!(creds.contains("listed by other hosts"), "{creds}");
         assert!(!creds.contains("unverified"), "a credentialed read-only identity is not anonymous: {creds}");
+    }
+
+    /// #933: the presence create is gated on "the broker is known to refuse
+    /// it", not on "we have no credentials". The production swarm keeps its
+    /// silence (anon + stream already there = no attempt), and an open broker
+    /// can still be bootstrapped by an unauthenticated client.
+    #[test]
+    fn presence_create_is_attempted_until_the_broker_refuses_it() {
+        // Production: anonymous, KANNAKA_PRESENCE already exists. No attempt,
+        // so no Permissions Violation on the broker — what #928 bought.
+        assert!(
+            !should_attempt_presence_create(false, false, false),
+            "an anon node on a running swarm must not re-issue the doomed create"
+        );
+        // Open broker / fresh swarm: anonymous and the stream is absent.
+        assert!(
+            should_attempt_presence_create(false, false, true),
+            "an absent stream on an open bus must still be bootstrapped"
+        );
+        // Once refused on this connection, never again — whoever we are.
+        assert!(!should_attempt_presence_create(false, true, true));
+        assert!(!should_attempt_presence_create(true, true, false));
+        // Authenticated identities are unchanged: always attempt.
+        assert!(should_attempt_presence_create(true, false, false));
+        assert!(should_attempt_presence_create(true, false, true));
+    }
+
+    /// Only a refusal that names the create subject counts. A denial of some
+    /// other subject leaves the create path alone, and a non-permissions
+    /// error is not a refusal at all.
+    #[test]
+    fn only_a_stream_create_denial_closes_the_create_path() {
+        assert!(names_denied_stream_create(
+            "Permissions Violation for Publish to \"$JS.API.STREAM.CREATE.KANNAKA_PRESENCE\""
+        ));
+        assert!(!names_denied_stream_create(
+            "Permissions Violation for Subscription to \"KANNAKA.ask.*\""
+        ));
+        assert!(!names_denied_stream_create("Authorization Violation"));
+        assert!(!names_denied_stream_create("Unknown Protocol Operation"));
     }
 
     /// #928: how a JetStream reply is read as evidence about the stream. The
