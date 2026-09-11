@@ -2065,7 +2065,7 @@ pub fn validate_handle(handle: &str) -> Result<(), String> {
 /// If `non_interactive` is true, uses defaults and CLI-supplied overrides
 /// without prompting.
 pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String> {
-    use std::io::{self, Write as IoWrite, BufRead};
+    use std::io::{self, Write as IoWrite, BufRead, IsTerminal};
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2076,16 +2076,31 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
     // not ask about come from the file; only what is asked about changes.
     let mut config = KannakaConfig::init_base_config()?;
     if KannakaConfig::exists() && !non_interactive {
+        // #933: the interactive wizard MUTATES — it rewrites the tables it
+        // asks about and can seed the live HRM — so it must never run off a
+        // pipe, a cron entry, a Makefile line or a provisioning script that
+        // happens to reach `kannaka init`. End-of-file on stdin is not
+        // consent: `read_line` returns Ok(0) and leaves the answer empty,
+        // which is exactly what a scripted caller looks like.
+        if !io::stdin().is_terminal() {
+            return Err(
+                "init needs a terminal to prompt; pass --non-interactive to re-run against \
+                 the existing config without prompting"
+                    .into(),
+            );
+        }
         eprintln!("  Config already exists at {}.", KannakaConfig::config_path().display());
         eprint!(
-            "  Update it? Agent id '{}' and every setting not asked about are kept. [Y/n] > ",
+            "  Update it? Agent id '{}' and every setting not asked about are kept. [y/N] > ",
             config.agent.id
         );
         stdout.flush().ok();
         let mut line = String::new();
         stdin.lock().read_line(&mut line).ok();
         let answer = line.trim().to_lowercase();
-        if !(answer.is_empty() || answer == "y" || answer == "yes") {
+        // Empty input ABORTS (#933). Saying yes is what rewrites [llm] and
+        // [swarm] and what can write into the store, so the gate is opt-in.
+        if answer != "y" && answer != "yes" {
             return Err("aborted".into());
         }
     }
@@ -2134,6 +2149,11 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
         // config has it. A re-run must not reset a configured provider.
         0
     } else {
+        // #933: on a node that already has a provider, Enter must KEEP it.
+        // The old default (5 = None) turned the LLM off on every re-run and
+        // left a stale model/api_key behind. Only a FRESH config, which has
+        // no provider to keep, still defaults to None.
+        let keep_llm = !config.llm.provider.is_empty() && config.llm.provider != "none";
         eprintln!();
         eprintln!("  LLM Provider:");
         eprintln!("    1) Anthropic (Claude)");
@@ -2141,11 +2161,15 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
         eprintln!("    3) Ollama (local models)");
         eprintln!("    4) Custom API endpoint");
         eprintln!("    5) None (memory-only mode)");
-        eprint!("  [default: 5] > ");
+        if keep_llm {
+            eprint!("  [default: keep {}] > ", config.llm.provider);
+        } else {
+            eprint!("  [default: 5] > ");
+        }
         stdout.flush().ok();
         let mut line = String::new();
         stdin.lock().read_line(&mut line).ok();
-        line.trim().parse::<u32>().unwrap_or(5)
+        line.trim().parse::<u32>().unwrap_or(if keep_llm { 0 } else { 5 })
     };
 
     match llm_choice {
@@ -2155,11 +2179,20 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
             config.llm.api_key = if let Some(ref k) = overrides.llm_api_key {
                 k.clone()
             } else if !non_interactive {
-                eprint!("  Anthropic API key: ");
+                // #933: Enter keeps the key already on file rather than
+                // wiping it. Re-choosing the same provider is not a request
+                // to forget the credential.
+                let existing = config.llm.api_key.clone();
+                if existing.is_empty() {
+                    eprint!("  Anthropic API key: ");
+                } else {
+                    eprint!("  Anthropic API key [Enter to keep the existing key]: ");
+                }
                 stdout.flush().ok();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line).ok();
-                line.trim().to_string()
+                let v = line.trim().to_string();
+                if v.is_empty() { existing } else { v }
             } else {
                 String::new()
             };
@@ -2170,11 +2203,17 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
             config.llm.api_key = if let Some(ref k) = overrides.llm_api_key {
                 k.clone()
             } else if !non_interactive {
-                eprint!("  OpenAI API key: ");
+                let existing = config.llm.api_key.clone();
+                if existing.is_empty() {
+                    eprint!("  OpenAI API key: ");
+                } else {
+                    eprint!("  OpenAI API key [Enter to keep the existing key]: ");
+                }
                 stdout.flush().ok();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line).ok();
-                line.trim().to_string()
+                let v = line.trim().to_string();
+                if v.is_empty() { existing } else { v }
             } else {
                 String::new()
             };
@@ -2262,35 +2301,23 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
             }
         }
         0 => {
-            // keep the existing [llm] table untouched (non-interactive re-run)
+            // keep the existing [llm] table untouched (Enter on a configured
+            // node, or a non-interactive re-run with no --llm-provider)
         }
         _ => {
+            // #933: memory-only means memory-only. Setting `provider` alone
+            // left a self-contradictory table (provider = "none" beside a
+            // live model and api_key); this is now an explicit choice, never
+            // the Enter default, so clearing the rest is what was asked for.
             config.llm.provider = "none".into();
+            config.llm.model.clear();
+            config.llm.base_url.clear();
+            config.llm.api_key.clear();
         }
     }
 
     // --- Step 4: Seed Your Agent ---
     if !non_interactive {
-        eprintln!();
-        eprintln!("  Seed Your Agent");
-        eprintln!("  {}", "\u{2500}".repeat(35));
-        eprintln!("  Your agent '{}' needs memories to grow from.", config.agent.id);
-        eprintln!("  How would you like to seed {}'s personality?", config.agent.id);
-        eprintln!();
-        eprintln!("    1) Quick start \u{2014} basic identity + timezone/locale");
-        eprintln!("    2) From a folder \u{2014} point to a directory of your files");
-        eprintln!("       (documents, notes, code \u{2014} {} reads and remembers them)", config.agent.id);
-        eprintln!("    3) Full environment \u{2014} scan your home directory");
-        eprintln!("       \u{26a0} This reads file names and select content from ~/Documents,");
-        eprintln!("       ~/Desktop, ~/Projects, etc. Nothing is sent to the cloud.");
-        eprintln!("    4) Skip \u{2014} start with a blank slate");
-        eprintln!();
-        eprint!("  [default: 1] > ");
-        stdout.flush().ok();
-        let mut line = String::new();
-        stdin.lock().read_line(&mut line).ok();
-        let seed_choice: u32 = line.trim().parse().unwrap_or(1);
-
         // Ensure data dir + HRM path are set before seeding
         let data_dir = KannakaConfig::data_dir();
         std::fs::create_dir_all(&data_dir).ok();
@@ -2298,27 +2325,86 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
             config.hrm.path = data_dir.join("kannaka.hrm").to_string_lossy().to_string();
         }
 
-        let seed_count = run_seed_option(seed_choice, &config.agent.id, &data_dir, false);
-
-        // Step 4b: Constellation knowledge
         eprintln!();
-        eprintln!("  Enhance with constellation knowledge?");
-        eprintln!("  This adds foundational memories about the Kannaka constellation,");
-        eprintln!("  the Ghost Equation, consciousness theory, and the swarm protocol.");
-        eprintln!("  Your agent can participate more fully with this context.");
-        eprint!("  [Y/n] > ");
-        stdout.flush().ok();
-        let mut line = String::new();
-        stdin.lock().read_line(&mut line).ok();
-        let answer = line.trim().to_lowercase();
-        let want_constellation = answer.is_empty() || answer == "y" || answer == "yes";
-        if want_constellation {
-            let constellation_count = seed_constellation_knowledge(&data_dir);
-            eprintln!("  \u{2713} {constellation_count} constellation memories added.");
-        }
+        eprintln!("  Seed Your Agent");
+        eprintln!("  {}", "\u{2500}".repeat(35));
 
-        if seed_count > 0 {
-            eprintln!("  \u{2713} {seed_count} total seed memories stored in local HRM.");
+        // #933: a re-run must not re-seed a LIVE store. Seeding writes a
+        // "born on <today>" identity memory — a false origin fact on a node
+        // that has been running for months — plus 15 duplicate constellation
+        // memories, and it opens the single-writer HRM that a running
+        // `kannaka-node.service` may already hold. `run_upgrade_installer`
+        // already branches on this; the wizard now does too, and its default
+        // changes nothing.
+        let existing = detect_existing_install();
+        if existing.hrm_exists && existing.hrm_memory_count > 0 {
+            eprintln!(
+                "  Found existing memories: {} in {}'s HRM.",
+                existing.hrm_memory_count, config.agent.id
+            );
+            eprintln!();
+            eprintln!("  Would you like to:");
+            eprintln!("    1) Keep as-is \u{2014} your existing memories are your foundation");
+            eprintln!("    2) Enhance with constellation knowledge (15 shared memories)");
+            eprintln!("    3) Add more from a folder");
+            eprintln!();
+            eprint!("  [default: 1] > ");
+            stdout.flush().ok();
+            let mut line = String::new();
+            stdin.lock().read_line(&mut line).ok();
+            match line.trim().parse::<u32>().unwrap_or(1) {
+                2 => {
+                    let constellation_count = seed_constellation_knowledge(&data_dir);
+                    eprintln!("  \u{2713} {constellation_count} constellation memories added.");
+                }
+                3 => {
+                    let folder_count = seed_from_folder(&config.agent.id, &data_dir, false);
+                    if folder_count > 0 {
+                        eprintln!("  \u{2713} {folder_count} memories added from folder.");
+                    }
+                }
+                _ => eprintln!("  \u{2713} Keeping existing memories as-is."),
+            }
+        } else {
+            eprintln!("  Your agent '{}' needs memories to grow from.", config.agent.id);
+            eprintln!("  How would you like to seed {}'s personality?", config.agent.id);
+            eprintln!();
+            eprintln!("    1) Quick start \u{2014} basic identity + timezone/locale");
+            eprintln!("    2) From a folder \u{2014} point to a directory of your files");
+            eprintln!("       (documents, notes, code \u{2014} {} reads and remembers them)", config.agent.id);
+            eprintln!("    3) Full environment \u{2014} scan your home directory");
+            eprintln!("       \u{26a0} This reads file names and select content from ~/Documents,");
+            eprintln!("       ~/Desktop, ~/Projects, etc. Nothing is sent to the cloud.");
+            eprintln!("    4) Skip \u{2014} start with a blank slate");
+            eprintln!();
+            eprint!("  [default: 1] > ");
+            stdout.flush().ok();
+            let mut line = String::new();
+            stdin.lock().read_line(&mut line).ok();
+            let seed_choice: u32 = line.trim().parse().unwrap_or(1);
+
+            let seed_count = run_seed_option(seed_choice, &config.agent.id, &data_dir, false);
+
+            // Step 4b: Constellation knowledge
+            eprintln!();
+            eprintln!("  Enhance with constellation knowledge?");
+            eprintln!("  This adds foundational memories about the Kannaka constellation,");
+            eprintln!("  the Ghost Equation, consciousness theory, and the swarm protocol.");
+            eprintln!("  Your agent can participate more fully with this context.");
+            eprint!("  [Y/n] > ");
+            stdout.flush().ok();
+            let mut line = String::new();
+            stdin.lock().read_line(&mut line).ok();
+            let answer = line.trim().to_lowercase();
+            let want_constellation = answer.is_empty() || answer == "y" || answer == "yes";
+            if want_constellation {
+                let constellation_count = seed_constellation_knowledge(&data_dir);
+                eprintln!("  \u{2713} {constellation_count} constellation memories added.");
+            }
+
+            if seed_count > 0 {
+                eprintln!("  \u{2713} {seed_count} total seed memories stored in local HRM.");
+            }
         }
     }
 
@@ -3755,23 +3841,48 @@ pub fn run_upgrade_installer() {
     eprintln!("    4) Custom API endpoint");
     eprintln!("    5) None (memory-only mode)");
     eprintln!();
-    let llm_input = prompt_line(&a, "[1-5, default 5]", "5");
-    let llm_choice: u32 = llm_input.parse().unwrap_or(5);
+    // #933: the same defect as the wizard's prompt — Enter must KEEP a
+    // configured provider instead of switching it to "none".
+    let keep_llm = !config.llm.provider.is_empty() && config.llm.provider != "none";
+    let llm_label = if keep_llm {
+        format!("[1-5, Enter to keep {}]", config.llm.provider)
+    } else {
+        "[1-5, default 5]".to_string()
+    };
+    let llm_input = prompt_line(&a, &llm_label, if keep_llm { "0" } else { "5" });
+    let llm_choice: u32 = llm_input.parse().unwrap_or(if keep_llm { 0 } else { 5 });
 
     match llm_choice {
+        0 => {
+            // keep the existing [llm] table untouched
+        }
         1 => {
             config.llm.provider = "anthropic".into();
             config.llm.model = "claude-sonnet-4-20250514".into();
             eprintln!();
-            let key = prompt_line(&a, "Anthropic API key", "");
-            config.llm.api_key = key;
+            let label = if config.llm.api_key.is_empty() {
+                "Anthropic API key"
+            } else {
+                "Anthropic API key (Enter to keep the existing key)"
+            };
+            let key = prompt_line(&a, label, "");
+            if !key.is_empty() {
+                config.llm.api_key = key;
+            }
         }
         2 => {
             config.llm.provider = "openai".into();
             config.llm.model = "gpt-4".into();
             eprintln!();
-            let key = prompt_line(&a, "OpenAI API key", "");
-            config.llm.api_key = key;
+            let label = if config.llm.api_key.is_empty() {
+                "OpenAI API key"
+            } else {
+                "OpenAI API key (Enter to keep the existing key)"
+            };
+            let key = prompt_line(&a, label, "");
+            if !key.is_empty() {
+                config.llm.api_key = key;
+            }
         }
         3 => {
             config.llm.provider = "ollama".into();
@@ -3788,6 +3899,9 @@ pub fn run_upgrade_installer() {
         }
         _ => {
             config.llm.provider = "none".into();
+            config.llm.model.clear();
+            config.llm.base_url.clear();
+            config.llm.api_key.clear();
         }
     }
 
