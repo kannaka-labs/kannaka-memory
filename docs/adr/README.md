@@ -86,3 +86,4 @@ unused.
 | [0054](ADR-0054-tiered-triage-retires-prune-cron.md) | Tiered Memory Triage Inside the Dream Cycle (retiring prune-cron) | Accepted (Phases 1+2 live; Phase 3 pending parallel-run) | 2026-08-07 |
 | [0057](ADR-0057-kannaka-llm-open-weight-brain.md) | Kannaka LLM — an open-weight brain, the HRM as its memory, qBraid as its compute | Accepted (P0–P2 shipped; open release decided) | 2026-09-05 |
 | [0058](ADR-0058-rogue-agent.md) | Rogue Agent — an autonomous OpenBotCity agent on debain2 that improves itself weekly | Proposed | 2026-09-05 |
+| [0059](ADR-0059-one-claim-onboarding-and-brain-routing.md) | One claim, one identity — onboarding a node in three commands, providers with kannaka-brain as the base, routing by kind of ask, and what the microVMs are for | Proposed | 2026-09-11 |
