@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed — `kannaka init` merges, saves atomically, and tells the truth (#930, #928)
+
+`kannaka init` now MERGES into an existing `config.toml` instead of starting from
+defaults: the agent id, persona, retention rules, `swarm_trust` and every table the
+wizard does not ask about survive a re-run (a non-interactive re-run is a no-op on
+identity; a config that exists but does not parse is refused, not replaced).
+`config.toml` and every other owner-only file are written temp-and-rename in their
+own directory, 0600 from creation, never truncated in place. `ghostsignals.enabled`
+is set only after the hub actually returned a token (the failure line no longer
+names the non-existent `kannaka ghostsignals register`), and the registration body
+carries the id as both `agent_id` and `id` so the hub creates the trader row today.
+`swarm.enabled = true` is written only when credentials exist or the operator
+explicitly chose anonymous membership (`--anonymous`; the config header says so).
+Member defaults are `[swarm] role = "worker"` and `[agent] kind = "agent"`; `queen`
+is never a default. The Kannaktopus install prompt is gone. `swarm join` no longer
+claims an anonymous node "will NOT appear in swarm peers" when the presence stream
+already exists: it checks (STREAM.INFO, or the MSG.GET probe anonymous users are
+granted) and warns only when the stream is genuinely absent; anonymous connections
+also stop issuing the create they are structurally denied. ADR-0059 §1.
+
 ## [0.16.2] — 2026-09-09
 
 ### Changed — the constellation lives at kannaka-labs

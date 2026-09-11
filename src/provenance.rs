@@ -631,27 +631,18 @@ fn fill_os_random(buf: &mut [u8]) {
 /// TOCTOU window that `std::fs::write` (0644 under umask 022) + a post-hoc
 /// `chmod 0600` leaves open, and avoiding a permanently-exposed file when a
 /// discarded post-hoc chmod silently fails. Also re-tightens a file that already
-/// existed from an older 0644 write. On non-Unix, falls back to `std::fs::write`
-/// (Windows secret ACLs are applied separately, e.g. via `restrict_key_permissions`).
+/// existed from an older 0644 write.
+///
+/// #930 / ADR-0059 §1: the write is temp-and-rename in the target's own
+/// directory, never a truncate-in-place — a crash or a full disk mid-write
+/// used to leave `config.toml` (and the identity, tokens and API key in it)
+/// as an empty or half-written file. The 0600 temp sibling is created with
+/// that mode and renamed over the target, so a reader sees the old file or
+/// the new one, whole. On non-Unix the mode is ignored (Windows secret ACLs
+/// are applied separately, e.g. via `restrict_key_permissions`).
 pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    crate::fs_util::atomic_write_bytes_mode(path, bytes, Some(0o600))
+        .map_err(std::io::Error::other)
 }
 
 /// Restrict a key file to the current user. Unix: `chmod 0600`. Windows:

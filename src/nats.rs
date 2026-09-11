@@ -471,6 +471,43 @@ fn should_attempt_stream_create(authenticated: bool) -> bool {
     authenticated
 }
 
+/// JetStream API error code for "stream not found".
+const JS_ERR_STREAM_NOT_FOUND: u64 = 10059;
+
+/// Read a JetStream API reply as evidence about the STREAM rather than the
+/// request (#928): a clean reply, or an error about anything but the stream's
+/// existence (10037 "no message found" is the usual one from a MSG.GET probe),
+/// means the stream is there; 10059 means it is not.
+fn js_reply_names_an_existing_stream(reply: &serde_json::Value) -> bool {
+    match reply.get("error") {
+        None => true,
+        Some(err) => err.get("err_code").and_then(|c| c.as_u64()) != Some(JS_ERR_STREAM_NOT_FOUND),
+    }
+}
+
+/// The line `swarm join` prints when this identity could not create the
+/// presence stream (#928). Only when the stream is genuinely absent is
+/// presence actually dropped; when it exists, the node is listed by other
+/// hosts — an anonymous member as `(unverified)`, which is what anonymous
+/// membership costs, not invisibility.
+pub fn presence_stream_notice(create_err: &str, stream_exists: bool, authenticated: bool) -> String {
+    if stream_exists {
+        if authenticated {
+            "[nats] presence stream present (read-only identity); this agent will be listed by other hosts"
+                .to_string()
+        } else {
+            "[nats] presence stream present (read-only identity); this agent will be listed by other \
+             hosts as (unverified) — anonymous membership"
+                .to_string()
+        }
+    } else {
+        format!(
+            "[nats] WARNING: presence stream unavailable ({create_err}) — this agent will NOT appear \
+             in `swarm peers`. Presence publishes will be accepted by the broker and dropped."
+        )
+    }
+}
+
 fn permissions_error(op: &str, subject: &str, raw: &str, authenticated: bool) -> NatsError {
     let hint = if authenticated {
         "this connection IS authenticated, so the broker's ACL does not grant this subject to your user"
@@ -1687,7 +1724,7 @@ impl SwarmTransport {
     ///
     /// Read under its own short-lived lock: `stream_readable` takes the same
     /// (non-reentrant) mutex, so the guard must be dropped before calling it.
-    fn is_authenticated(&self) -> bool {
+    pub fn is_authenticated(&self) -> bool {
         match self.lock_conn() {
             Ok(conn) => conn.authenticated,
             // Unknown — assume authenticated so we keep the create path rather
@@ -2045,7 +2082,19 @@ impl SwarmTransport {
     }
 
     /// Ensure the KANNAKA_PRESENCE stream exists. ADR-0026 Phase 5.
+    ///
+    /// #928: an anonymous connection is structurally denied STREAM.CREATE
+    /// (ADR-0042 closed anon's control lane), so the same policy as
+    /// `should_attempt_stream_create` applies here — issuing it only bought
+    /// a broker-side "Permissions Violation" per join. The `Err` says the
+    /// create was not available to this identity; whether the stream is
+    /// nevertheless THERE is `presence_stream_exists`'s question.
     pub fn ensure_presence_stream(&self) -> Result<(), NatsError> {
+        if !should_attempt_stream_create(self.is_authenticated()) {
+            return Err(NatsError::Protocol(
+                "stream create is not available to an anonymous connection".to_string(),
+            ));
+        }
         self.ensure_js_stream(
             "KANNAKA_PRESENCE",
             serde_json::json!({
@@ -2059,6 +2108,42 @@ impl SwarmTransport {
                 "num_replicas": 1
             }),
         )
+    }
+
+    /// #928: does KANNAKA_PRESENCE exist on this broker, as far as THIS
+    /// identity can tell? A refused create says only that this identity
+    /// cannot create the stream; on a running swarm it already exists, the
+    /// anonymous user's presence publishes are retained by it, and the node
+    /// IS listed by other hosts.
+    ///
+    /// Credentialed identities ask `$JS.API.STREAM.INFO` (granted to the
+    /// read-only users such as `radio`). Anonymous ones are denied INFO and
+    /// NAMES but granted MSG.GET (config/nats-accounts.conf), so they probe
+    /// that instead: any reply proves the stream is there EXCEPT error 10059
+    /// "stream not found". A permission denial produces no reply, which is
+    /// the one case that stays `false`.
+    pub fn presence_stream_exists(&self) -> bool {
+        self.stream_exists("KANNAKA_PRESENCE")
+    }
+
+    fn stream_exists(&self, stream_name: &str) -> bool {
+        let Ok(mut conn) = self.lock_conn() else {
+            return false;
+        };
+        if conn.authenticated {
+            let info_subject = format!("$JS.API.STREAM.INFO.{stream_name}");
+            if let Ok(Some(reply)) =
+                self.js_api_call_locked(&mut conn, &info_subject, b"", JS_API_TIMEOUT)
+            {
+                return js_reply_names_an_existing_stream(&reply);
+            }
+        }
+        let get_subject = format!("$JS.API.STREAM.MSG.GET.{stream_name}");
+        let req = serde_json::json!({ "seq": 1, "next_by_subj": ">" }).to_string();
+        match self.js_api_call_locked(&mut conn, &get_subject, req.as_bytes(), JS_API_TIMEOUT) {
+            Ok(Some(reply)) => js_reply_names_an_existing_stream(&reply),
+            _ => false,
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -3506,6 +3591,44 @@ mod tests {
             "an authenticated identity must still create/update the stream — that is what \
              provisions a fresh cluster, syncs stream config, and proves jetstream_writable"
         );
+    }
+
+    /// #928: the presence notice is a warning ONLY when the stream is
+    /// genuinely absent. A refused create on an existing stream is the
+    /// normal state of every anonymous node on a running swarm, and those
+    /// nodes DO appear in `swarm peers` (as unverified).
+    #[test]
+    fn presence_notice_warns_only_when_the_stream_is_absent() {
+        let absent = presence_stream_notice("no JetStream reply for stream create", false, false);
+        assert!(absent.contains("WARNING"), "{absent}");
+        assert!(absent.contains("will NOT appear"), "{absent}");
+        assert!(absent.contains("no JetStream reply"), "must carry the create error: {absent}");
+
+        let anon = presence_stream_notice("permissions", true, false);
+        assert!(!anon.contains("WARNING"), "{anon}");
+        assert!(!anon.contains("NOT appear"), "{anon}");
+        assert!(anon.contains("presence stream present (read-only identity)"), "{anon}");
+        assert!(anon.contains("listed by other hosts"), "{anon}");
+        assert!(anon.contains("(unverified)"), "anonymous membership is named: {anon}");
+
+        let creds = presence_stream_notice("permissions", true, true);
+        assert!(creds.contains("listed by other hosts"), "{creds}");
+        assert!(!creds.contains("unverified"), "a credentialed read-only identity is not anonymous: {creds}");
+    }
+
+    /// #928: how a JetStream reply is read as evidence about the stream. The
+    /// MSG.GET probe an anonymous user is granted answers 10037 "no message
+    /// found" on an EMPTY existing stream — that is still an existing stream.
+    #[test]
+    fn js_reply_distinguishes_missing_stream_from_other_errors() {
+        let clean = serde_json::json!({"type": "io.nats.jetstream.api.v1.stream_info_response", "config": {"name": "KANNAKA_PRESENCE"}});
+        assert!(js_reply_names_an_existing_stream(&clean));
+        let empty_stream = serde_json::json!({"error": {"code": 404, "err_code": 10037, "description": "no message found"}});
+        assert!(js_reply_names_an_existing_stream(&empty_stream), "an empty stream still exists");
+        let not_found = serde_json::json!({"error": {"code": 404, "err_code": 10059, "description": "stream not found"}});
+        assert!(!js_reply_names_an_existing_stream(&not_found));
+        let no_code = serde_json::json!({"error": {"code": 500, "description": "server error"}});
+        assert!(js_reply_names_an_existing_stream(&no_code), "an unrelated error is not evidence of absence");
     }
 
     /// Both real server phrasings, publish and subscribe, must be recognised —
