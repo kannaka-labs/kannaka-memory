@@ -2629,6 +2629,7 @@ fn print_init_help() {
     eprintln!("  --nats-url <URL>        NATS server URL");
     eprintln!("  --no-swarm              Skip swarm join");
     eprintln!("  --anonymous             Join the swarm without credentials (listed as unverified)");
+    eprintln!("  --no-claim              Alias for --anonymous");
     eprintln!("  --no-ghostsignals       Skip GhostSignals registration");
     eprintln!("  --non-interactive       Use defaults without prompting (keeps an existing config's values)");
     eprintln!("  -h, --help              Print this help");
