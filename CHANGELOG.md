@@ -15,12 +15,27 @@ or have an operator clear the row with `POST /api/agents/:id/bearer/reset`), a 4
 with a token on file (the stored token is stale, and it is KEPT), a 200 naming a
 pre-existing row that holds no bearer (true of every row on the live hub today —
 not a failure, and it changes neither the stored token nor `enabled`), and a
-transport failure. The retry hint follows the outcome: "re-run `kannaka init`" is
-printed only where re-running can actually change the answer, never for an existing
-row that only the hub oracle can give a bearer to. **No path writes an empty token
-over a stored one** — only the success arm assigns `ghostsignals.token` at all.
-`kannaka init` on an already-registered node offers rotation (default no), and a
-rejected trade names the hub bearer alongside the KAX identity token.
+a 4xx the hub understood and rejected (a bad id, or the reserved `kax:` namespace),
+and a transport failure. The retry hint follows the outcome: "re-run `kannaka init`"
+is printed only where re-running can actually change the answer, never for an
+existing row that only the hub oracle can give a bearer to, and never for a 4xx that
+will be refused identically until the request itself changes.
+
+Three rules hold across every outcome. **No path writes an empty token over a stored
+one** — only the success arm assigns `ghostsignals.token` at all, and it trims what
+it stores so a padded answer cannot become a malformed `Authorization` header.
+**A failure the stored token had nothing to do with no longer disables a working
+node**: an unreachable hub, a 5xx or a 4xx leaves `enabled` as it is when a token is
+on file, since only a 409 proves the stored token is not the row's bearer. And **a
+new token is written to disk the moment it arrives**, ahead of the HRM work and the
+final save: the hub commits the row's new `bearer_hash` before it answers and never
+shows the plaintext again, so a rotation whose save failed would have locked the
+node out of its own row for good. If even that save fails, the token is printed
+where an operator can copy it, alongside the oracle reset route.
+
+`kannaka init` on an already-registered node offers rotation, defaulted to no and
+taking only an explicit yes, and a rejected trade names the hub bearer alongside the
+KAX identity token.
 
 ## [0.16.3] — 2026-09-11
 

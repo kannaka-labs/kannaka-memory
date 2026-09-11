@@ -986,8 +986,15 @@ pub enum GsRegisterError {
     /// The request never reached the hub (DNS, refused, timeout). Retrying
     /// is the right advice for this one, and only this one.
     Transport(String),
-    /// Any other HTTP status, or a 200 whose body cannot be read as a
-    /// registration.
+    /// Any other 4xx: the hub understood the request and rejected THIS
+    /// request. 400 is a validation failure on the id, display name or kind;
+    /// 403 is the reserved `kax:` namespace, whose ids are derived from a KAX
+    /// identity token and cannot be self-registered (kannaka-radio
+    /// `routes.js`). Re-running unchanged returns the same answer, so the
+    /// remedy is to change the request, never to retry it.
+    Refused { status: u16, message: String },
+    /// A 5xx, or a 200 whose body cannot be read as a registration: the hub
+    /// is at fault, and it may answer properly later.
     Other(String),
 }
 
@@ -997,9 +1004,66 @@ impl std::fmt::Display for GsRegisterError {
             GsRegisterError::IdTaken => {
                 write!(f, "409 Conflict: that row already holds a hub bearer")
             }
+            GsRegisterError::Refused { status, message } => write!(f, "HTTP {status}: {message}"),
             GsRegisterError::Transport(e) | GsRegisterError::Other(e) => write!(f, "{e}"),
         }
     }
+}
+
+/// The result of applying a registration: the line to print, and the token
+/// that MUST reach disk before anything else is allowed to fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsApplied {
+    /// The one factual line the caller prints.
+    pub note: String,
+    /// The plaintext token the hub just handed over, when this call put a NEW
+    /// one into the config.
+    ///
+    /// The hub commits the row's `bearer_hash` BEFORE it answers
+    /// (kannaka-radio `ghostsignals-hub.js`) and never shows the plaintext
+    /// again. A token that only ever lived in this process's memory is an
+    /// unrecoverable lockout: the row's bearer is one this node cannot
+    /// produce, and only an operator with the hub oracle token can clear it.
+    /// The caller MUST persist immediately and, if that save fails, put the
+    /// token where a human can read it — see `save_new_hub_token`.
+    pub unsaved_token: Option<String>,
+}
+
+impl GsApplied {
+    fn note(note: String) -> Self {
+        Self { note, unsaved_token: None }
+    }
+}
+
+/// Persist a freshly minted hub token NOW, and if the save fails, hand the
+/// token to the operator in the error.
+///
+/// The window this closes: the hub has already rotated the row's bearer by the
+/// time it answers, so between "the reply arrived" and "the config is on disk"
+/// the only copy of the new token is in memory. Before rotation was reachable
+/// this could only lose a first registration on a brand-new row (re-register
+/// and get another); after it, a failed save on a rotation locks a working
+/// node out of its own row for good. `save` is a parameter so the failure path
+/// is testable without breaking a real filesystem.
+pub fn save_new_hub_token(
+    config: &KannakaConfig,
+    token: &str,
+    save: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    save().map_err(|e| {
+        format!(
+            "could not save the new GhostSignals token for '{}': {e}\n\
+             \n  The hub has ALREADY minted it and will never show it again. Write it into \n\
+             \x20 {} under [ghostsignals] as  token = \"...\"  or this node is locked out of its\n\
+             \x20 own row, and only an operator with the hub oracle token can clear it\n\
+             \x20 (POST /api/agents/{}/bearer/reset). The token is:\n\
+             \n    {}\n",
+            config.agent.id,
+            KannakaConfig::config_path().display(),
+            config.agent.id,
+            token,
+        )
+    })
 }
 
 /// The one path that may reset the bearer on a row, quoted in the notes below.
@@ -1008,97 +1072,144 @@ fn bearer_reset_hint(agent_id: &str) -> String {
 }
 
 /// Apply the hub's answer to the config (ADR-0059 §1, #930; contract from
-/// kannaka-radio#304): `enabled` becomes true ONLY with a token in hand. On
-/// failure the flag is left false — `enabled = true` with an empty token was
-/// the silently-broken identity of #111, and the wizard used to set it BEFORE
-/// calling the hub.
+/// kannaka-radio#304): `enabled` becomes true ONLY with a token in hand. An
+/// `enabled = true` with an empty token was the silently-broken identity of
+/// #111, and the wizard used to set it BEFORE calling the hub.
 ///
 /// A 200 carrying a token different from the one on file is a ROTATION (the
 /// hub rotates when the caller presents the current bearer); the new token
-/// replaces the old. **No arm ever writes an empty token over a stored one** —
-/// only the `Token` arm assigns `ghostsignals.token` at all, so a 409, a
-/// transport failure or a token-less 200 leave what is on disk untouched.
+/// replaces the old, trimmed, and the caller must persist it at once.
 ///
-/// Returns the one factual line the caller prints.
+/// Two rules hold across every arm:
+///
+/// * **No arm writes an empty token over a stored one.** Only the success arm
+///   assigns `ghostsignals.token` at all.
+/// * **A failure the stored token had nothing to do with does not disable a
+///   working node.** An unreachable hub or a 5xx says nothing about the
+///   credential on disk; before rotation existed these arms could only be
+///   reached with no token, so clearing the flag was free. Only a 409 — the
+///   hub proving the stored token is not the row's bearer — disables a node
+///   that holds one.
 pub fn apply_ghostsignals_registration(
     config: &mut KannakaConfig,
     result: Result<GsRegistered, GsRegisterError>,
-) -> String {
+) -> GsApplied {
     let stored = config.ghostsignals.token.trim().to_string();
     let had_token = !stored.is_empty();
+    /// A failure that says nothing about the token on disk: keep the flag as
+    /// it is when there is a token, and it cannot be true when there is none.
+    fn keep_flag_unless_tokenless(config: &mut KannakaConfig, had_token: bool) -> &'static str {
+        if had_token {
+            "The token on file is untouched"
+        } else {
+            config.ghostsignals.enabled = false;
+            "Left disabled"
+        }
+    }
     match result {
         Ok(GsRegistered::Token(token)) if !token.trim().is_empty() => {
-            let rotated = had_token && stored != token.trim();
-            config.ghostsignals.token = token;
+            // Trim on assignment: a padded answer stored verbatim goes back
+            // out as `Authorization: Bearer <token> ` and is rejected as
+            // malformed on the next call.
+            let token = token.trim().to_string();
+            let rotated = had_token && stored != token;
+            config.ghostsignals.token = token.clone();
             config.ghostsignals.enabled = true;
-            if rotated {
+            let note = if rotated {
                 format!(
                     "Rotated the GhostSignals token for '{}': the hub replaced the one on file.",
                     config.agent.id
                 )
             } else {
                 format!("Registered '{}' with GhostSignals.", config.agent.id)
-            }
+            };
+            // The hub committed the new bearer before answering: this token is
+            // now the only thing that can authenticate as this row.
+            GsApplied { note, unsaved_token: Some(token) }
         }
         // Defensive: a 200 whose `token` is present but blank is a malformed
         // answer, not a registration (#111). `register_ghostsignals` refuses
         // it before this point; if it ever arrives it is a failure, and one
         // that still leaves whatever is on disk alone.
         Ok(GsRegistered::Token(_)) => {
-            config.ghostsignals.enabled = false;
-            format!(
-                "GhostSignals returned an empty token for '{}'; left disabled, token on file untouched.",
-                config.agent.id
-            )
+            let kept = keep_flag_unless_tokenless(config, had_token);
+            GsApplied::note(format!(
+                "GhostSignals returned an empty token for '{}'; {}.",
+                config.agent.id,
+                kept.to_lowercase()
+            ))
         }
         Ok(GsRegistered::NoTokenExistingRow) if had_token => {
             // The row predates the bearer contract and holds none, so the hub
             // minted nothing. Nothing changes: not the token, not the flag.
-            format!(
+            GsApplied::note(format!(
                 "GhostSignals already knows '{}' and issued no new token (the row holds no bearer); \
                  the token on file is unchanged.",
                 config.agent.id
-            )
+            ))
         }
         Ok(_) => {
             // No token on file and none coming. `enabled` cannot be true
             // without a token, and re-running init will never change this
             // answer — say what actually would.
             config.ghostsignals.enabled = false;
-            format!(
+            GsApplied::note(format!(
                 "GhostSignals already has a row for '{}' with no bearer, and only the hub oracle can \
                  mint one for an existing row: an operator must re-register it with the oracle token, \
                  or register under a different id (--agent-id). Left disabled; re-running `kannaka \
                  init` returns the same answer.",
                 config.agent.id
-            )
+            ))
         }
         Err(GsRegisterError::IdTaken) if had_token => {
+            // The one failure that IS about the stored token: the hub has just
+            // proved it is not this row's bearer, so trading with it will 401.
             config.ghostsignals.enabled = false;
-            format!(
+            GsApplied::note(format!(
                 "GhostSignals refused the stored token for '{}' (409): it is stale — the row's bearer \
                  is not this one. The token on file is kept; {}, then re-run `kannaka init`.",
                 config.agent.id,
                 bearer_reset_hint(&config.agent.id)
-            )
+            ))
         }
         Err(GsRegisterError::IdTaken) => {
             config.ghostsignals.enabled = false;
-            format!(
+            GsApplied::note(format!(
                 "GhostSignals: '{}' is already registered and its bearer is not on this machine (409). \
                  Left disabled; register under a different id (--agent-id), or {}, then re-run \
                  `kannaka init`.",
                 config.agent.id,
                 bearer_reset_hint(&config.agent.id)
-            )
+            ))
+        }
+        Err(GsRegisterError::Refused { status, message }) => {
+            let kept = keep_flag_unless_tokenless(config, had_token);
+            let remedy = if status == 403 {
+                "ids in the `kax:` namespace are derived from a KAX identity token and cannot be \
+                 self-registered — register under an id outside it (--agent-id)"
+            } else {
+                "the hub rejected this request's own values (agent id, display name or kind) — \
+                 change them (--agent-id) rather than re-running unchanged"
+            };
+            GsApplied::note(format!(
+                "GhostSignals refused the registration for '{}' (HTTP {status}: {message}). That is \
+                 this request, not a hub outage: {remedy}. {kept}; re-running `kannaka init` unchanged \
+                 returns the same answer.",
+                config.agent.id
+            ))
         }
         Err(GsRegisterError::Transport(e)) => {
-            config.ghostsignals.enabled = false;
-            format!("GhostSignals registration failed: {e}. Left disabled; re-run `kannaka init` to try again.")
+            let kept = keep_flag_unless_tokenless(config, had_token);
+            GsApplied::note(format!(
+                "GhostSignals registration failed: {e}. {kept}; re-run `kannaka init` to try again."
+            ))
         }
         Err(GsRegisterError::Other(e)) => {
-            config.ghostsignals.enabled = false;
-            format!("GhostSignals registration failed: {e}. Left disabled; re-run `kannaka init` once the hub answers properly.")
+            let kept = keep_flag_unless_tokenless(config, had_token);
+            GsApplied::note(format!(
+                "GhostSignals registration failed: {e}. {kept}; re-run `kannaka init` once the hub \
+                 answers properly."
+            ))
         }
     }
 }
@@ -2668,8 +2779,26 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
         // `enabled` is set inside apply_ghostsignals_registration, and only
         // once a token has actually arrived (ADR-0059 §1).
         let result = register_ghostsignals_for(&config);
-        let note = apply_ghostsignals_registration(&mut config, result);
-        eprintln!("  {note}");
+        let applied = apply_ghostsignals_registration(&mut config, result);
+        eprintln!("  {}", applied.note);
+        // #304: the hub commits the row's new bearer BEFORE it answers and
+        // never shows the plaintext again, so the token is only safe once it
+        // is on disk. Save it here, ahead of the HRM work and the final save
+        // that could still fail, and if even this save fails put the token in
+        // front of the operator — otherwise a rotation that cannot be written
+        // locks the node out of its own row for good.
+        // The early save writes the WHOLE config, so give hrm.path its value
+        // now: the save step below would have, and an init that stops here
+        // should not leave a half-filled file behind.
+        if applied.unsaved_token.is_some() && config.hrm.path.is_empty() {
+            config.hrm.path =
+                KannakaConfig::data_dir().join("kannaka.hrm").to_string_lossy().to_string();
+        }
+        if let Some(token) = applied.unsaved_token.as_deref() {
+            save_new_hub_token(&config, token, || {
+                config.save_with_header(membership == SwarmMembership::Anonymous)
+            })?;
+        }
     }
 
     // (Step 7, the Kannaktopus install prompt, was dropped — ADR-0059 §1.)
@@ -2841,7 +2970,14 @@ pub fn register_ghostsignals(
         Err(ureq::Error::Status(code, r)) => {
             let text = r.into_string().unwrap_or_default();
             let preview: String = text.chars().take(200).collect();
-            return Err(GsRegisterError::Other(format!("HTTP {code}: {preview}")));
+            // A 4xx is about THIS request (a rejected id, display name or
+            // kind; a reserved `kax:` id), so re-running unchanged returns the
+            // same answer. Only a 5xx may answer differently later.
+            return Err(if (400..500).contains(&code) {
+                GsRegisterError::Refused { status: code, message: preview }
+            } else {
+                GsRegisterError::Other(format!("HTTP {code}: {preview}"))
+            });
         }
         Err(e) => return Err(GsRegisterError::Transport(format!("HTTP request failed: {e}"))),
     };
@@ -2869,7 +3005,9 @@ pub fn register_ghostsignals(
                     json_preview(&json)
                 )));
             }
-            Ok(GsRegistered::Token(token))
+            // Trimmed at the source too: every consumer of this value ends
+            // up in an Authorization header.
+            Ok(GsRegistered::Token(token.trim().to_string()))
         }
         None if json["ok"].as_bool() == Some(true) && json["trader"].is_object() => {
             Ok(GsRegistered::NoTokenExistingRow)
@@ -3548,19 +3686,43 @@ fn run_init_wizard_with_installer_ui(overrides: InitOverrides, a: &Ansi, total_s
     let register_gs = if config.ghostsignals.token.trim().is_empty() {
         prompt_yn(a, "Register with GhostSignals", true)
     } else {
-        // #304: presenting the stored bearer rotates it. Offered, default no.
-        print_success(a, &format!("Already registered as '{}' (token on file).", config.agent.id));
-        prompt_yn(a, "Rotate the hub token", false)
+        // No prompt here: this wizard runs only when there is no config.toml
+        // (kannaka.rs first-run/upgrade detection), so `init_base_config`
+        // returns defaults and this branch is unreachable in practice. The
+        // rotate prompt lives in `run_init_wizard`, the one path that can see
+        // a token on file.
+        print_success(a, &format!("Already registered as '{}' (token on file) — keeping it.", config.agent.id));
+        false
     };
 
     if register_gs {
         // `enabled` is set only once a token has actually arrived (ADR-0059 §1).
         let result = register_ghostsignals_for(&config);
-        let note = apply_ghostsignals_registration(&mut config, result);
+        let applied = apply_ghostsignals_registration(&mut config, result);
         if config.ghostsignals.enabled {
-            print_success(a, &note);
+            print_success(a, &applied.note);
         } else {
-            eprintln!("  {}{}{}", a.yellow, note, a.reset);
+            eprintln!("  {}{}{}", a.yellow, applied.note, a.reset);
+        }
+        // #304: the hub commits the row's new bearer BEFORE it answers and
+        // never shows the plaintext again, so the token is only safe once it
+        // is on disk. Save it here, ahead of the HRM work and the final save
+        // that could still fail, and if even this save fails put the token in
+        // front of the operator — otherwise a rotation that cannot be written
+        // locks the node out of its own row for good.
+        // The early save writes the WHOLE config, so give hrm.path its value
+        // now: the save step below would have, and an init that stops here
+        // should not leave a half-filled file behind.
+        if applied.unsaved_token.is_some() && config.hrm.path.is_empty() {
+            config.hrm.path =
+                KannakaConfig::data_dir().join("kannaka.hrm").to_string_lossy().to_string();
+        }
+        if let Some(token) = applied.unsaved_token.as_deref() {
+            if let Err(e) = save_new_hub_token(&config, token, || {
+                config.save_with_header(membership == SwarmMembership::Anonymous)
+            }) {
+                eprintln!("  {}{}{}", a.yellow, e, a.reset);
+            }
         }
     }
 
@@ -4253,19 +4415,43 @@ pub fn run_upgrade_installer() {
     let register_gs = if config.ghostsignals.token.trim().is_empty() {
         prompt_yn(&a, "Register with GhostSignals", true)
     } else {
-        // #304: presenting the stored bearer rotates it. Offered, default no.
-        print_success(&a, &format!("Already registered as '{}' (token on file).", config.agent.id));
-        prompt_yn(&a, "Rotate the hub token", false)
+        // No prompt here: this wizard runs only when there is no config.toml
+        // (kannaka.rs first-run/upgrade detection), so `init_base_config`
+        // returns defaults and this branch is unreachable in practice. The
+        // rotate prompt lives in `run_init_wizard`, the one path that can see
+        // a token on file.
+        print_success(&a, &format!("Already registered as '{}' (token on file) — keeping it.", config.agent.id));
+        false
     };
 
     if register_gs {
         // `enabled` is set only once a token has actually arrived (ADR-0059 §1).
         let result = register_ghostsignals_for(&config);
-        let note = apply_ghostsignals_registration(&mut config, result);
+        let applied = apply_ghostsignals_registration(&mut config, result);
         if config.ghostsignals.enabled {
-            print_success(&a, &note);
+            print_success(&a, &applied.note);
         } else {
-            eprintln!("  {}{}{}", a.yellow, note, a.reset);
+            eprintln!("  {}{}{}", a.yellow, applied.note, a.reset);
+        }
+        // #304: the hub commits the row's new bearer BEFORE it answers and
+        // never shows the plaintext again, so the token is only safe once it
+        // is on disk. Save it here, ahead of the HRM work and the final save
+        // that could still fail, and if even this save fails put the token in
+        // front of the operator — otherwise a rotation that cannot be written
+        // locks the node out of its own row for good.
+        // The early save writes the WHOLE config, so give hrm.path its value
+        // now: the save step below would have, and an init that stops here
+        // should not leave a half-filled file behind.
+        if applied.unsaved_token.is_some() && config.hrm.path.is_empty() {
+            config.hrm.path =
+                KannakaConfig::data_dir().join("kannaka.hrm").to_string_lossy().to_string();
+        }
+        if let Some(token) = applied.unsaved_token.as_deref() {
+            if let Err(e) = save_new_hub_token(&config, token, || {
+                config.save_with_header(membership == SwarmMembership::Anonymous)
+            }) {
+                eprintln!("  {}{}{}", a.yellow, e, a.reset);
+            }
         }
     }
 
@@ -5052,7 +5238,7 @@ mod config_field_tests {
         let mut cfg = KannakaConfig::default();
         cfg.agent.id = "node-a".to_string();
 
-        let note = apply_ghostsignals_registration(
+        let note = applied_note(
             &mut cfg,
             Err(GsRegisterError::Transport("HTTP request failed: 503".into())),
         );
@@ -5062,7 +5248,7 @@ mod config_field_tests {
         assert!(note.contains("503"), "the line must be factual: {note}");
         assert!(!note.contains("ghostsignals register"), "no phantom command hint: {note}");
 
-        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::Token("   ".into())));
+        let note = applied_note(&mut cfg, Ok(GsRegistered::Token("   ".into())));
         assert!(!cfg.ghostsignals.enabled, "an empty token is not a registration");
         assert!(!note.contains("ghostsignals register"), "{note}");
 
@@ -5073,7 +5259,7 @@ mod config_field_tests {
         apply_ghostsignals_registration(&mut cfg, Err(GsRegisterError::Transport("timeout".into())));
         assert!(!cfg.ghostsignals.enabled);
 
-        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::Token("tok-123".into())));
+        let note = applied_note(&mut cfg, Ok(GsRegistered::Token("tok-123".into())));
         assert!(cfg.ghostsignals.enabled);
         assert_eq!(cfg.ghostsignals.token, "tok-123");
         assert!(note.contains("node-a"), "{note}");
@@ -5100,6 +5286,15 @@ mod config_field_tests {
     }
 
     // ── kannaka-radio#304: the client presents the stored bearer ─────────
+
+    /// `apply_ghostsignals_registration`'s line, for the tests that only care
+    /// what the operator reads.
+    fn applied_note(
+        cfg: &mut KannakaConfig,
+        result: Result<GsRegistered, GsRegisterError>,
+    ) -> String {
+        apply_ghostsignals_registration(cfg, result).note
+    }
 
     /// A config that already holds a hub token, the way every registered node
     /// on the fleet has it.
@@ -5129,7 +5324,7 @@ mod config_field_tests {
         ];
         for outcome in outcomes {
             let mut cfg = cfg_with_token("node-a", TOKEN);
-            let note = apply_ghostsignals_registration(&mut cfg, outcome.clone());
+            let note = applied_note(&mut cfg, outcome.clone());
             assert_eq!(
                 cfg.ghostsignals.token, TOKEN,
                 "outcome {outcome:?} overwrote the stored token; note was: {note}"
@@ -5143,7 +5338,7 @@ mod config_field_tests {
     fn a_different_token_on_a_registered_node_is_a_rotation() {
         let mut cfg = cfg_with_token("node-a", "gs1.bm9kZS1h.b2xk");
 
-        let note = apply_ghostsignals_registration(
+        let note = applied_note(
             &mut cfg,
             Ok(GsRegistered::Token("gs1.bm9kZS1h.bmV3".into())),
         );
@@ -5153,7 +5348,7 @@ mod config_field_tests {
         assert!(note.contains("node-a"), "{note}");
 
         // The same token back is not a rotation, and says nothing about one.
-        let note = apply_ghostsignals_registration(
+        let note = applied_note(
             &mut cfg,
             Ok(GsRegistered::Token("gs1.bm9kZS1h.bmV3".into())),
         );
@@ -5161,12 +5356,177 @@ mod config_field_tests {
         assert!(!note.contains("Rotated"), "{note}");
     }
 
+    /// The lockout window. The hub commits the row's new `bearer_hash` before
+    /// it answers and never shows the plaintext again, so a rotation whose
+    /// save fails leaves the node unable to authenticate as its own row —
+    /// recoverable only through the oracle reset route. The token must reach
+    /// the operator in that failure, or it is gone.
+    #[test]
+    fn a_rotation_that_cannot_be_saved_hands_the_token_to_the_operator() {
+        let mut cfg = cfg_with_token("node-a", "gs1.bm9kZS1h.b2xk");
+        let applied = apply_ghostsignals_registration(
+            &mut cfg,
+            Ok(GsRegistered::Token("gs1.bm9kZS1h.cm90YXRlZA".into())),
+        );
+        // The obligation is visible to the caller, not something it must infer.
+        assert_eq!(
+            applied.unsaved_token.as_deref(),
+            Some("gs1.bm9kZS1h.cm90YXRlZA"),
+            "a rotation must tell the caller to persist NOW"
+        );
+
+        let token = applied.unsaved_token.unwrap();
+        let err = save_new_hub_token(&cfg, &token, || Err("read-only file system".into()))
+            .expect_err("the save failed, so this must be an error");
+        assert!(err.contains("gs1.bm9kZS1h.cm90YXRlZA"), "the token itself must be printed: {err}");
+        assert!(err.contains("read-only file system"), "and why the save failed: {err}");
+        assert!(err.contains("bearer/reset"), "and how an operator recovers: {err}");
+        assert!(err.contains("node-a"), "{err}");
+
+        // A save that works says nothing and costs nothing.
+        let saved = std::cell::Cell::new(false);
+        save_new_hub_token(&cfg, &token, || {
+            saved.set(true);
+            Ok(())
+        })
+        .expect("a working save is not an error");
+        assert!(saved.get(), "the save closure must actually run");
+    }
+
+    /// A first registration carries the same obligation: the row was created
+    /// WITH a bearer, so a token that never reaches disk orphans the row.
+    #[test]
+    fn a_first_registration_must_also_be_persisted_at_once() {
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = "node-new".to_string();
+        let applied =
+            apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::Token("gs1.x.y".into())));
+        assert_eq!(applied.unsaved_token.as_deref(), Some("gs1.x.y"));
+        assert!(applied.note.contains("Registered"), "{}", applied.note);
+    }
+
+    /// No outcome that failed to produce a token may ask the caller to write
+    /// one — an empty `unsaved_token` is what keeps the save path off the
+    /// failure arms entirely.
+    #[test]
+    fn only_a_real_token_asks_to_be_persisted() {
+        let outcomes: Vec<Result<GsRegistered, GsRegisterError>> = vec![
+            Ok(GsRegistered::NoTokenExistingRow),
+            Ok(GsRegistered::Token("  ".into())),
+            Err(GsRegisterError::IdTaken),
+            Err(GsRegisterError::Transport("refused".into())),
+            Err(GsRegisterError::Refused { status: 400, message: "bad id".into() }),
+            Err(GsRegisterError::Other("HTTP 500".into())),
+        ];
+        for outcome in outcomes {
+            let mut cfg = cfg_with_token("node-a", "gs1.a.b");
+            let applied = apply_ghostsignals_registration(&mut cfg, outcome.clone());
+            assert!(applied.unsaved_token.is_none(), "outcome {outcome:?} asked to persist nothing");
+        }
+    }
+
+    /// A hub that is down says NOTHING about the token on disk. Before
+    /// rotation was reachable these arms could only be hit with no token, so
+    /// clearing the flag was free; now accepting the rotate prompt while the
+    /// hub is unreachable would disable a node that is trading perfectly well,
+    /// and nothing turns it back on (the next init defaults the prompt to no).
+    #[test]
+    fn a_failure_the_token_had_nothing_to_do_with_does_not_disable_a_working_node() {
+        for outcome in [
+            Err(GsRegisterError::Transport("connection refused".into())),
+            Err(GsRegisterError::Other("HTTP 502: bad gateway".into())),
+            Err(GsRegisterError::Refused { status: 400, message: "display_name too long".into() }),
+        ] {
+            let mut cfg = cfg_with_token("node-a", "gs1.a.b");
+            let note = applied_note(&mut cfg, outcome.clone());
+            assert!(
+                cfg.ghostsignals.enabled,
+                "outcome {outcome:?} disabled a node whose token is fine; note: {note}"
+            );
+            assert_eq!(cfg.ghostsignals.token, "gs1.a.b");
+            assert!(!note.contains("Left disabled"), "it was not disabled, so do not say so: {note}");
+            assert!(note.contains("untouched"), "{note}");
+        }
+
+        // With NO token on file the flag cannot be true, and still is not.
+        for outcome in [
+            Err(GsRegisterError::Transport("connection refused".into())),
+            Err(GsRegisterError::Other("HTTP 502".into())),
+            Err(GsRegisterError::Refused { status: 403, message: "kax: is reserved".into() }),
+        ] {
+            let mut cfg = KannakaConfig::default();
+            cfg.agent.id = "node-a".to_string();
+            cfg.ghostsignals.enabled = true; // the #111 lie
+            let note = applied_note(&mut cfg, outcome);
+            assert!(!cfg.ghostsignals.enabled, "enabled with no token is the #111 lie: {note}");
+            assert!(note.contains("Left disabled"), "{note}");
+        }
+    }
+
+    /// 400 and 403 are this request's own fault: the hub understood it and
+    /// said no. Telling the operator to retry is the dead-end class this
+    /// change exists to remove.
+    #[test]
+    fn a_4xx_names_what_to_change_instead_of_suggesting_a_retry() {
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = "kax:agent:rogue".to_string();
+        let note = applied_note(
+            &mut cfg,
+            Err(GsRegisterError::Refused {
+                status: 403,
+                message: "ids in the kax: namespace ... cannot be self-registered".into(),
+            }),
+        );
+        assert!(note.contains("403"), "{note}");
+        assert!(note.contains("--agent-id"), "the remedy is a different id: {note}");
+        assert!(note.contains("same answer"), "a retry is pointless and must be said: {note}");
+        assert!(
+            !note.contains("to try again") && !note.contains("answers properly"),
+            "no retry hint on a caller-side fault: {note}"
+        );
+
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = "node a".to_string();
+        let note = applied_note(
+            &mut cfg,
+            Err(GsRegisterError::Refused { status: 400, message: "id must be 1..128 chars".into() }),
+        );
+        assert!(note.contains("400"), "{note}");
+        assert!(note.contains("id must be 1..128 chars"), "the hub's own reason: {note}");
+        assert!(note.contains("same answer"), "{note}");
+
+        // A 5xx is the hub's fault and MAY answer differently later, so that
+        // one keeps its retry hint.
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = "node-a".to_string();
+        let note = applied_note(&mut cfg, Err(GsRegisterError::Other("HTTP 503: down".into())));
+        assert!(note.contains("answers properly"), "{note}");
+    }
+
+    /// A padded token stored verbatim goes back out as a malformed
+    /// `Authorization: Bearer <token> ` header on the next call.
+    #[test]
+    fn a_padded_token_is_trimmed_before_it_is_stored() {
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = "node-a".to_string();
+        let applied = apply_ghostsignals_registration(
+            &mut cfg,
+            Ok(GsRegistered::Token("  gs1.bm9kZS1h.cGFkZGVk\n".into())),
+        );
+        assert_eq!(cfg.ghostsignals.token, "gs1.bm9kZS1h.cGFkZGVk");
+        assert_eq!(applied.unsaved_token.as_deref(), Some("gs1.bm9kZS1h.cGFkZGVk"));
+
+        // And the same value coming back padded is not a "rotation".
+        let note = applied_note(&mut cfg, Ok(GsRegistered::Token(" gs1.bm9kZS1h.cGFkZGVk ".into())));
+        assert!(!note.contains("Rotated"), "whitespace is not a new token: {note}");
+    }
+
     /// 409 has two readings and the remedy differs. With a token on file the
     /// stored one is stale; with none, the id belongs to someone else.
     #[test]
     fn a_409_says_stale_or_taken_and_never_destroys_the_token() {
         let mut cfg = cfg_with_token("node-a", "gs1.bm9kZS1h.c3RhbGU");
-        let note = apply_ghostsignals_registration(&mut cfg, Err(GsRegisterError::IdTaken));
+        let note = applied_note(&mut cfg, Err(GsRegisterError::IdTaken));
         assert!(!cfg.ghostsignals.enabled, "a refused registration is not an identity");
         assert_eq!(cfg.ghostsignals.token, "gs1.bm9kZS1h.c3RhbGU", "a refused token is not destroyed");
         assert!(note.contains("stale"), "{note}");
@@ -5175,7 +5535,7 @@ mod config_field_tests {
 
         let mut fresh = KannakaConfig::default();
         fresh.agent.id = "node-a".to_string();
-        let note = apply_ghostsignals_registration(&mut fresh, Err(GsRegisterError::IdTaken));
+        let note = applied_note(&mut fresh, Err(GsRegisterError::IdTaken));
         assert!(!fresh.ghostsignals.enabled);
         assert!(fresh.ghostsignals.token.is_empty());
         assert!(note.contains("already registered"), "{note}");
@@ -5188,7 +5548,7 @@ mod config_field_tests {
     #[test]
     fn a_token_less_200_on_a_legacy_row_changes_nothing() {
         let mut cfg = cfg_with_token("kannaka-01", "gs1.a2FubmFrYS0wMQ.b24tZmlsZQ");
-        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::NoTokenExistingRow));
+        let note = applied_note(&mut cfg, Ok(GsRegistered::NoTokenExistingRow));
         assert!(cfg.ghostsignals.enabled, "a working node is not disabled by a token-less 200");
         assert_eq!(cfg.ghostsignals.token, "gs1.a2FubmFrYS0wMQ.b24tZmlsZQ");
         assert!(!note.contains("failed"), "this is not a failure: {note}");
@@ -5203,7 +5563,7 @@ mod config_field_tests {
         let mut cfg = KannakaConfig::default();
         cfg.agent.id = "kannaka-witness-01".to_string();
 
-        let note = apply_ghostsignals_registration(&mut cfg, Ok(GsRegistered::NoTokenExistingRow));
+        let note = applied_note(&mut cfg, Ok(GsRegistered::NoTokenExistingRow));
         assert!(!cfg.ghostsignals.enabled, "no token means no identity");
         assert!(note.contains("oracle"), "the remedy is the hub oracle: {note}");
         assert!(note.contains("--agent-id"), "or a different id: {note}");
@@ -5382,7 +5742,7 @@ mod config_field_tests {
         assert!(matches!(err, GsRegisterError::Transport(_)), "{err:?}");
 
         let mut cfg = cfg_with_token("node-a", "gs1.a.b");
-        let note = apply_ghostsignals_registration(&mut cfg, Err(err));
+        let note = applied_note(&mut cfg, Err(err));
         assert_eq!(cfg.ghostsignals.token, "gs1.a.b", "an unreachable hub does not cost a token");
         assert!(note.contains("re-run `kannaka init` to try again"), "{note}");
     }
