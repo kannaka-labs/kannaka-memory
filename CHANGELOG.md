@@ -42,10 +42,17 @@ publish there, so a stranger sending ~30-byte non-resonant asks — every one dr
 by that gate, none of them costing a token — would take the public `ask_kannaka`
 off the air for everybody at one publish every twelve seconds.
 
-A requester is keyed by the envelope's `from`, else by the reply-inbox prefix —
-NATS core carries no publisher identity on a message, so **both are caller-chosen**:
-the per-requester limit bounds an honest neighbour, and the hourly total is what
-holds against a caller who rotates. That key is also attacker-*sized*, since the
+A requester is keyed by the **pair** of reply-inbox prefix and declared `from`.
+NATS attaches no publisher identity to a message even on an authenticated
+connection, so **there is no unforgeable identity on this path** and both halves
+are caller-chosen. Keying on `from` alone was not merely evadable, it was aimable:
+three asks declaring `from = "kannaka-prime"` exhausted that peer's bucket, so any
+caller could spend an honest neighbour's quota by claiming its name. The pair means
+a caller can only exhaust the bucket it owns unless it also guesses the victim's
+calling process. That is the most this layer can do, so the startup banner says the
+rest plainly: the per-requester limit keeps honest neighbours from spending each
+other's quota, and the hourly total is the ceiling that holds against a determined
+caller. That key is also attacker-*sized*, since the
 broker's `max_payload` is 64MB: an id over 128 bytes is stored as a hash of itself
 (a hash, not a truncation, so one caller cannot land in another's bucket by sharing
 a prefix), and `serve` refuses an oversized `from` outright before it costs a
@@ -81,6 +88,23 @@ accounting, which is #931 — and the banner says so rather than letting a numbe
 a config file read as a ceiling. Because the installer writes `provider = "openai"`
 for a local Ollama brain as well as for the hosted gateway, the base URL decides
 locality before the provider string does.
+
+**A reply only ever goes to an inbox.** `reply_to` comes off the wire, so every
+reply in the serve handler could be aimed at a third party — or at an ordinary
+subject. The sharp edge is privilege rather than volume: a serving node
+authenticates with publish `>`, while anon is explicitly denied publish on
+`KANNAKA.work.>`, `KANNAKA.inbox.>` and the JetStream admin subjects, so reflecting
+through a serving node was a way to emit onto subjects the caller may not publish
+to. `serve` now refuses any `reply_to` that is not an `_INBOX.` subject, above
+every reply including the two that predate this work, so it closes the primitive
+rather than only the refusal this change added.
+
+Two diagnostics that an anonymous caller could trigger at will now log once per
+process instead of once per ask: the malformed-reply-to line and the
+"tried to steer the route" line, which also moved below the rate limit. Neither
+was an injection vector, since `sanitize_display` strips control characters and
+truncates, but both were journald volume on demand, and O1 has filled its disk with
+syslog before.
 
 This PR emits no `KANNAKA.events.*` at all, so the 48-character prompt preview the
 activity publisher sends on an anon-readable subject is not extended to served asks.

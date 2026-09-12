@@ -214,11 +214,11 @@ pub const MAX_TRACKED_REQUESTERS: usize = 4096;
 /// keeping two different long ids in two different buckets.
 pub const MAX_REQUESTER_ID_BYTES: usize = 128;
 
-/// Bound on the bytes one tracked requester can retain: the `from:`/`inbox:`
-/// tag plus a capped id. Multiplied by [`MAX_TRACKED_REQUESTERS`] this is the
+/// Bound on the bytes one tracked requester can retain: two capped components
+/// plus their tags. Multiplied by [`MAX_TRACKED_REQUESTERS`] this is the
 /// limiter's whole memory footprint, and it is what
 /// [`ServeRateLimiter::tracked_bytes`] measures.
-pub const MAX_REQUESTER_KEY_BYTES: usize = MAX_REQUESTER_ID_BYTES + 8;
+pub const MAX_REQUESTER_KEY_BYTES: usize = 2 * MAX_REQUESTER_ID_BYTES + 16;
 
 /// Identity this node will rate-limit an inbound ask against.
 ///
@@ -233,21 +233,57 @@ pub const MAX_REQUESTER_KEY_BYTES: usize = MAX_REQUESTER_ID_BYTES + 8;
 ///   are fresh per request, so only the `_INBOX.<tag>.<pid>` prefix is stable —
 ///   stable across one calling *process*, rotated by restarting it.
 ///
-/// So this key raises the cost of abuse; it does not make it impossible. The
-/// per-requester limit is the polite bound on an honest neighbour, and the
-/// global ceiling is the bound that actually holds against a caller who rotates.
-/// Say so in the log, not only here.
+/// The key is **the pair**, not whichever is present. Keying on `from` alone
+/// was not merely evadable, it was aimable: three asks declaring
+/// `from = "kannaka-prime"` exhausted that peer's bucket, so any caller could
+/// spend an honest neighbour's quota by claiming its name. Keying on the inbox
+/// alone has the same shape, because `reply_to` is caller-chosen too. Requiring
+/// both means a caller can only exhaust the bucket it actually owns unless it
+/// also guesses the victim's calling process — strictly harder than either
+/// half, and the most this layer can do.
+///
+/// Because it is the most this layer can do, say the rest plainly: **there is
+/// no unforgeable identity on this path.** NATS core attaches none to a message
+/// even on an authenticated connection. So the per-requester limit is not
+/// meaningful on its own — it raises the cost of abuse and keeps honest
+/// neighbours from spending each other's quota. The hourly total is the bound
+/// that holds against a determined caller. The startup banner says this too.
+///
 /// Every returned key is at most [`MAX_REQUESTER_KEY_BYTES`] bytes, whatever
 /// the caller sent — see [`bounded_id`].
 pub fn requester_key(from: Option<&str>, reply_to: Option<&str>) -> String {
-    let declared = from.map(str::trim).filter(|s| !s.is_empty() && *s != "?");
-    if let Some(id) = declared {
-        return format!("from:{}", bounded_id(id));
-    }
-    match reply_to {
-        Some(inbox) => format!("inbox:{}", bounded_id(&inbox_identity(inbox))),
-        None => "anonymous".to_string(),
-    }
+    let declared = from
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "?")
+        .map(bounded_id)
+        .unwrap_or_else(|| "-".to_string());
+    let inbox = reply_to
+        .map(|r| bounded_id(&inbox_identity(r)))
+        .unwrap_or_else(|| "-".to_string());
+    format!("inbox:{inbox}+from:{declared}")
+}
+
+/// Is this reply subject one a serving node will publish to?
+///
+/// Only `_INBOX.<something>` — the subject space NATS reserves for request
+/// inboxes — and never a wildcard.
+///
+/// `reply_to` comes off the wire, so without this a stranger can aim any of
+/// this handler's replies at a third party, or at an ordinary subject. The
+/// sharp edge is not volume (a refusal is ~110 bytes against a ~30-byte ask)
+/// but **privilege**: the serving node authenticates with publish `>`, while
+/// `anon` is explicitly denied publish on `KANNAKA.work.>`, `KANNAKA.inbox.>`
+/// and the JetStream admin subjects (`config/nats-accounts.conf`). Reflecting
+/// through a serving node is therefore a way to emit onto subjects the caller
+/// may not publish to itself.
+///
+/// This guard runs before every reply in the handler, including the two that
+/// predate this work (`bad json`, `empty text`), so it closes the primitive
+/// rather than only the refusal this change added.
+pub fn is_valid_reply_inbox(reply_to: &str) -> bool {
+    reply_to.starts_with("_INBOX.")
+        && reply_to.len() > "_INBOX.".len()
+        && !reply_to.contains(['*', '>', ' ', '\t', '\r', '\n'])
 }
 
 /// Is this declared id short enough to be worth answering at all?
@@ -776,28 +812,92 @@ mod tests {
     // ── 2. rate limit ──────────────────────────────────────────────────────
 
     #[test]
-    fn requester_key_prefers_the_declared_id_then_the_inbox_prefix() {
-        assert_eq!(requester_key(Some("kannaka-prime"), None), "from:kannaka-prime");
+    fn requester_key_is_the_pair_of_inbox_and_declared_id() {
         assert_eq!(
-            requester_key(Some("  "), Some("_INBOX.req.4242.deadbeef.17")),
-            "inbox:_INBOX.req.4242"
+            requester_key(Some("kannaka-prime"), Some("_INBOX.req.4242.deadbeef.17")),
+            "inbox:_INBOX.req.4242+from:kannaka-prime"
+        );
+        // Neither half alone is an identity, so neither half alone is the key.
+        assert_eq!(
+            requester_key(Some("  "), Some("_INBOX.req.4242.cafe.18")),
+            "inbox:_INBOX.req.4242+from:-"
         );
         assert_eq!(
             requester_key(Some("?"), Some("_INBOX.req.4242.cafe.18")),
-            "inbox:_INBOX.req.4242",
+            "inbox:_INBOX.req.4242+from:-",
             "the `?` placeholder is not an identity"
         );
         assert_eq!(
-            requester_key(None, Some("_INBOX.req.4242.other.19")),
-            requester_key(None, Some("_INBOX.req.4242.another.20")),
+            requester_key(Some("a"), Some("_INBOX.req.4242.other.19")),
+            requester_key(Some("a"), Some("_INBOX.req.4242.another.20")),
             "two requests from one process share an inbox prefix"
         );
         assert_ne!(
-            requester_key(None, Some("_INBOX.req.4242.x.1")),
-            requester_key(None, Some("_INBOX.req.9999.x.1")),
+            requester_key(Some("a"), Some("_INBOX.req.4242.x.1")),
+            requester_key(Some("a"), Some("_INBOX.req.9999.x.1")),
             "a different process is a different requester"
         );
-        assert_eq!(requester_key(None, None), "anonymous");
+    }
+
+    #[test]
+    fn claiming_another_peers_name_cannot_spend_its_quota() {
+        // Keying on `from` alone was not merely evadable, it was AIMABLE: three
+        // asks declaring `from = "kannaka-prime"` exhausted that peer's bucket.
+        // The pair means a caller can only exhaust the bucket it actually owns.
+        let victim_inbox = "_INBOX.req.1111.aaaa.1";
+        let attacker_inbox = "_INBOX.req.2222.bbbb.1";
+        let mut rl = ServeRateLimiter::new(3, 1000);
+
+        for i in 0..3 {
+            let forged = requester_key(Some("kannaka-prime"), Some(attacker_inbox));
+            assert!(rl.check(&forged, 500).is_allow(), "forged ask {i}");
+        }
+        // The attacker has spent only its own bucket.
+        assert!(
+            !rl.check(
+                &requester_key(Some("kannaka-prime"), Some(attacker_inbox)),
+                500
+            )
+            .is_allow(),
+            "the attacker must exhaust itself"
+        );
+        // The peer whose name was claimed is untouched.
+        let victim = requester_key(Some("kannaka-prime"), Some(victim_inbox));
+        for i in 0..3 {
+            assert!(
+                rl.check(&victim, 500).is_allow(),
+                "the honest peer's ask {i} must still be answered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_is_only_ever_sent_to_an_inbox() {
+        // `reply_to` is caller-chosen, and a serving node authenticates with
+        // publish `>` while anon is denied KANNAKA.work.> / KANNAKA.inbox.> and
+        // the JetStream admin subjects. Reflecting through this handler must not
+        // become a way to emit onto subjects the caller may not publish to.
+        for ok in ["_INBOX.req.1.2.3", "_INBOX.x", "_INBOX.reqm.9.a.b"] {
+            assert!(is_valid_reply_inbox(ok), "should be accepted: {ok}");
+        }
+        for bad in [
+            // The subjects anon is DENIED publish on come first: if this guard
+            // ever weakens, the failure should name the privileged reflection,
+            // not an empty string.
+            "KANNAKA.work.render",
+            "KANNAKA.inbox.someone",
+            "$JS.API.STREAM.DELETE.KANNAKA",
+            "KANNAKA.ask.broadcast",
+            "",
+            "_INBOX.",
+            "_INBOX.>",
+            "_INBOX.*.x",
+            "_INBOX.a b",
+            "_INBOX.a\r\nPUB evil 0",
+            " _INBOX.a",
+        ] {
+            assert!(!is_valid_reply_inbox(bad), "should be refused: {bad:?}");
+        }
     }
 
     #[test]
@@ -920,7 +1020,10 @@ mod tests {
             "and the same id must stay one bucket"
         );
         // Short ids are untouched, so the log stays readable.
-        assert_eq!(requester_key(Some("kannaka-prime"), None), "from:kannaka-prime");
+        assert_eq!(
+            requester_key(Some("kannaka-prime"), Some("_INBOX.req.7.a.b")),
+            "inbox:_INBOX.req.7+from:kannaka-prime"
+        );
         // The inbox fallback is bounded the same way — its tokens are wire-sized too.
         let huge_inbox = format!("_INBOX.req.{}", "9".repeat(900_000));
         assert!(requester_key(None, Some(&huge_inbox)).len() <= MAX_REQUESTER_KEY_BYTES);

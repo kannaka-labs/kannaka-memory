@@ -183,7 +183,7 @@ pub(crate) fn handle_swarm_serve(
             rate_limit.global_limit()
         );
         eprintln!(
-            "[swarm serve] NOTE: NATS carries no publisher identity on a message, so a requester is keyed by the envelope's `from` or the reply-inbox prefix — both caller-chosen. The per-hour TOTAL is the ceiling that holds against a caller who rotates."
+            "[swarm serve] NOTE: NATS attaches NO publisher identity to a message, even on an authenticated connection, so there is no unforgeable identity on this path. A requester is keyed by the PAIR (reply-inbox prefix, declared `from`); both halves are caller-chosen, so the per-requester limit keeps honest neighbours from spending each other's quota — it does not bound a determined caller. The per-hour TOTAL is the ceiling that does."
         );
     }
 
@@ -620,6 +620,27 @@ fn _neighbors_reply(
     }
 }
 
+/// Log a line the first time it happens in this process, and never again.
+///
+/// For diagnostics an anonymous caller can trigger at will. `swarm serve`
+/// answers a subject anon may publish to, so any unconditional `eprintln!` on
+/// a malformed inbound message is journald volume on demand — and O1 has
+/// filled its disk with syslog before. Once is enough to diagnose a client
+/// that genuinely has the wrong shape; the rest is the attack.
+#[cfg(feature = "nats")]
+fn warn_once(flag: &std::sync::atomic::AtomicBool, line: &str) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{line}");
+    }
+}
+
+#[cfg(feature = "nats")]
+static NO_REPLY_TO_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "nats")]
+static BAD_REPLY_TO_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(feature = "nats")]
 #[allow(clippy::too_many_arguments)]
 fn _handle_serve_msg(
@@ -636,13 +657,41 @@ fn _handle_serve_msg(
     let reply_to = match &msg.reply_to {
         Some(r) => r.clone(),
         None => {
-            eprintln!(
-                "[swarm serve] msg without reply-to on {} — ignoring",
-                msg.subject
+            // Once per process, not once per ask: anon may publish
+            // KANNAKA.ask.broadcast, so an attacker-triggered log line with no
+            // limit of its own is journald volume on demand. This box has
+            // flooded syslog before.
+            warn_once(
+                &NO_REPLY_TO_WARNED,
+                &format!(
+                    "[swarm serve] msg without reply-to on {} — ignoring",
+                    msg.subject
+                ),
             );
             return;
         }
     };
+
+    // #932: `reply_to` is caller-chosen, so every reply below can be aimed at a
+    // third party — or at an ordinary subject. The sharp edge is privilege, not
+    // volume: this node authenticates with publish `>`, while anon is denied
+    // publish on KANNAKA.work.>, KANNAKA.inbox.> and the JetStream admin
+    // subjects, so reflecting through here would emit onto subjects the caller
+    // may not publish to itself. Refuse anything that is not a request inbox.
+    //
+    // Placed above every reply, including the two that predate this work, so it
+    // closes the primitive rather than only the refusal this change added. The
+    // drop is silent past the first, for the reason directly above.
+    if !kannaka_memory::serve_guard::is_valid_reply_inbox(&reply_to) {
+        warn_once(
+            &BAD_REPLY_TO_WARNED,
+            &format!(
+                "[swarm serve] refusing to reply to {} — only _INBOX.> is a reply subject (#932). Further occurrences are not logged.",
+                kannaka_memory::sanitize_display(&reply_to)
+            ),
+        );
+        return;
+    }
 
     let req: serde_json::Value = match serde_json::from_slice(&msg.payload) {
         Ok(v) => v,
@@ -661,25 +710,6 @@ fn _handle_serve_msg(
         let err = serde_json::json!({ "from": serve_agent_id, "error": "empty text" });
         let _ = transport.reply(&reply_to, err.to_string().as_bytes());
         return;
-    }
-
-    // #932, behaviour 1: the wire never chooses the route. Provider and model
-    // come from this node's own `[llm]`; the envelope is read only to SAY what
-    // was ignored. An ask labelling itself `kind = "reason"` to reach the
-    // operator's expensive key gets the same provider as every other ask.
-    //
-    // Nothing on the answer path below has ever consulted these fields — this
-    // is the invariant made explicit and testable, because #931 adds a router
-    // right here and "we happen not to read it" is not a property a test holds.
-    let route = kannaka_memory::serve_guard::resolve_served_route(&cfg.llm, &req);
-    if !route.ignored_wire_fields.is_empty() {
-        eprintln!(
-            "[swarm serve] {} tried to steer the route ({}) — ignored; answering with {}/{}",
-            kannaka_memory::sanitize_display(from),
-            route.ignored_wire_fields.join(", "),
-            route.provider,
-            route.model
-        );
     }
 
     // An id that long is not a name, it is a payload: the broker's max_payload
@@ -745,6 +775,30 @@ fn _handle_serve_msg(
         let err = serde_json::json!({ "from": serve_agent_id, "error": refusal });
         let _ = transport.reply(&reply_to, err.to_string().as_bytes());
         return;
+    }
+
+    // #932, behaviour 1: the wire never chooses the route. Provider and model
+    // come from this node's own `[llm]`; the envelope is read only to SAY what
+    // was ignored. An ask labelling itself `kind = "reason"` to reach the
+    // operator's expensive key gets the same provider as every other ask.
+    //
+    // Nothing on the answer path below has ever consulted these fields — this
+    // is the invariant made explicit and testable, because #931 adds a router
+    // right here and "we happen not to read it" is not a property a test holds.
+    //
+    // BELOW the rate limit, not above it. This line is emitted on attacker
+    // choice (any routing-shaped field on the envelope) and embeds a
+    // wire-supplied id, so above the limiter it was one unmetered journald line
+    // per ask, for free, from anyone on the bus.
+    let route = kannaka_memory::serve_guard::resolve_served_route(&cfg.llm, &req);
+    if !route.ignored_wire_fields.is_empty() {
+        eprintln!(
+            "[swarm serve] {} tried to steer the route ({}) — ignored; answering with {}/{}",
+            kannaka_memory::sanitize_display(from),
+            route.ignored_wire_fields.join(", "),
+            route.provider,
+            route.model
+        );
     }
 
     // #932, behaviour 3: `hops`, ceiling 1 — a hired ask never hires. Absent
