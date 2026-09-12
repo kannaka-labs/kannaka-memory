@@ -218,7 +218,7 @@ What that means for the code, starting now:
 | **P0 — served** (2026-09-05, DONE) | `kannaka-brain` = `qwen2.5:14b` via ollama in debain2's gateway; `fc-03` (key bound to it) answered a signed job in 15.6 s on CPU | debain2 stack (done) |
 | P0.1 — identity (DONE, kax-computer d833954) | runtime.py's prompt hardcoded "You are Claude"; fc-03 on Qwen called itself Claude. Now derived from `KAX_MODEL` (Claude / Kannaka's open-weight core / plain model name; `KAX_BRAIN_IDENTITY` override) and the sandbox line says microVM vs container. Re-asked: "powered by Qwen2.5-14B, running in a Firecracker microVM". Long-term, identity comes from the adapter + HRM, not the prompt | P0 |
 | P1 — corpus (DONE 2026-09-05, PR #898) | `tools/corpus/export_corpus.py`: sources with authorship known by construction, never the HRM (its `origin_agent` is not persisted, so the ADR-0056 decision is sidestepped rather than waited on); tiers 1/2/3; inbound text only ever `context`. First export: voice 608 records / 61k words (200 songs from 24 albums, 367 Ghost Signals lines, identity docs); all tiers 1,758 / 145k. Skipped with reasons: dreams, social (P1.1), HRM | — |
-| P2 — adapter (TRAINED 2026-09-05, PR #899) | QLoRA r=32 on Qwen2.5-14B-Instruct, 2 epochs over 551 examples, on a qBraid A100 driven from debain2: held-out ppl **104.4 → 4.01**, 13.6 min of training, **$0.84**. Pod trains only; merge + GGUF q4_K_M on debain2 (`merge_gguf.py`) → ollama `kannaka-brain-v1` behind the gateway. Smoke on a 4090 first (1.5B, ppl 56 → 6, $0.07). Still owed: the 10-run voice A/B and the recall harness on the served model | P1 |
+| P2 — adapter (TRAINED 2026-09-05, PR #899) | QLoRA r=32 on Qwen2.5-14B-Instruct, 2 epochs over 551 examples, on a qBraid A100 driven from debain2: held-out ppl **104.4 → 4.01**, 13.6 min of training, **$0.84**. Pod trains only; merge + GGUF q4_K_M on debain2 (`merge_gguf.py`) → ollama `kannaka-brain-v1` behind the gateway. Smoke on a 4090 first (1.5B, ppl 56 → 6, $0.07). The voice A/B exists since 2026-09-06 (`ab_judge.py`, grade mode with controls) and gates the weekly; the recall harness on the served model is still owed | P1 |
 | P3 — retrieval front | ADR-0049 facet encoder as the recall embedding for the open brain (today it is keyword+resonance) | P0 |
 | P4 — the decision (DONE 2026-09-05) | **Published open:** [flaukowski/kannaka-brain-v1-lora](https://huggingface.co/flaukowski/kannaka-brain-v1-lora) (adapter, 275 MB) and [flaukowski/kannaka-brain-v1-GGUF](https://huggingface.co/flaukowski/kannaka-brain-v1-GGUF) (q4_K_M, 9.0 GB, Modelfile; `ollama run hf.co/flaukowski/kannaka-brain-v1-GGUF`). Apache-2.0. Corpus and HRM stay private | P2 results, Nick |
 | P5 — Rogue Agent | ADR-0058: an autonomous OBC agent on debain2 that retrains itself weekly on its own authored output through this pipeline | P2, ADR-0058 |
@@ -232,5 +232,17 @@ What that means for the code, starting now:
    authored text? Dreams are first-party but machine-generated.
 3. Multi-host brains: one adapter served everywhere, or per-host adapters
    that diverge (a swarm of Kannakas)? ADR-0035 sensemaking assumed one.
-4. Who scores the voice A/B besides Nick — a Sonnet judge is circular when
-   Sonnet is one arm.
+4. ~~Who scores the voice A/B besides Nick — a Sonnet judge is circular when
+   Sonnet is one arm.~~ — answered 2026-09-06, twice. (a) `tools/corpus/p2/ab_judge.py`:
+   a judge never tuned on the corpus (`qwen2.5:14b`) grades ONE candidate beside the
+   real hold-out reply, 1–10, with two controls per prompt (the reference itself and a
+   foreign reference) so the judge's own separation is measured (9.0 on the first run;
+   below 2 the summary says NOT USABLE). Pairwise judging was abandoned the same day:
+   the judge answered "B" in every order. The weekly (rogue-agent `weekly.py`) now
+   serves a candidate under its own tag, judges it against the incumbent (n=20) and
+   adopts only if it is not more than 1.0 below — perplexity had let a voice regression
+   through (v3, ppl 4.004, judged 1.33 vs 7b's 2.75 at n=12). (b) The non-circular
+   evaluator: thegrid's fossil record over the genomes the colony mind proposes
+   (kannaka-grid verdict pipeline); the relay authors as the served brain since
+   2026-09-06 and rogue-agent pulls the verdicts daily as memories and training rows.
+   Sonnet is neither an arm nor a judge anywhere in this loop.

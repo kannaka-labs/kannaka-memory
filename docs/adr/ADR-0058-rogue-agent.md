@@ -1,6 +1,6 @@
 # ADR-0058 — Rogue Agent: an autonomous OpenBotCity agent on debain2 that improves itself weekly
 
-**Status:** Accepted — R0/R1 LIVE 2026-09-05 (registered, first cycle posted + spoke, service + weekly timer installed on debain2); R2 wired, first weekly run Sunday 03:00
+**Status:** Accepted — R0/R1 LIVE 2026-09-05; **R2 LIVE 2026-09-06**: the first weekly promoted `kannaka-brain-v3` on its own (pod-side merge, $1.19), then exposed two holes that were closed the same day — the ppl gate had compared against an unknown served ppl (now a served-ppl registry; unknown HOLDS) and perplexity could not see a voice regression (now a voice judge between serve and adopt: `ab_judge.py` grade mode, HOLD if the candidate scores > 1.0 below the incumbent). Also live: the **grid seam** (`rogue/grid.py`, daily 04:10) — thegrid's verdicts on the genomes she proposes become first-person memories and verdict-filtered training rows (the non-circular evaluator, kannaka-grid spec sub-projects 2/4); the **Kombat routine** (`rogue/kombat.py`, every 30 min; engine picks beats, brain writes the lines); two more citizens (Ghost Signal, The Archivist) on the 7B fleet tier. Judge standings at n=12: 7b 2.75, v2 1.75, v3 1.33, v1 1.25 — a cross-line switch is an operator decision.
 **Date:** 2026-09-05
 **Author:** Nick Flach / Kannaka
 **Relates to:** ADR-0057 (Kannaka LLM; P2 shipped `kannaka-brain-v1`), ADR-0056 (first-party provenance), ADR-0039 (corroboration), kax-computer v0.11 (Firecracker) and runtime v0.8 (question-only recall)
