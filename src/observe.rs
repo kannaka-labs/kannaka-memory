@@ -424,12 +424,8 @@ impl MemoryIntrospector {
 
                 // Temporal span
                 let times: Vec<_> = members.iter().map(|(_, m)| m.created_at).collect();
-                let (earliest, latest) = times.iter().fold((None, None), |(mn, mx): (Option<DateTime<Utc>>, Option<DateTime<Utc>>), t| {
-                    (
-                        Some(mn.map_or(*t, |x| x.min(*t))),
-                        Some(mx.map_or(*t, |x| x.max(*t))),
-                    )
-                });
+                let earliest = times.iter().copied().min();
+                let latest = times.iter().copied().max();
                 let temporal_span_hours = match (earliest, latest) {
                     (Some(a), Some(b)) => (b - a).num_seconds() as f32 / 3600.0,
                     _ => 0.0,
