@@ -86,7 +86,6 @@ rustfft = "6"
 rubato = "0.15"
 
 # Video perception (optional) — uses ffmpeg subprocess, no C deps
-image = { version = "0.25", optional = true }
 
 # NATS real-time transport (optional) — uses raw TCP protocol (nats crate broken with rand 0.9)
 
@@ -102,7 +101,7 @@ flate2 = "1"
 # glyph is now default: the SGA glyph path (fano_line_of, classify, glyph-
 # gravity recall) is load-bearing for attention-as-gravity. Keeping it in
 # default means every build — including the autoresearch cron — ships it.
-default = ["hrm", "nats", "glyph", "nostr"]
+default = ["hrm", "nats", "glyph", "video", "nostr"]
 nats = []
 # ADR-0043: NIP-01 sign/verify + nsec/npub encoding for the Nostr membrane.
 nostr = ["k256", "bech32", "hmac", "chacha20", "base64"]
@@ -113,7 +112,11 @@ bridge = ["nostr", "tungstenite"]
 # audio feature retained as a no-op alias so external Cargo.toml entries
 # specifying features = ["audio"] still build. Audio support is now always on.
 audio = []
-video = ["image"]
+# ADR-0008: the eye (video perception). In default since the module stopped
+# being dead code -- `kannaka watch` is unreachable otherwise, which is how
+# src/eye/ sat with zero callers from March. Pure Rust + an ffmpeg subprocess,
+# no new crates, so this costs default builds nothing but compile time.
+video = []
 glyph = []
 collective = []  # rayon is now unconditional
 hrm = ["ndarray"]  # blake3 promoted to an unconditional dependency (inc-1a)

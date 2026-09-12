@@ -313,6 +313,24 @@ For belief/spiral order + winding without the (slower) eigendecomp, use `kannaka
         // ── Perception ─────────────────────────────────────────────────
         .subcommand(passthrough("hear", "Absorb audio (file/url/stream) into the right hemisphere"))
         .subcommand(passthrough("see", "Absorb visual input as a wavefront"))
+        .subcommand(passthrough_doc(
+            "watch",
+            "Absorb a video clip as a visual memory (the eye, ADR-0008)",
+            r#"Run a video file through the eye: decode frames with ffmpeg, extract 192 spatial + 128 temporal dims, project through the EYE codebook (seed 0x3E5E), and absorb the result as a Visual memory.
+
+Distinct from `see`, which encodes a single file through the SGA glyph path. `watch` is temporal: shots, motion, visual tempo, brightness arc.
+
+Needs `ffmpeg` and `ffprobe` on PATH. No GPU, no neural inference (ADR-0008 principle 4).
+
+FLAGS:
+  --fps <N>      frames per second to sample (default 2.0)
+  --json         emit the full perception summary as JSON
+  --long-term    keep the clip out of short-term triage
+
+EXAMPLES:
+  kannaka watch ./clip.mp4
+  kannaka watch ./clip.mp4 --fps 4 --json"#,
+        ))
         // ── Reasoning ──────────────────────────────────────────────────
         .subcommand(passthrough("ask", "One-shot LLM query with HRM recall as grounding"))
         .subcommand(passthrough("chat", "Long-running chat REPL (--json for NDJSON mode)"))

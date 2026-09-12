@@ -1737,6 +1737,103 @@ impl KannakaMemorySystem {
         Ok((id, features))
     }
 
+    /// Store a video clip as a visual memory (ADR-0008).
+    ///
+    /// Mirrors [`Self::store_audio`]: run the perception pipeline, then absorb a
+    /// *perceptually descriptive* content string rather than the ephemeral
+    /// "video:/tmp/<hash>.mp4" path the encoder produces. Absorbing the path
+    /// would embed every clip to ~the same point (the hash is noise, the prefix
+    /// is constant) and collapse all visual memories into one hive, which is
+    /// exactly the bug the audio path already learned. Describing what was SEEN
+    /// -- motion band, cut structure, brightness, dominant colours -- makes
+    /// clips of similar character cluster and gives the memory a readable
+    /// identity.
+    ///
+    /// Unlike audio, the modality is set explicitly to [`Modality::Visual`]
+    /// instead of being inferred from the content keywords: "motion", "shot"
+    /// and "frame" are visual words, but "video:" memories are not worth
+    /// leaving to a keyword vote.
+    ///
+    /// Requires ffmpeg on PATH. Its absence comes back as an error, never a
+    /// panic; callers should check [`crate::eye::ffmpeg_available`] first so
+    /// they can say so plainly.
+    #[cfg(feature = "video")]
+    pub fn store_video(
+        &mut self,
+        path: &std::path::Path,
+        fps: f32,
+    ) -> Result<(Uuid, crate::eye::VideoFeatures), SystemError> {
+        use crate::eye::VideoPipeline;
+
+        let pipeline = VideoPipeline::with_fps(fps);
+        let (_mem, features) = pipeline.encode_file(path).map_err(|e| {
+            SystemError::Engine(EngineError::Encoding(
+                crate::encoding::EncodingError::Other(e.to_string()),
+            ))
+        })?;
+
+        // The first tag is the motion band; the rest are the categorical
+        // descriptors (bright/dark, cut/single-shot, colour).
+        let motion_word = features
+            .feature_tags
+            .first()
+            .map(String::as_str)
+            .unwrap_or("static");
+        let descriptors: Vec<&str> = features
+            .feature_tags
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .collect();
+
+        let mut colors: Vec<&str> = Vec::new();
+        for c in &features.dominant_colors {
+            if !colors.contains(&c.name) {
+                colors.push(c.name);
+            }
+        }
+        colors.truncate(3);
+
+        let content = format!(
+            "video:watched {} {} | {} shots {} frames motion {:.2}px brightness {:.0} \
+             contrast {:.1} tempo {:.0} dur {:.1}s colors {}",
+            motion_word,
+            descriptors.join(" "),
+            features.shot_count,
+            features.frame_count,
+            features.motion_mean,
+            features.mean_brightness(),
+            features.mean_contrast(),
+            features.visual_tempo_bpm(),
+            features.duration_secs,
+            colors.join(" "),
+        );
+
+        // Absorb through the HRM-native path, same as audio.
+        let id = self
+            .engine
+            .store
+            .absorb(&content, 0.6, Some("experience"))
+            .map_err(SystemError::Store)?;
+
+        // Tag the wavefront Visual before the save below, so the modality is
+        // persisted with the memory rather than needing a second write.
+        if let Some(hrm) = self
+            .engine
+            .store
+            .as_any_mut()
+            .downcast_mut::<crate::hrm_store::HrmStore>()
+        {
+            hrm.set_modality(&id, crate::medium::Modality::Visual);
+        }
+
+        if self.auto_save {
+            self.save()?;
+        }
+
+        Ok((id, features))
+    }
+
     /// Store a file as a visual/glyph memory.
     ///
     /// Reads the file, encodes it through the SGA glyph bridge,

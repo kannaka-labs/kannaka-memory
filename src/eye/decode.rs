@@ -51,14 +51,29 @@ pub struct VideoFrames {
     pub analysis_fps: f32,
 }
 
-/// Check if ffmpeg is available.
+/// True when both `ffmpeg` and `ffprobe` can be spawned from PATH.
+///
+/// The eye shells out to decode — no C/C++ linking, no GPU (ADR-0008
+/// principle 4) — so a missing binary is a normal environment condition,
+/// not a bug. Tests that need a real decode call this and skip cleanly.
+pub fn ffmpeg_available() -> bool {
+    check_ffmpeg().is_ok()
+}
+
+/// Check that both ffmpeg and ffprobe are available.
+///
+/// `ffprobe` is checked too: it ships with ffmpeg but is a separate binary,
+/// and a PATH with only one of the two used to fail later as an opaque
+/// "ffprobe JSON parse error" instead of the actionable not-found message.
 fn check_ffmpeg() -> Result<(), EyeError> {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|_| EyeError::FfmpegNotFound)?;
+    for exe in ["ffmpeg", "ffprobe"] {
+        Command::new(exe)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| EyeError::FfmpegNotFound)?;
+    }
     Ok(())
 }
 
@@ -73,7 +88,20 @@ fn probe_video(path: &Path) -> Result<(u32, u32, f32, f32), EyeError> {
         ])
         .arg(path)
         .output()
-        .map_err(|e| EyeError::Decode(format!("ffprobe failed: {e}")))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EyeError::FfmpegNotFound
+            } else {
+                EyeError::Decode(format!("ffprobe failed: {e}"))
+            }
+        })?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(EyeError::Decode(format!(
+            "ffprobe could not read {} (not a video file, or unsupported codec)",
+            path.display()
+        )));
+    }
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| EyeError::Decode(format!("ffprobe JSON parse error: {e}")))?;
@@ -118,7 +146,9 @@ pub fn decode_video(path: &Path, target_fps: f32, target_width: u32) -> Result<V
 
     // Calculate target height preserving aspect ratio
     let aspect = src_height as f32 / src_width as f32;
-    let target_height = ((target_width as f32 * aspect) as u32 / 2) * 2; // ensure even
+    // Ensure even (many filters require it) and never zero — a degenerate
+    // probe would otherwise make `frame_bytes` 0 and divide by zero below.
+    let target_height = (((target_width as f32 * aspect) as u32 / 2) * 2).max(2);
 
     let output = Command::new("ffmpeg")
         .args([
@@ -132,7 +162,13 @@ pub fn decode_video(path: &Path, target_fps: f32, target_width: u32) -> Result<V
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| EyeError::Decode(format!("ffmpeg failed: {e}")))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EyeError::FfmpegNotFound
+            } else {
+                EyeError::Decode(format!("ffmpeg failed: {e}"))
+            }
+        })?;
 
     if output.stdout.is_empty() {
         return Err(EyeError::EmptyVideo);
@@ -161,4 +197,70 @@ pub fn decode_video(path: &Path, target_fps: f32, target_width: u32) -> Result<V
         source_fps: src_fps,
         analysis_fps: target_fps,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2x2 frame: red, green / blue, white.
+    fn tiny_frame() -> FrameInfo {
+        FrameInfo {
+            rgb: vec![
+                255, 0, 0, /**/ 0, 255, 0, // row 0
+                0, 0, 255, /**/ 255, 255, 255, // row 1
+            ],
+            width: 2,
+            height: 2,
+            index: 0,
+        }
+    }
+
+    #[test]
+    fn pixel_reads_the_right_bytes_for_each_coordinate() {
+        let f = tiny_frame();
+        assert_eq!(f.pixel(0, 0), (255, 0, 0));
+        assert_eq!(f.pixel(1, 0), (0, 255, 0));
+        assert_eq!(f.pixel(0, 1), (0, 0, 255));
+        assert_eq!(f.pixel(1, 1), (255, 255, 255));
+    }
+
+    #[test]
+    fn luminance_uses_bt601_weights() {
+        let f = tiny_frame();
+        // 0.299 R + 0.587 G + 0.114 B, on 0-255 channels.
+        assert!((f.luminance(0, 0) - 0.299 * 255.0).abs() < 1e-3);
+        assert!((f.luminance(1, 0) - 0.587 * 255.0).abs() < 1e-3);
+        assert!((f.luminance(0, 1) - 0.114 * 255.0).abs() < 1e-3);
+        assert!((f.luminance(1, 1) - 255.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn pixel_count_is_width_times_height() {
+        assert_eq!(tiny_frame().pixel_count(), 4);
+    }
+
+    /// The eye must never panic because the environment lacks ffmpeg.
+    /// `ffmpeg_available` answers the question without spawning a decode.
+    #[test]
+    fn ffmpeg_availability_probe_never_panics() {
+        let _ = ffmpeg_available();
+    }
+
+    /// A path that is not a video must come back as an error, never a panic.
+    /// Skips cleanly when ffmpeg is absent — that is a different error and a
+    /// different test.
+    #[test]
+    fn decoding_a_non_video_is_an_error_not_a_panic() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let err = decode_video(Path::new("definitely-not-a-video.txt"), 2.0, 320)
+            .expect_err("a missing/!video path must not decode");
+        assert!(
+            !matches!(err, EyeError::FfmpegNotFound),
+            "ffmpeg is on PATH, so this must not report it missing: {err}"
+        );
+    }
 }
