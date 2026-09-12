@@ -87,15 +87,15 @@ fn extract_year(s: &str) -> Option<i64> {
     let mut i = 0;
     while i + 4 <= bytes.len() {
         if bytes[i].is_ascii_digit() {
-            let run: String = s[i..].chars().take_while(char::is_ascii_digit).collect();
-            if run.len() == 4 {
-                if let Ok(y) = run.parse::<i64>() {
+            let run_len = bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+            if run_len == 4 {
+                if let Ok(y) = s[i..i + 4].parse::<i64>() {
                     if (1500..=2100).contains(&y) {
                         return Some(y);
                     }
                 }
             }
-            i += run.len().max(1);
+            i += run_len.max(1);
         } else {
             i += 1;
         }
@@ -129,7 +129,7 @@ fn truncate_words(s: &str, max: usize) -> String {
         }
         out.push_str(word);
     }
-    out.push('…');
+    out.push('\u{2026}');
     out
 }
 
@@ -143,14 +143,14 @@ pub fn render_dispatch(
     max_chars: usize,
 ) -> String {
     let cite = match (f.year, f.citations) {
-        (Some(y), Some(c)) => format!(" ({y}, {c}× cited)"),
+        (Some(y), Some(c)) => format!(" ({y}, {c}\u{00d7} cited)"),
         (Some(y), None) => format!(" ({y})"),
-        (None, Some(c)) => format!(" ({c}× cited)"),
+        (None, Some(c)) => format!(" ({c}\u{00d7} cited)"),
         (None, None) => String::new(),
     };
     // State flavor: how the medium currently holds the corpus.
     let flavor = format!(
-        " — the field holds it across {num_clusters} cluster{} (Ξ {xi:.2}).",
+        " \u{2014} the field holds it across {num_clusters} cluster{} (\u{039e} {xi:.2}).",
         if num_clusters == 1 { "" } else { "s" },
     );
     let head = format!("From the field: \"{}\"{cite}", f.title);
@@ -160,11 +160,11 @@ pub fn render_dispatch(
     let with_flavor = head.chars().count() + connectors + flavor.chars().count();
     if max_chars > with_flavor + 20 {
         let body = lede(&f.abstract_snippet, max_chars - with_flavor);
-        format!("{head} — {body}.{flavor}")
+        format!("{head} \u{2014} {body}.{flavor}")
     } else {
         // No room for the flavor — keep head + a trimmed lede.
         let body = lede(&f.abstract_snippet, max_chars.saturating_sub(head.chars().count() + connectors).max(10));
-        format!("{head} — {body}.")
+        format!("{head} \u{2014} {body}.")
     }
 }
 
@@ -172,7 +172,7 @@ pub fn render_dispatch(
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "research: Holographic reduced representations (1995) — Tony Plate [IEEE Transactions on Neural Networks]\nAssociative memories represent simple structure. This paper describes a method for richer compositional structure.\nOpenAlex: https://openalex.org/W2157306293 cited_by=672\nConcepts: Convolution, Associative property";
+    const SAMPLE: &str = "research: Holographic reduced representations (1995) \u{2014} Tony Plate [IEEE Transactions on Neural Networks]\nAssociative memories represent simple structure. This paper describes a method for richer compositional structure.\nOpenAlex: https://openalex.org/W2157306293 cited_by=672\nConcepts: Convolution, Associative property";
 
     #[test]
     fn parses_research_memory() {
@@ -195,7 +195,7 @@ mod tests {
         let d = render_dispatch(&f, 0.18, 1, 280);
         assert!(d.chars().count() <= 280, "len {} > 280: {d}", d.chars().count());
         assert!(d.contains("Holographic reduced representations"));
-        assert!(d.contains("Ξ 0.18"));
+        assert!(d.contains("\u{039e} 0.18"));
         assert!(d.contains("1 cluster"));
     }
 
