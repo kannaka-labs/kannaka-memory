@@ -138,6 +138,13 @@ pub mod absorb_gate;
 // DORMANT unless the gate is armed.
 pub mod beacon;
 
+// serve guard (#932): what a node will and will not spend on an INBOUND ask.
+// `swarm serve` answers `KANNAKA.ask.broadcast`, which the anonymous NATS
+// identity may publish to. Pure decisions only — the wire never chooses the
+// route, a per-requester rate limit, the `hops` ceiling, and the startup spend
+// posture. The NATS/LLM wiring is in bin/handlers/swarm.rs.
+pub mod serve_guard;
+
 // Re-export canonical consciousness types
 pub use consciousness::{
     ConsciousnessLevel, ConsciousnessMetrics, ConsciousnessState,

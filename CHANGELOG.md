@@ -2,6 +2,113 @@
 
 ## [Unreleased]
 
+### Fixed — serve: an anonymous ask can no longer choose what it costs (#932)
+
+`swarm serve` answers `KANNAKA.ask.broadcast`, and the anonymous NATS identity may
+publish there. Behind a 0.4 resonance gate the inbound text went straight to the
+node's configured provider: no rate limit, no ceiling, and no distinction between
+the operator's own ask and a stranger's broadcast. A node serving with a paid key
+was a public endpoint for that key. The invariant this closes is not the ADR's
+literal "pin served asks to local providers" — `kannaka-prime`, which *is* the
+public `ask_kannaka` product, answers from a remote gateway on a virtual key
+already capped at $25/30d, and pinning would take it off the air to fix an exposure
+it does not have. What matters is the ceiling, not the locality:
+
+> A served ask must never spend without a ceiling, and must never let the caller
+> choose what it costs.
+
+**The wire never chooses the route.** An inbound ask is answered with this node's
+own `[llm]` provider and model. Any routing-shaped field on the envelope —
+`provider`, `model`, `base_url`, `api_key`, `kind`, `route` — is ignored and named
+in the log, so an ask labelling itself `kind = "reason"` to reach the operator's
+expensive key gets exactly the provider every other ask gets. Nothing on the answer
+path ever read those fields; the point is that a test now holds it there, because
+the providers table (#931) adds a router in the same place.
+
+**A per-requester rate limit, on by default.** 60 asks per requester per hour and
+300 per hour in total, both settable with `KANNAKA_SERVE_ASKS_PER_HOUR` and
+`KANNAKA_SERVE_ASKS_PER_HOUR_TOTAL`, both printed at startup. A refused ask gets a
+short reply naming the limit rather than a timeout, and the refusal is logged once
+per requester per window, not once per ask.
+
+The two ceilings are metered in **different places, on purpose**. The per-requester
+bucket is committed before the resonance probe, because that probe is a full recall
+and is the cheap half of the abuse on a 1-vCPU hub — CPU the caller spends on
+itself. The hourly total is committed past the resonance gate, immediately before
+the model call, so it counts only asks that actually spend. Metering the total up
+front turns the control into a cheaper outage than the problem: `swarm serve`
+decides whether to answer a broadcast *after* the limiter runs, and anon may
+publish there, so a stranger sending ~30-byte non-resonant asks — every one dropped
+by that gate, none of them costing a token — would take the public `ask_kannaka`
+off the air for everybody at one publish every twelve seconds.
+
+A requester is keyed by the **pair** of reply-inbox prefix and declared `from`.
+NATS attaches no publisher identity to a message even on an authenticated
+connection, so **there is no unforgeable identity on this path** and both halves
+are caller-chosen. Keying on `from` alone was not merely evadable, it was aimable:
+three asks declaring `from = "kannaka-prime"` exhausted that peer's bucket, so any
+caller could spend an honest neighbour's quota by claiming its name. The pair means
+a caller can only exhaust the bucket it owns unless it also guesses the victim's
+calling process. That is the most this layer can do, so the startup banner says the
+rest plainly: the per-requester limit keeps honest neighbours from spending each
+other's quota, and the hourly total is the ceiling that holds against a determined
+caller. That key is also attacker-*sized*, since the
+broker's `max_payload` is 64MB: an id over 128 bytes is stored as a hash of itself
+(a hash, not a truncation, so one caller cannot land in another's bucket by sharing
+a prefix), and `serve` refuses an oversized `from` outright before it costs a
+recall. The limiter is therefore bounded in bytes, not just in entries — a cap on
+the number of tracked requesters would have left ~85 asks able to retain ~5.4GB on
+a box with 5.5GB.
+
+**`hops`, ceiling 1 — a hired ask never hires.** The ask envelope gains `hops`; an
+envelope without the field reads as 0, so an old client is unchanged. `serve` marks
+the hop count of the ask it is answering, and the outbound publisher refuses to
+forward one that has already been hired. A wire value is clamped to one above the
+ceiling, and "this process is not serving anything" is an `Option`, never a
+reserved number — otherwise a forged `hops` of `4294967295` would clamp onto that
+reserved value and read back as "I originated this ask", handing the forger the
+budget it was meant to exhaust. No serve path routes onward today, so the refusal
+is dormant by construction: it is here so #931's router lands on a ceiling that is
+already enforced instead of after one.
+
+**Refuse to start unbounded — loudly, not fatally.** `serve` now classifies what it
+can spend. A local brain or a keyless provider is free; a keyed provider with
+`[llm] max_usd_per_day` or `[llm] externally_capped = true` is bounded. A keyed
+provider with neither gets one of two notices, because they are not the same
+situation: against the vendor's own API it is the plain exposure and draws the loud
+banner; through a gateway the operator interposed it draws a single calm line
+saying what is actually known — this node can spend, has declared no ceiling here,
+and reaches its provider through that URL, so set `externally_capped` if the key is
+capped upstream. A gateway is where budgets live, and a false alarm on the one node
+everybody watches is how a banner stops being read. Either way `serve` still
+starts; the hard refusal is opt-in with `KANNAKA_SERVE_REFUSE_UNBOUNDED=1`.
+
+`max_usd_per_day` is **declared, not enforced** — enforcing it needs per-call cost
+accounting, which is #931 — and the banner says so rather than letting a number in
+a config file read as a ceiling. Because the installer writes `provider = "openai"`
+for a local Ollama brain as well as for the hosted gateway, the base URL decides
+locality before the provider string does.
+
+**A reply only ever goes to an inbox.** `reply_to` comes off the wire, so every
+reply in the serve handler could be aimed at a third party — or at an ordinary
+subject. The sharp edge is privilege rather than volume: a serving node
+authenticates with publish `>`, while anon is explicitly denied publish on
+`KANNAKA.work.>`, `KANNAKA.inbox.>` and the JetStream admin subjects, so reflecting
+through a serving node was a way to emit onto subjects the caller may not publish
+to. `serve` now refuses any `reply_to` that is not an `_INBOX.` subject, above
+every reply including the two that predate this work, so it closes the primitive
+rather than only the refusal this change added.
+
+Two diagnostics that an anonymous caller could trigger at will now log once per
+process instead of once per ask: the malformed-reply-to line and the
+"tried to steer the route" line, which also moved below the rate limit. Neither
+was an injection vector, since `sanitize_display` strips control characters and
+truncates, but both were journald volume on demand, and O1 has filled its disk with
+syslog before.
+
+This PR emits no `KANNAKA.events.*` at all, so the 48-character prompt preview the
+activity publisher sends on an anon-readable subject is not extended to served asks.
+
 ### Fixed — GhostSignals: present the stored bearer, and tell the truth about a 409 (#930)
 
 The hub now mints a per-row bearer and returns the plaintext token once

@@ -107,6 +107,86 @@ pub(crate) fn handle_swarm_serve(
             "[swarm serve] recall-only mode (no LLM provider configured) — not serving KANNAKA.ask.*"
         );
     }
+    // #932: `KANNAKA.ask.broadcast` is publishable by the anonymous NATS
+    // identity, so everything below this line is money a stranger can spend.
+    //
+    // ADR-0059 §3 says an inbound ask is "pinned to local providers". Taken
+    // literally that would take `kannaka-prime` — the public `ask_kannaka`
+    // product — off the air, because prime answers from a REMOTE gateway
+    // (ninja-portal.com/v1) on a virtual key already capped at $25/30d. The
+    // invariant that actually matters is the ceiling, not the locality:
+    //
+    //   a served ask must never spend without a ceiling, and must never let
+    //   the caller choose what it costs.
+    //
+    // So: warn loudly when the posture is unbounded, refuse only on request,
+    // and rate-limit per requester unconditionally.
+    let posture = kannaka_memory::serve_guard::spend_posture(
+        &cfg.llm,
+        kannaka_memory::serve_guard::api_key_present(&cfg.llm),
+    );
+    if llm_ok {
+        match &posture {
+            kannaka_memory::serve_guard::SpendPosture::Free { why } => {
+                eprintln!("[swarm serve] spend: free ({why})");
+            }
+            kannaka_memory::serve_guard::SpendPosture::Capped { how } => {
+                eprintln!("[swarm serve] spend: bounded — {how}");
+                eprintln!(
+                    "[swarm serve] NOTE: max_usd_per_day is DECLARED, not enforced by this build (#931 adds per-call cost accounting); the rate limit below is what bounds spend today"
+                );
+            }
+            // A gateway the operator interposed is evidence of a budget — it is
+            // where virtual keys and caps live — so this says what it knows and
+            // does not shout. `kannaka-prime` has exactly this shape, and
+            // shouting at the one node everybody watches, about a key that IS
+            // capped, is how a banner stops being read.
+            kannaka_memory::serve_guard::SpendPosture::UndeclaredGateway { base_url } => {
+                eprintln!(
+                    "[swarm serve] spend: this node can spend and has declared no ceiling here; it reaches its provider through {base_url}. If that key is capped upstream, record it with `[llm] externally_capped = true`; otherwise set `[llm] max_usd_per_day`."
+                );
+                if kannaka_memory::serve_guard::refuse_unbounded_requested() {
+                    eprintln!(
+                        "[swarm serve] KANNAKA_SERVE_REFUSE_UNBOUNDED=1 — refusing to serve with no declared ceiling"
+                    );
+                    process::exit(1);
+                }
+            }
+            kannaka_memory::serve_guard::SpendPosture::Unbounded => {
+                eprintln!("[swarm serve] ============================================================");
+                eprintln!("[swarm serve] WARNING: serving KANNAKA.ask.broadcast with a KEYED provider");
+                eprintln!("[swarm serve] WARNING: against the vendor's own API, and NO declared ceiling");
+                eprintln!("[swarm serve] WARNING: anywhere. The anonymous NATS identity may publish");
+                eprintln!("[swarm serve] WARNING: there, so this key is spendable by anyone on the bus");
+                eprintln!("[swarm serve] WARNING: (#932). Declare a ceiling in config.toml:");
+                eprintln!("[swarm serve] WARNING:   [llm] max_usd_per_day = 2.00");
+                eprintln!("[swarm serve] WARNING:   [llm] externally_capped = true   # if capped upstream");
+                eprintln!("[swarm serve] WARNING: or set KANNAKA_SERVE_REFUSE_UNBOUNDED=1 to refuse to start.");
+                eprintln!("[swarm serve] ============================================================");
+                if kannaka_memory::serve_guard::refuse_unbounded_requested() {
+                    eprintln!(
+                        "[swarm serve] KANNAKA_SERVE_REFUSE_UNBOUNDED=1 — refusing to serve unbounded"
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+    }
+
+    // Per-requester rate limit — the actual abuse control. On by default; the
+    // numbers are printed so the knob is discoverable from the log alone.
+    let mut rate_limit = kannaka_memory::serve_guard::ServeRateLimiter::from_env();
+    if llm_ok {
+        eprintln!(
+            "[swarm serve] rate limit: {}/requester/hour, {}/hour total (KANNAKA_SERVE_ASKS_PER_HOUR, KANNAKA_SERVE_ASKS_PER_HOUR_TOTAL)",
+            rate_limit.per_requester(),
+            rate_limit.global_limit()
+        );
+        eprintln!(
+            "[swarm serve] NOTE: NATS attaches NO publisher identity to a message, even on an authenticated connection, so there is no unforgeable identity on this path. A requester is keyed by the PAIR (reply-inbox prefix, declared `from`); both halves are caller-chosen, so the per-requester limit keeps honest neighbours from spending each other's quota — it does not bound a determined caller. The per-hour TOTAL is the ceiling that does."
+        );
+    }
+
     eprintln!("[swarm serve] press Ctrl+C to stop");
 
     // Single subscription per subject; in v1 we run them sequentially via
@@ -308,7 +388,7 @@ pub(crate) fn handle_swarm_serve(
                 SubEvent::Msg(msg) => {
                     _handle_serve_msg(
                         sys, cfg, &transport, &msg, /*is_broadcast*/ false, threshold, &agent_id,
-                        &nats_url,
+                        &nats_url, &mut rate_limit,
                     );
                 }
                 SubEvent::Timeout => {}
@@ -332,6 +412,7 @@ pub(crate) fn handle_swarm_serve(
                         threshold,
                         &agent_id,
                         &nats_url,
+                        &mut rate_limit,
                     );
                 }
                 SubEvent::Timeout => {}
@@ -539,6 +620,27 @@ fn _neighbors_reply(
     }
 }
 
+/// Log a line the first time it happens in this process, and never again.
+///
+/// For diagnostics an anonymous caller can trigger at will. `swarm serve`
+/// answers a subject anon may publish to, so any unconditional `eprintln!` on
+/// a malformed inbound message is journald volume on demand — and O1 has
+/// filled its disk with syslog before. Once is enough to diagnose a client
+/// that genuinely has the wrong shape; the rest is the attack.
+#[cfg(feature = "nats")]
+fn warn_once(flag: &std::sync::atomic::AtomicBool, line: &str) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{line}");
+    }
+}
+
+#[cfg(feature = "nats")]
+static NO_REPLY_TO_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "nats")]
+static BAD_REPLY_TO_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(feature = "nats")]
 #[allow(clippy::too_many_arguments)]
 fn _handle_serve_msg(
@@ -550,17 +652,46 @@ fn _handle_serve_msg(
     threshold: f32,
     serve_agent_id: &str,
     nats_url: &str,
+    rate_limit: &mut kannaka_memory::serve_guard::ServeRateLimiter,
 ) {
     let reply_to = match &msg.reply_to {
         Some(r) => r.clone(),
         None => {
-            eprintln!(
-                "[swarm serve] msg without reply-to on {} — ignoring",
-                msg.subject
+            // Once per process, not once per ask: anon may publish
+            // KANNAKA.ask.broadcast, so an attacker-triggered log line with no
+            // limit of its own is journald volume on demand. This box has
+            // flooded syslog before.
+            warn_once(
+                &NO_REPLY_TO_WARNED,
+                &format!(
+                    "[swarm serve] msg without reply-to on {} — ignoring",
+                    msg.subject
+                ),
             );
             return;
         }
     };
+
+    // #932: `reply_to` is caller-chosen, so every reply below can be aimed at a
+    // third party — or at an ordinary subject. The sharp edge is privilege, not
+    // volume: this node authenticates with publish `>`, while anon is denied
+    // publish on KANNAKA.work.>, KANNAKA.inbox.> and the JetStream admin
+    // subjects, so reflecting through here would emit onto subjects the caller
+    // may not publish to itself. Refuse anything that is not a request inbox.
+    //
+    // Placed above every reply, including the two that predate this work, so it
+    // closes the primitive rather than only the refusal this change added. The
+    // drop is silent past the first, for the reason directly above.
+    if !kannaka_memory::serve_guard::is_valid_reply_inbox(&reply_to) {
+        warn_once(
+            &BAD_REPLY_TO_WARNED,
+            &format!(
+                "[swarm serve] refusing to reply to {} — only _INBOX.> is a reply subject (#932). Further occurrences are not logged.",
+                kannaka_memory::sanitize_display(&reply_to)
+            ),
+        );
+        return;
+    }
 
     let req: serde_json::Value = match serde_json::from_slice(&msg.payload) {
         Ok(v) => v,
@@ -581,6 +712,103 @@ fn _handle_serve_msg(
         return;
     }
 
+    // An id that long is not a name, it is a payload: the broker's max_payload
+    // is 64MB, so `from` is attacker-SIZED as well as attacker-chosen. Refuse it
+    // here, before it costs a recall. (`requester_key` hashes an oversized id
+    // anyway, so the limiter is safe on its own — this is the cheaper refusal,
+    // not the bound.)
+    if kannaka_memory::serve_guard::id_is_oversized(from) {
+        let err = serde_json::json!({
+            "from": serve_agent_id,
+            "error": format!(
+                "`from` is {} bytes; this node accepts at most {}",
+                from.len(),
+                kannaka_memory::serve_guard::MAX_REQUESTER_ID_BYTES
+            ),
+        });
+        let _ = transport.reply(&reply_to, err.to_string().as_bytes());
+        return;
+    }
+
+    // #932, behaviour 2: rate limit BEFORE the resonance probe. The probe is a
+    // full recall against the medium, so it is itself the cheap half of the
+    // abuse — metering after it would leave the 1-vCPU hub payable in CPU even
+    // when it never spends a token.
+    //
+    // Only the REQUESTER's bucket is committed here. The hourly ceiling is
+    // committed further down, past the resonance gate, at the point the ask
+    // actually reaches the model — see `ServeRateLimiter::check`. Metering the
+    // ceiling here instead made a stranger's ~30-byte non-resonant publish, one
+    // every twelve seconds, enough to take the public ask_kannaka off the air
+    // for everybody: an outage cheaper than the abuse it was guarding.
+    //
+    // Keyed by the envelope's `from`, else the reply-inbox prefix. Both are
+    // caller-chosen (NATS core carries no publisher identity on a message), so
+    // this bounds an honest neighbour precisely and a rotating caller only via
+    // the hourly TOTAL. The startup banner says exactly that.
+    let requester =
+        kannaka_memory::serve_guard::requester_key(Some(from), Some(reply_to.as_str()));
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let decision = rate_limit.check(&requester, now_secs);
+    if let Some(refusal) = decision.refusal_text() {
+        // Logged once per requester per window, not once per ask: a caller
+        // hammering the bus must not be able to drive our log volume either.
+        let first = matches!(
+            decision,
+            kannaka_memory::serve_guard::RateDecision::Requester { first_in_window: true, .. }
+                | kannaka_memory::serve_guard::RateDecision::Global { first_in_window: true, .. }
+                | kannaka_memory::serve_guard::RateDecision::TooManyRequesters { .. }
+        );
+        if first {
+            eprintln!(
+                "[swarm serve] refusing {}: {} (silent for the rest of this window)",
+                kannaka_memory::sanitize_display(&requester),
+                refusal
+            );
+        }
+        // A short, polite reply beats silence: the caller learns it was throttled
+        // rather than timing out and retrying. It costs one small publish on a
+        // subject only that caller is listening to.
+        let err = serde_json::json!({ "from": serve_agent_id, "error": refusal });
+        let _ = transport.reply(&reply_to, err.to_string().as_bytes());
+        return;
+    }
+
+    // #932, behaviour 1: the wire never chooses the route. Provider and model
+    // come from this node's own `[llm]`; the envelope is read only to SAY what
+    // was ignored. An ask labelling itself `kind = "reason"` to reach the
+    // operator's expensive key gets the same provider as every other ask.
+    //
+    // Nothing on the answer path below has ever consulted these fields — this
+    // is the invariant made explicit and testable, because #931 adds a router
+    // right here and "we happen not to read it" is not a property a test holds.
+    //
+    // BELOW the rate limit, not above it. This line is emitted on attacker
+    // choice (any routing-shaped field on the envelope) and embeds a
+    // wire-supplied id, so above the limiter it was one unmetered journald line
+    // per ask, for free, from anyone on the bus.
+    let route = kannaka_memory::serve_guard::resolve_served_route(&cfg.llm, &req);
+    if !route.ignored_wire_fields.is_empty() {
+        eprintln!(
+            "[swarm serve] {} tried to steer the route ({}) — ignored; answering with {}/{}",
+            kannaka_memory::sanitize_display(from),
+            route.ignored_wire_fields.join(", "),
+            route.provider,
+            route.model
+        );
+    }
+
+    // #932, behaviour 3: `hops`, ceiling 1 — a hired ask never hires. Absent
+    // field = 0, so an envelope written before this field existed is a
+    // first-hop ask and behaves exactly as it always did. The cell is read by
+    // the outbound ask publisher (`ask --remote`), which refuses to forward
+    // once the ceiling is reached; it is cleared on every exit path below.
+    let inbound_hops = kannaka_memory::serve_guard::hops_of(&req);
+    kannaka_memory::serve_guard::set_serving_hops(Some(inbound_hops));
+
     // Self-throttle on broadcast: only reply if local recall has resonance ≥ threshold.
     if is_broadcast {
         let probe = recall_q.unwrap_or(text);
@@ -588,6 +816,7 @@ fn _handle_serve_msg(
         let top = res.first().map(|r| r.strength).unwrap_or(0.0);
         if top < threshold {
             eprintln!("[swarm serve] broadcast from {from}: top resonance {top:.3} < threshold {threshold:.2} — staying quiet");
+            kannaka_memory::serve_guard::set_serving_hops(None);
             return;
         }
         eprintln!(
@@ -627,6 +856,12 @@ fn _handle_serve_msg(
     }
     let cfg = &eff;
 
+    // #932: the hourly ceiling is committed HERE — past the resonance gate,
+    // immediately before the model call — so it counts asks that actually
+    // spend. An ask the gate dropped cost one recall and nothing else, and must
+    // not be able to exhaust the node's hour on everybody else's behalf.
+    rate_limit.commit_global(now_secs);
+
     let result = match mode {
         kannaka_memory::agent::RemoteAskMode::Attention => {
             kannaka_memory::agent::ask_attention(sys, cfg, text)
@@ -638,6 +873,9 @@ fn _handle_serve_msg(
             kannaka_memory::agent::ask_notools_ex(sys, cfg, text, recall_q)
         }
     };
+    // The hop budget covers the ANSWER, not the reply write-back: past this
+    // point nothing can hire another node on this ask's behalf.
+    kannaka_memory::serve_guard::set_serving_hops(None);
     // "from" is the id this serve loop is actually answering as (the
     // --agent-id override when given), not unconditionally cfg.agent.id.
     // `mode_used` is additive: an old client ignores it, a new one uses its
