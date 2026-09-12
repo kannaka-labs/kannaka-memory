@@ -61,8 +61,7 @@ pub fn rank_correlation_01(pairs: &[(f32, f32)]) -> f32 {
     if pairs.len() < 3 {
         return 0.5;
     }
-    let xs: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-    let ys: Vec<f32> = pairs.iter().map(|p| p.1).collect();
+    let (xs, ys): (Vec<f32>, Vec<f32>) = pairs.iter().copied().unzip();
     let rx = average_ranks(&xs);
     let ry = average_ranks(&ys);
     let n = rx.len() as f32;
