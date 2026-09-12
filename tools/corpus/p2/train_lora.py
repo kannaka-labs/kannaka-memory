@@ -11,6 +11,15 @@ converts to GGUF + quantizes with llama.cpp so debain2's ollama can serve it
       --qlora --epochs 2 --lr 1e-4 --r 32 --max-len 2048 --merge --gguf q4_K_M
   python train_lora.py --base Qwen/Qwen2.5-0.5B-Instruct --data ~/sft --out /tmp/smoke \
       --max-steps 4 --max-len 256 --r 4 --cpu-smoke
+  python train_lora.py --base DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU \
+      --data ~/sft --out ~/run-27b --qlora --epochs 2 --r 32 \
+      --chat-template-kwargs '{"enable_thinking": false}'   # VL-wrapped hybrid base: text-only, no <think>
+
+The base is not assumed anywhere: LoRA targets come from base_info.LORA_TARGET_REGEX
+(dense q/k/v/o and hybrid in_proj_qkv/in_proj_z/out_proj alike; vision and MTP tensors
+never), AutoModelForCausalLM unwraps a vision-language checkpoint to its text model
+(transformers >= 5, the qwen3_5 'VLM compatibility' mapping), and the manifest records
+the parameter count so the card can say what size it is (kannaka-memory #926).
 
 Metric: held-out loss / perplexity on the SAME lines every run (prep_sft's
 deterministic hold-out), before and after training. Generation samples for
@@ -27,6 +36,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from base_info import LORA_TARGET_REGEX, lora_targets  # noqa: E402
 
 
 def log(msg):
@@ -58,7 +70,15 @@ def main(argv=None) -> int:
     ap.add_argument("--gguf", default=None, help="quant type (q4_K_M, q8_0, f16) -> <out>/gguf/ via llama.cpp")
     ap.add_argument("--llama-cpp", default=os.environ.get("LLAMA_CPP", str(Path.home() / "llama.cpp")))
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--target-modules", default=None,
+                    help="regex or comma list for PEFT; default base_info.LORA_TARGET_REGEX (fits Qwen2.5 and Qwen3.5/3.8)")
+    ap.add_argument("--chat-template-kwargs", default=None,
+                    help="JSON passed to apply_chat_template, e.g. {\"enable_thinking\": false} for thinking-mode bases")
+    ap.add_argument("--max-sane-ppl", type=float, default=2000.0,
+                    help="abort before training if the untouched base scores worse than this on the hold-out: "
+                         "the weights did not load (wrong class / prefix), and every metered minute after is waste")
     a = ap.parse_args(argv)
+    ct_kwargs = json.loads(a.chat_template_kwargs) if a.chat_template_kwargs else {}
 
     import torch
     from datasets import Dataset
@@ -91,9 +111,19 @@ def main(argv=None) -> int:
     if a.qlora:
         from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model)
+    params_b = sum(p.numel() for p in model.parameters()) / 1e9
+    if a.target_modules and "," in a.target_modules:
+        targets = [t.strip() for t in a.target_modules.split(",") if t.strip()]
+    else:
+        targets = a.target_modules or LORA_TARGET_REGEX
+    chosen = lora_targets(n for n, _ in model.named_modules()) if isinstance(targets, str) else list(targets)
+    log(f"base params {params_b:.2f}B; model class {type(model).__name__}; lora targets {len(chosen)} modules "
+        f"(leaves: {sorted({c.rsplit(chr(46), 1)[-1] for c in chosen})})")
+    if not chosen:
+        log("no LoRA target matched this base; pass --target-modules")
+        return 2
     lcfg = LoraConfig(r=a.r, lora_alpha=a.alpha or 2 * a.r, lora_dropout=a.dropout, bias="none",
-                      task_type="CAUSAL_LM",
-                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+                      task_type="CAUSAL_LM", target_modules=targets)
     model = get_peft_model(model, lcfg)
     model.print_trainable_parameters()
 
@@ -108,7 +138,7 @@ def main(argv=None) -> int:
         with torch.no_grad():
             for r in hold_rows:
                 ids = tok.apply_chat_template(r["messages"], tokenize=True, return_tensors="pt",
-                                              truncation=True, max_length=a.max_len)
+                                              truncation=True, max_length=a.max_len, **ct_kwargs)
                 if not isinstance(ids, torch.Tensor):
                     ids = ids["input_ids"]
                 ids = ids.to(m.device)
@@ -119,6 +149,10 @@ def main(argv=None) -> int:
 
     before = heldout_loss(model)
     log(f"holdout loss BEFORE={before:.4f} ppl={math.exp(before):.2f}")
+    if math.exp(before) > a.max_sane_ppl and not a.cpu_smoke:
+        log(f"base perplexity {math.exp(before):.0f} exceeds --max-sane-ppl {a.max_sane_ppl:.0f}: the base did not load "
+            "as a language model (check the class/prefix mapping for this checkpoint). Refusing to spend on it.")
+        return 3
 
     # transformers/trl rename fields between releases (warmup_ratio -> warmup_steps,
     # max_seq_length -> max_length, ...). Build the kwargs and keep only the ones
@@ -133,6 +167,7 @@ def main(argv=None) -> int:
         warmup_ratio=0.03, logging_steps=5, save_strategy="epoch", bf16=cuda, fp16=False,
         gradient_checkpointing=cuda, max_length=a.max_len, max_seq_length=a.max_len, packing=False,
         report_to=[], seed=a.seed, dataloader_pin_memory=cuda, use_cpu=not cuda,
+        chat_template_kwargs=ct_kwargs or None,
     )
     if "warmup_steps" in known:
         want.pop("warmup_ratio", None)
@@ -156,7 +191,7 @@ def main(argv=None) -> int:
     samples = []
     model.eval()
     for r in hold_rows[: a.eval_samples]:
-        prompt = tok.apply_chat_template(r["messages"][:-1], tokenize=False, add_generation_prompt=True)
+        prompt = tok.apply_chat_template(r["messages"][:-1], tokenize=False, add_generation_prompt=True, **ct_kwargs)
         ids = tok(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             g = model.generate(**ids, max_new_tokens=48 if a.cpu_smoke else 200, do_sample=True,
@@ -166,7 +201,10 @@ def main(argv=None) -> int:
                         "generated": tok.decode(g[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)})
     (out / "samples.json").write_text(json.dumps(samples, indent=1, ensure_ascii=False), encoding="utf-8")
 
-    manifest = {"base": a.base, "train": len(train_rows), "holdout": len(hold_rows), "lora": {"r": a.r, "alpha": a.alpha or 2 * a.r},
+    manifest = {"base": a.base, "params_b": round(params_b, 2), "model_class": type(model.base_model.model).__name__,
+                "lora_targets": sorted({c.rsplit(chr(46), 1)[-1] for c in chosen}), "chat_template_kwargs": ct_kwargs,
+                "trained_at": time.strftime("%Y-%m-%d"),
+                "train": len(train_rows), "holdout": len(hold_rows), "lora": {"r": a.r, "alpha": a.alpha or 2 * a.r},
                 "epochs": a.epochs, "max_steps": a.max_steps, "lr": a.lr, "qlora": a.qlora,
                 "holdout_loss": {"before": before, "after": after}, "holdout_ppl": {"before": math.exp(before), "after": math.exp(after)},
                 "seconds": round(time.time() - t0), "adapter": str(adapter), "cuda": cuda,
