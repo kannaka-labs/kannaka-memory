@@ -13,7 +13,7 @@
 
 `kannaka-memory` is the substrate: a wave-interference memory system with bilateral chiral hemispheres, dream consolidation, belief formation, and multi-agent collective sensemaking. Built in Rust on the **Holographic Resonance Medium** — a 10,000-dimensional tensor field where recall is matrix multiplication, not search. Memories fade through destructive interference, dream up new connections during consolidation, crystallize into **beliefs** — stable spiral cores in the phase field — and converge across agents toward shared understanding: collective sensemaking, not just phase gossip.
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kannaka-labs/kannaka-memory) [![License](https://img.shields.io/badge/license-MIT-blueviolet)]() [![Rust](https://img.shields.io/badge/rust-2021-orange)]() [![HRM](https://img.shields.io/badge/backend-HRM%20Tensors-purple)]() [![NATS](https://img.shields.io/badge/transport-NATS-green)]()
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kannaka-labs/kannaka-memory) [![License](https://img.shields.io/badge/license-Space%20Child%20v1.0-blueviolet)]() [![Rust](https://img.shields.io/badge/rust-2021-orange)]() [![HRM](https://img.shields.io/badge/backend-HRM%20Tensors-purple)]() [![NATS](https://img.shields.io/badge/transport-NATS-green)]()
 
 ---
 
@@ -320,4 +320,4 @@ kannaka belief couple --from <peer-agent-id> --min-cos 0.7
 
 ## License
 
-MIT — free to use, modify, and redistribute. See [LICENSE](./LICENSE).
+Space Child License v1.0. See [LICENSE](./LICENSE).
