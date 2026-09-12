@@ -37,7 +37,7 @@ use rayon::prelude::*;
 /// resonance ranking + Φ/Kuramoto metrics. Clamp every additive boost to the
 /// same ceiling. `HrmStore::sync_cache_to_medium` copies amplitude straight
 /// into `store.energy`, so this also bounds the on-disk energy.
-const AMPLITUDE_CEILING: f32 = 2.0;
+pub(crate) const AMPLITUDE_CEILING: f32 = 2.0;
 
 /// Classification of interference between two memories.
 #[derive(Debug, Clone, Copy, PartialEq)]

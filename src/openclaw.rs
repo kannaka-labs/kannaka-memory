@@ -33,6 +33,85 @@ pub enum SystemError {
 }
 
 // ---------------------------------------------------------------------------
+// Reinforce-on-repeat
+// ---------------------------------------------------------------------------
+
+/// Fraction of the remaining gap to the ceiling that one repeat closes.
+///
+/// The curve is `a' = a + GAIN·(CEILING − a)`, so after `n` repeats from `a₀`
+/// the amplitude is `CEILING − (CEILING − a₀)·(1 − GAIN)ⁿ`. Three properties
+/// are why it was chosen over "add a constant":
+///
+/// 1. **Monotone** — a repeat never weakens a memory, so the count and the
+///    strength never disagree about which fact the world insists on.
+/// 2. **Diminishing** — the tenth sighting moves the amplitude ~0.075× as far
+///    as the first. Salience is a claim about relative frequency, and a linear
+///    rule lets a cron job that re-asserts the same line beat a fact a human
+///    told you once.
+/// 3. **Bounded by construction, not by a clamp** — the gap to the ceiling
+///    shrinks geometrically, so no number of repeats can carry the amplitude
+///    past `AMPLITUDE_CEILING`, the same ceiling dream consolidation's
+///    additive boosts respect. A fact asserted 500 times can dominate the
+///    field no more than the strongest dream-strengthened memory already can.
+///    (The explicit clamp below is belt-and-braces against f32 rounding at
+///    the very top of the range; the curve alone never overshoots.)
+const REINFORCE_GAIN: f32 = 0.25;
+
+/// Amplitude a repeated memory approaches but never exceeds. Shared with dream
+/// consolidation so reinforcement and dreaming cannot disagree about the top of
+/// the scale (`HrmStore::sync_cache_to_medium` copies amplitude into
+/// `store.energy`, so this bounds the on-disk energy too).
+const REINFORCE_CEILING: f32 = crate::consolidation::AMPLITUDE_CEILING;
+
+/// Environment escape hatch. Reinforcement is ON by default; set
+/// `KANNAKA_REINFORCE_ON_REPEAT=0` (or `false`/`off`) to restore the old
+/// insert-every-time behaviour for a whole process.
+fn reinforce_on_repeat_enabled() -> bool {
+    match std::env::var("KANNAKA_REINFORCE_ON_REPEAT") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Err(_) => true,
+    }
+}
+
+/// One memory that a duplicate-collapse pass would fold, or folded.
+#[derive(Debug, Clone)]
+pub struct CollapsedGroup {
+    /// The memory kept — the oldest of the set, which is also the one
+    /// `remember` reinforces from now on, so a later repeat lands on this row.
+    pub keeper: Uuid,
+    /// The ids folded into the keeper (dropped on apply, reported on dry run).
+    pub folded: Vec<Uuid>,
+    /// The keeper's `times_seen` after folding: how many copies existed.
+    pub times_seen_after: u32,
+    pub amplitude_before: f32,
+    pub amplitude_after: f32,
+    /// First 80 characters of the shared content, for the operator's report.
+    pub preview: String,
+}
+
+/// Result of `collapse_exact_duplicates`.
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateCollapseReport {
+    /// True when the store was actually mutated.
+    pub applied: bool,
+    pub scanned: usize,
+    /// Groups of 2+ memories sharing exactly the same trimmed content.
+    pub groups: Vec<CollapsedGroup>,
+    /// Rows left alone because deleting them would dangle ADR-0049 facet
+    /// structure (a facet, or a parent already decomposed into facets).
+    pub skipped_facet_structured: usize,
+    /// Deletions that failed (apply mode only).
+    pub errors: usize,
+}
+
+impl DuplicateCollapseReport {
+    /// Memories that would be / were removed.
+    pub fn duplicates(&self) -> usize {
+        self.groups.iter().map(|g| g.folded.len()).sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Simplified output types
 // ---------------------------------------------------------------------------
 
@@ -409,7 +488,256 @@ impl KannakaMemorySystem {
     /// - Fano group assignment → fold line selection
     /// - Optic chiasm routing (enters right hemisphere)
     /// - Callosal echo to left hemisphere
+    ///
+    /// ## Reinforce-on-repeat
+    ///
+    /// Remembering text this system already holds does NOT insert a second
+    /// copy. The existing memory is strengthened, its repeat count raised, and
+    /// ITS id returned. The contract callers depend on is unchanged — a `Uuid`
+    /// for a memory that now contains this text — and the reason is measured,
+    /// not aesthetic: five identical copies of one verdict each sat at strength
+    /// 0.400 instead of one memory that had grown, and a top-10 recall came
+    /// back holding five distinct facts because one sentence occupied six of
+    /// the ten slots. Duplication made the view shallower. In a resonance
+    /// medium a signal arriving again should build amplitude.
     pub fn remember_with_category(&mut self, text: &str, category: &str, importance: f64) -> Result<Uuid, SystemError> {
+        if reinforce_on_repeat_enabled() {
+            if let Some(existing) = self.find_exact_repeat(text) {
+                self.reinforce(&existing)?;
+                // The fact was asserted again; downstream consumers of the flux
+                // stream learn that the same way they learn about a first
+                // sighting. The id they receive is the one that now holds it.
+                self.flux_publish_memory(&existing, category, text);
+                if self.auto_save {
+                    self.save()?;
+                }
+                // No count change, so no status-cache refresh is owed here
+                // (#730 refreshes because absorb changes the memory count).
+                return Ok(existing);
+            }
+        }
+        self.absorb_new(text, category, importance)
+    }
+
+    /// Find the memory whose stored content is EXACTLY this text after trimming.
+    ///
+    /// **Exact match only, deliberately.** Fuzzy merging of near-identical
+    /// memories already exists and already has a home: dream consolidation's
+    /// `stage_strengthen` / resonance-merge decide, with the whole field in
+    /// view and a snapshot behind them, that two wavefronts are the same
+    /// thought. Doing that at write time would mean `remember` silently
+    /// deciding your new sentence "was" an old one on a similarity threshold —
+    /// lossy, surprising, and unreviewable. Byte-identical text is the only
+    /// repeat the write path can claim with certainty.
+    ///
+    /// Ties break on the OLDEST memory (then on id, so the choice is stable
+    /// across HashMap iteration order). That is the same keeper rule
+    /// `collapse_exact_duplicates` uses, so a cleanup pass and a later repeat
+    /// land on the same row.
+    pub fn find_exact_repeat(&self, text: &str) -> Option<Uuid> {
+        let needle = text.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        let memories = self.engine.store.all_memories().ok()?;
+        memories
+            .into_iter()
+            // A hallucinated memory is the medium's own invention, not
+            // something the world showed us; re-remembering real text must not
+            // reinforce a dream's confabulation of it.
+            .filter(|m| !m.hallucinated && m.content.trim() == needle)
+            .min_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)))
+            .map(|m| m.id)
+    }
+
+    /// Strengthen an existing memory because the world showed it again.
+    /// Returns the new `times_seen`.
+    pub fn reinforce(&mut self, id: &Uuid) -> Result<u32, SystemError> {
+        let now = Utc::now();
+        let mem = self
+            .engine
+            .store
+            .get_mut(id)?
+            .ok_or(StoreError::NotFound(*id))?;
+
+        // Asymptotic approach to the ceiling — see REINFORCE_GAIN for why this
+        // curve and not a constant increment.
+        if mem.amplitude < REINFORCE_CEILING {
+            mem.amplitude += REINFORCE_GAIN * (REINFORCE_CEILING - mem.amplitude);
+            if mem.amplitude > REINFORCE_CEILING {
+                mem.amplitude = REINFORCE_CEILING;
+            }
+        }
+        mem.times_seen = mem.times_seen.saturating_add(1);
+        mem.updated_at = Some(now);
+        mem.sync_version = mem.sync_version.saturating_add(1);
+        Ok(mem.times_seen)
+    }
+
+    /// Absorb a NEW memory even if identical text is already held.
+    ///
+    /// The explicit opt-out from reinforce-on-repeat, for a caller that
+    /// genuinely needs one row per call. Nothing in this repository needs it
+    /// today (every `remember*` call site either logs the returned id or uses
+    /// it to stamp modality/temporal bounds on the row it just wrote, all of
+    /// which stay correct when the row is an existing one) — it exists so that
+    /// a future caller with that requirement says so in its own code rather
+    /// than having the write path guess.
+    pub fn remember_forcing_new(
+        &mut self,
+        text: &str,
+        category: &str,
+        importance: f64,
+    ) -> Result<Uuid, SystemError> {
+        self.absorb_new(text, category, importance)
+    }
+
+
+    /// Collapse existing sets of byte-identical memories into one.
+    ///
+    /// This is the retrospective half of reinforce-on-repeat: the write path
+    /// stops NEW duplicates, this folds the ones already on disk. It collapses
+    /// rather than deletes, because the duplicate set is itself evidence — five
+    /// copies mean the world showed you that fact five times, and a cleanup
+    /// that merely deleted four of them would throw away the one useful thing
+    /// the accident encoded. So the keeper inherits the count, and its
+    /// amplitude is advanced along the same curve `reinforce` uses, as though
+    /// those repeats had arrived through the fixed write path all along.
+    ///
+    /// The keeper is the OLDEST member (ties on id) — the same rule
+    /// `find_exact_repeat` uses, so the next repeat of that text lands on the
+    /// row this pass kept.
+    ///
+    /// `apply = false` is a dry run: identical counting, nothing mutated.
+    /// **Never call this from a scheduled path.** It is operator-invoked only.
+    pub fn collapse_exact_duplicates(&mut self, apply: bool) -> Result<DuplicateCollapseReport, SystemError> {
+        use std::collections::HashMap;
+
+        let mut report = DuplicateCollapseReport { applied: apply, ..Default::default() };
+
+        // Rows carrying ADR-0049 facet structure are untouchable: deleting a
+        // decomposed parent dangles its facets, deleting a facet drops an atom
+        // recall depends on. Excluded from grouping entirely, so they are
+        // neither folded away nor chosen as a keeper whose siblings vanish.
+        let protected = self.engine.store.facet_structured_ids();
+
+        // Snapshot first — the borrow of `all_memories` cannot outlive the
+        // mutations below.
+        struct Row { id: Uuid, content: String, created_at: DateTime<Utc>, amplitude: f32, times_seen: u32, updated_at: Option<DateTime<Utc>> }
+        let rows: Vec<Row> = {
+            let memories = self.engine.store.all_memories()?;
+            report.scanned = memories.len();
+            memories
+                .into_iter()
+                .filter(|m| !m.hallucinated)
+                .filter(|m| {
+                    if protected.contains(&m.id) {
+                        report.skipped_facet_structured += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .map(|m| Row {
+                    id: m.id,
+                    content: m.content.trim().to_string(),
+                    created_at: m.created_at,
+                    amplitude: m.amplitude,
+                    times_seen: m.times_seen,
+                    updated_at: m.updated_at,
+                })
+                .collect()
+        };
+
+        let mut by_content: HashMap<String, Vec<Row>> = HashMap::new();
+        for row in rows {
+            if row.content.is_empty() {
+                continue;
+            }
+            by_content.entry(row.content.clone()).or_default().push(row);
+        }
+
+        // Deterministic report order: biggest duplicate sets first, then by
+        // content, so two runs on the same store print the same thing.
+        let mut groups: Vec<(String, Vec<Row>)> =
+            by_content.into_iter().filter(|(_, v)| v.len() > 1).collect();
+        groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+
+        for (content, mut members) in groups {
+            members.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+            let keeper_id = members[0].id;
+
+            // Start from the STRONGEST member, not the keeper's own amplitude:
+            // the keeper is the oldest, and decay/dreaming may have left it the
+            // weakest of the set. Collapsing must never lose strength the store
+            // already held.
+            let amplitude_before = members.iter().fold(f32::MIN, |acc, m| acc.max(m.amplitude));
+            // Each folded copy is one repeat that the write path should have
+            // absorbed; replay the curve once per copy.
+            let mut amplitude_after = amplitude_before;
+            for _ in 1..members.len() {
+                if amplitude_after < REINFORCE_CEILING {
+                    amplitude_after += REINFORCE_GAIN * (REINFORCE_CEILING - amplitude_after);
+                }
+            }
+            if amplitude_after > REINFORCE_CEILING {
+                amplitude_after = REINFORCE_CEILING;
+            }
+            // The copies' own counts add up: a set of five rows one of which
+            // was already reinforced twice means the fact was seen six times.
+            let times_seen_after: u32 = members
+                .iter()
+                .fold(0u32, |acc, m| acc.saturating_add(m.times_seen.max(1)));
+            let newest_update = members.iter().filter_map(|m| m.updated_at).max();
+
+            let folded: Vec<Uuid> = members[1..].iter().map(|m| m.id).collect();
+
+            if apply {
+                if let Some(mem) = self.engine.store.get_mut(&keeper_id)? {
+                    mem.amplitude = amplitude_after;
+                    mem.times_seen = times_seen_after;
+                    mem.updated_at = newest_update.or(Some(Utc::now()));
+                    mem.sync_version = mem.sync_version.saturating_add(1);
+                }
+                for id in &folded {
+                    match self.engine.store.delete(id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("[dedupe] {id} vanished before it could be folded");
+                            report.errors += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("[dedupe] could not fold {id}: {e}");
+                            report.errors += 1;
+                        }
+                    }
+                }
+            }
+
+            report.groups.push(CollapsedGroup {
+                keeper: keeper_id,
+                folded,
+                times_seen_after,
+                amplitude_before,
+                amplitude_after,
+                preview: content.chars().take(80).collect(),
+            });
+        }
+
+        if apply && !report.groups.is_empty() {
+            self.engine.store.flush().map_err(SystemError::Store)?;
+            // The memory count moved, so Observatory's fast-path cache is now
+            // wrong — same obligation `forget` has (#730).
+            self.refresh_status_cache_counts();
+        }
+
+        Ok(report)
+    }
+
+    /// The insert half of `remember_with_category`: unconditionally absorb a new
+    /// wavefront. Split out so `remember_forcing_new` can reach it without
+    /// duplicating the HRM-native/fallback logic.
+    fn absorb_new(&mut self, text: &str, category: &str, importance: f64) -> Result<Uuid, SystemError> {
         // Try HRM-native path first
         let id = match self.engine.store.absorb(text, importance as f32, Some(category)) {
             Ok(id) => {
@@ -1940,6 +2268,270 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         env::temp_dir().join(format!("kannaka_octest_{}_{}", name, Uuid::new_v4()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Reinforce-on-repeat
+    // -----------------------------------------------------------------------
+
+    const FACT: &str = "rogue posted the colony-one verdict";
+
+    /// THE behaviour. Remembering held text returns the id already held and
+    /// makes that memory stronger — it does not insert a second copy.
+    #[test]
+    fn reinforce_exact_repeat_returns_same_id_and_raises_strength() {
+        let dir = temp_dir("reinforce_same_id");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        let first = sys.remember(FACT).unwrap();
+        let before = sys.get_memory(&first).unwrap().unwrap().amplitude;
+
+        let second = sys.remember(FACT).unwrap();
+
+        assert_eq!(second, first, "a repeat must return the id already held");
+        assert_eq!(sys.all_memories().unwrap().len(), 1, "no second copy");
+
+        let mem = sys.get_memory(&first).unwrap().unwrap();
+        assert!(
+            mem.amplitude > before,
+            "a repeat must strengthen: {} -> {}",
+            before,
+            mem.amplitude
+        );
+        assert_eq!(mem.times_seen, 2, "the repeat count is the salience signal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exact match ONLY. Anything short of byte-identical is a different
+    /// memory — fuzzy merging belongs to dream consolidation, which has the
+    /// whole field in view, not to the write path.
+    #[test]
+    fn near_but_not_identical_text_still_inserts_separately() {
+        let dir = temp_dir("reinforce_near_miss");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        let base = sys.remember(FACT).unwrap();
+
+        // A near miss on every axis a fuzzy matcher would forgive.
+        let variants = [
+            "rogue posted the colony-one verdicts",
+            "Rogue posted the colony-one verdict",
+            "rogue posted the colony-one verdict.",
+            "rogue posted the colony one verdict",
+        ];
+        for v in variants {
+            let id = sys.remember(v).unwrap();
+            assert_ne!(id, base, "{v:?} is not the same sentence");
+        }
+
+        assert_eq!(
+            sys.all_memories().unwrap().len(),
+            1 + variants.len(),
+            "each distinct sentence is its own memory"
+        );
+
+        // Surrounding whitespace IS forgiven — it is not part of the fact.
+        let padded = sys.remember(&format!("  {FACT}\n")).unwrap();
+        assert_eq!(padded, base, "trimming is the only normalisation applied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bounded growth. A fact asserted 500 times must not drown the store:
+    /// every repeat is worth no more than the last, and the amplitude stays
+    /// under the same ceiling dream consolidation respects.
+    #[test]
+    fn reinforcement_has_diminishing_returns_and_a_ceiling() {
+        let dir = temp_dir("reinforce_ceiling");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        let id = sys.remember(FACT).unwrap();
+        let mut prev = sys.get_memory(&id).unwrap().unwrap().amplitude;
+        let mut prev_step = f32::MAX;
+
+        for n in 1..=500 {
+            sys.remember(FACT).unwrap();
+            let a = sys.get_memory(&id).unwrap().unwrap().amplitude;
+
+            assert!(a <= REINFORCE_CEILING, "repeat {n} broke the ceiling: {a}");
+            assert!(a >= prev, "repeat {n} must never weaken: {prev} -> {a}");
+
+            let step = a - prev;
+            assert!(
+                step <= prev_step + f32::EPSILON,
+                "repeat {n} gained MORE than the one before ({prev_step} -> {step}) — the curve is supposed to be diminishing"
+            );
+            prev_step = step;
+            prev = a;
+        }
+
+        let mem = sys.get_memory(&id).unwrap().unwrap();
+        assert_eq!(mem.times_seen, 501, "every sighting is counted");
+        assert!(
+            mem.amplitude <= REINFORCE_CEILING,
+            "500 repeats sit at the ceiling, not above it: {}",
+            mem.amplitude
+        );
+        assert_eq!(sys.all_memories().unwrap().len(), 1, "still one memory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `times_seen` is the whole point of the change, so it has to outlive the
+    /// process. It is not in the .hrm binary — it rides the `.times_seen.json`
+    /// sidecar, exactly like reactivation counts.
+    #[test]
+    fn times_seen_survives_save_and_reload() {
+        let dir = temp_dir("reinforce_reload");
+        let id = {
+            let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            let id = sys.remember(FACT).unwrap();
+            for _ in 0..3 {
+                sys.remember(FACT).unwrap();
+            }
+            assert_eq!(sys.get_memory(&id).unwrap().unwrap().times_seen, 4);
+            sys.save().unwrap();
+            id
+        };
+
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let seen = sys
+            .get_memory(&id)
+            .unwrap()
+            .expect("the memory must come back")
+            .times_seen;
+        assert_eq!(
+            seen, 4,
+            "the repeat count must survive reload via the sidecar"
+        );
+
+        // And a memory nobody ever repeated reads 1 — the truthful count for a
+        // fact seen once — not 0.
+        let once = sys.remember("something said only once").unwrap();
+        assert_eq!(sys.get_memory(&once).unwrap().unwrap().times_seen, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The explicit opt-out: a caller that genuinely needs one row per call
+    /// says so in its own code, and gets the old insert-every-time behaviour.
+    #[test]
+    fn the_explicit_opt_out_still_inserts_every_time() {
+        let dir = temp_dir("reinforce_optout");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        let first = sys.remember(FACT).unwrap();
+        let forced = sys.remember_forcing_new(FACT, "semantic", 0.5).unwrap();
+        assert_ne!(forced, first, "the explicit opt-out inserts a new row");
+        assert_eq!(sys.all_memories().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // The cleanup tool
+    // -----------------------------------------------------------------------
+
+    /// Build the accident: five identical copies, as the live store held them.
+    fn seed_five_copies(sys: &mut KannakaMemorySystem) -> Vec<Uuid> {
+        (0..5)
+            .map(|_| sys.remember_forcing_new(FACT, "semantic", 0.4).unwrap())
+            .collect()
+    }
+
+    fn snapshot(sys: &KannakaMemorySystem) -> Vec<(Uuid, u32, u32)> {
+        let mut v: Vec<(Uuid, u32, u32)> = sys
+            .all_memories()
+            .unwrap()
+            .iter()
+            .map(|m| (m.id, m.amplitude.to_bits(), m.times_seen))
+            .collect();
+        v.sort_by_key(|r| r.0);
+        v
+    }
+
+    /// A dry run reports and changes NOTHING. This is the guard on the default
+    /// mode of a one-way operation.
+    #[test]
+    fn collapse_dry_run_reports_without_mutating() {
+        let dir = temp_dir("collapse_dry");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let ids = seed_five_copies(&mut sys);
+        sys.remember_forcing_new("an unrelated fact", "semantic", 0.4)
+            .unwrap();
+
+        let before = snapshot(&sys);
+
+        let report = sys.collapse_exact_duplicates(false).unwrap();
+
+        assert!(!report.applied);
+        assert_eq!(report.groups.len(), 1, "one duplicate set");
+        assert_eq!(report.duplicates(), 4, "four copies would fold");
+        assert!(ids.contains(&report.groups[0].keeper));
+        assert!(
+            report.groups[0].amplitude_after > report.groups[0].amplitude_before,
+            "the report must say the keeper would get STRONGER, not just that there would be fewer rows"
+        );
+
+        assert_eq!(before, snapshot(&sys), "a dry run must not mutate anything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Apply collapses the set into ONE memory that is stronger and carries the
+    /// count — five copies become a fact seen five times, not four deletions.
+    #[test]
+    fn collapse_apply_folds_into_one_memory_that_carries_the_count() {
+        let dir = temp_dir("collapse_apply");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let ids = seed_five_copies(&mut sys);
+        let unrelated = sys
+            .remember_forcing_new("an unrelated fact", "semantic", 0.4)
+            .unwrap();
+
+        let dry = sys.collapse_exact_duplicates(false).unwrap();
+        let report = sys.collapse_exact_duplicates(true).unwrap();
+
+        assert!(report.applied);
+        assert_eq!(
+            report.duplicates(),
+            dry.duplicates(),
+            "apply folds exactly what the dry run promised"
+        );
+        assert_eq!(report.errors, 0);
+
+        let keeper = report.groups[0].keeper;
+        assert_eq!(
+            sys.all_memories().unwrap().len(),
+            2,
+            "the collapsed set plus the unrelated fact"
+        );
+        assert!(sys.get_memory(&unrelated).unwrap().is_some());
+
+        let mem = sys.get_memory(&keeper).unwrap().unwrap();
+        assert_eq!(
+            mem.times_seen, 5,
+            "five copies mean the world showed it five times"
+        );
+        assert!(
+            mem.amplitude > 0.4,
+            "collapsing must not throw away what the duplicates encoded: {}",
+            mem.amplitude
+        );
+        assert!(mem.amplitude <= REINFORCE_CEILING);
+
+        for id in ids.iter().filter(|i| **i != keeper) {
+            assert!(
+                sys.get_memory(id).unwrap().is_none(),
+                "folded copies are gone"
+            );
+        }
+
+        // The keeper is the row a later repeat lands on — cleanup and the write
+        // path must agree about which memory holds this fact.
+        assert_eq!(sys.remember(FACT).unwrap(), keeper);
+
+        // And it is idempotent: nothing left to collapse.
+        assert_eq!(
+            sys.collapse_exact_duplicates(false).unwrap().groups.len(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The dream digest is DURABLE history — JetStream captures

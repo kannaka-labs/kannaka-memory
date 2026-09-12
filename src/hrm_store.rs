@@ -523,6 +523,7 @@ impl HrmStore {
                 store.rebuild_cache()?;
                 store.load_link_graph();
                 store.load_reactivation();
+                store.load_times_seen();
                 Ok(store)
             }
             Err(chiral_err) => {
@@ -550,6 +551,7 @@ impl HrmStore {
                 store.rebuild_cache()?;
                 store.load_link_graph();
                 store.load_reactivation();
+                store.load_times_seen();
                 Ok(store)
             }
         }
@@ -598,6 +600,18 @@ impl HrmStore {
                 .map(|(id, m)| (*id, (m.layer_depth, m.last_consolidated_at)))
                 .collect();
 
+        // Reinforce-on-repeat: `times_seen` lives only in the cache (the medium's
+        // WavefrontMeta has no such field — see HyperMemory::times_seen for why
+        // it is a sidecar and not a bincode field). rebuild_cache runs after
+        // every absorb and every dream, so without this snapshot every repeat
+        // count would reset to 1 several times an hour and the salience signal
+        // would never accumulate. Same shape as the reactivation snapshot above.
+        let saved_times_seen: std::collections::HashMap<uuid::Uuid, u32> =
+            self.memory_cache.iter()
+                .filter(|(_, m)| m.times_seen > 1)
+                .map(|(id, m)| (*id, m.times_seen))
+                .collect();
+
         self.memory_cache.clear();
 
         if let Some(ref chiral) = self.chiral {
@@ -626,6 +640,7 @@ impl HrmStore {
                     disputed: false,
                     updated_at: Some(meta.created_at),
                     retrieval_count: 0,
+                    times_seen: 1,
                     modality: meta.modality,
                     tier: meta.tier,
                     effective_at: meta.effective_at,
@@ -660,6 +675,7 @@ impl HrmStore {
                     disputed: false,
                     updated_at: Some(meta.created_at),
                     retrieval_count: 0,
+                    times_seen: 1,
                     modality: meta.modality,
                     tier: meta.tier,
                     effective_at: meta.effective_at,
@@ -697,6 +713,13 @@ impl HrmStore {
                 if last.is_some() {
                     mem.updated_at = last;
                 }
+            }
+        }
+
+        // Restore repeat counts (reinforce-on-repeat).
+        for (id, seen) in saved_times_seen {
+            if let Some(mem) = self.memory_cache.get_mut(&id) {
+                mem.times_seen = seen;
             }
         }
 
@@ -783,6 +806,8 @@ impl HrmStore {
         // Save reactivation sidecar (ADR-0036 Phase 1; not in the HRM binary).
         // The single writer holds the full cache, so it may prune stale ids.
         self.save_reactivation_merge(true);
+        // Save repeat-count sidecar (reinforce-on-repeat; not in the HRM binary).
+        self.save_times_seen_merge(true);
 
         self.dirty = false;
         Ok(())
@@ -936,6 +961,83 @@ impl HrmStore {
                     if last.is_some() {
                         mem.updated_at = last;
                     }
+                }
+            }
+        }
+    }
+
+    /// Save per-memory repeat counts (`times_seen`) as a sidecar JSON, mirroring
+    /// `.reactivation.json` exactly — including the merge-on-write, because the
+    /// same set of processes touch it: the single writer on dream-save, the
+    /// readonly serve daemon, and short-lived CLI `remember`. Counts are
+    /// monotonic, so MAX is the correct reconciliation.
+    ///
+    /// Only memories actually repeated (`times_seen > 1`) are written. A store
+    /// where nothing has ever been re-remembered has no sidecar at all, and a
+    /// missing entry reads back as 1 — the truthful count for a fact seen once.
+    ///
+    /// `prune_stale` drops entries whose id is absent from this cache; only the
+    /// single writer (which holds the full cache) may prune — a partial-cache
+    /// caller would otherwise delete other memories' counts.
+    fn save_times_seen_merge(&self, prune_stale: bool) {
+        let path = self.hrm_path.with_extension("times_seen.json");
+        let mut merged: std::collections::HashMap<String, u32> = std::fs::read(&path)
+            .ok()
+            .and_then(|d| serde_json::from_slice(&d).ok())
+            .unwrap_or_default();
+
+        for (id, m) in &self.memory_cache {
+            if m.times_seen <= 1 {
+                continue;
+            }
+            let entry = merged.entry(id.to_string()).or_insert(1);
+            if m.times_seen > *entry {
+                *entry = m.times_seen;
+            }
+        }
+
+        if prune_stale {
+            merged.retain(|k, _| {
+                k.parse::<uuid::Uuid>()
+                    .map(|id| self.memory_cache.contains_key(&id))
+                    .unwrap_or(false)
+            });
+        }
+
+        if merged.is_empty() {
+            return;
+        }
+        if let Ok(json) = serde_json::to_vec(&merged) {
+            Self::atomic_write(&path, &json);
+        }
+    }
+
+    /// Flush repeat counts to the sidecar from a possibly-readonly, partial-cache
+    /// process. Like `flush_reactivation`, deliberately NOT gated by `readonly`:
+    /// it writes only the heuristic sidecar, never the `.hrm`, so single-writer
+    /// is not violated.
+    pub fn flush_times_seen(&self) {
+        self.save_times_seen_merge(false);
+    }
+
+    /// Load repeat counts from the sidecar into the cache.
+    fn load_times_seen(&mut self) {
+        let path = self.hrm_path.with_extension("times_seen.json");
+        if !path.exists() {
+            return;
+        }
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let map: std::collections::HashMap<String, u32> = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        for (id_str, seen) in map {
+            if let Ok(id) = id_str.parse::<uuid::Uuid>() {
+                if let Some(mem) = self.memory_cache.get_mut(&id) {
+                    mem.times_seen = seen.max(1);
                 }
             }
         }
@@ -2390,6 +2492,22 @@ impl MediumBackend for HrmStore {
             self.mark_dirty(); // Mark dirty when getting mutable reference
         }
         Ok(self.memory_cache.get_mut(id))
+    }
+
+    fn facet_structured_ids(&self) -> std::collections::HashSet<Uuid> {
+        // ADR-0049 flags live on the canonical WavefrontMeta, not on the cached
+        // HyperMemory, so this reads the right hemisphere directly. A flat
+        // (non-chiral) store has no facet structure and returns the empty set.
+        match self.chiral {
+            Some(ref chiral) => chiral
+                .right
+                .metadata
+                .iter()
+                .filter(|m| m.is_facet || m.decomposed)
+                .map(|m| m.id)
+                .collect(),
+            None => std::collections::HashSet::new(),
+        }
     }
 
     fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {

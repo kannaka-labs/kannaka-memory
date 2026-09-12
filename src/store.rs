@@ -180,6 +180,19 @@ pub trait MediumBackend: Send + Sync {
 
     fn get(&self, id: &Uuid) -> Result<Option<&HyperMemory>, StoreError>;
     fn get_mut(&mut self, id: &Uuid) -> Result<Option<&mut HyperMemory>, StoreError>;
+
+    /// Ids that carry ADR-0049 facet structure: a minted facet row, or a
+    /// parent that has already been decomposed into facets.
+    ///
+    /// Maintenance tools must never delete either. Deleting a decomposed
+    /// parent dangles every facet that points at it ("parent retention is an
+    /// invariant" — `WavefrontMeta::decomposed`), and deleting a facet drops
+    /// an atom recall depends on. Backends with no facet structure return the
+    /// empty set, which is why the default is `HashSet::new()` rather than an
+    /// error: absence of facets is a correct answer, not an unsupported one.
+    fn facet_structured_ids(&self) -> std::collections::HashSet<Uuid> {
+        std::collections::HashSet::new()
+    }
     fn all_memories(&self) -> Result<Vec<&HyperMemory>, StoreError>;
     fn all_ids(&self) -> Result<Vec<Uuid>, StoreError>;
     fn delete(&mut self, id: &Uuid) -> Result<bool, StoreError>;

@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+### Changed — remember: a fact seen again is reinforced, not duplicated
+
+Rogue's grid job re-wrote the same verdicts on every run, and the store did what it
+was told: it inserted them all. One identical sentence existed **five times**, each
+at strength **0.400**, at ages 84.28 / 60.20 / 12.17 / 2.79 / 2.58 hours. If
+repetition deepened a memory there would be one memory with a rising strength.
+Instead there were five weak ones, none of which knew about the others.
+
+The cost lands on recall, which is what makes this a correctness bug and not
+housekeeping. `recall "what happened in colony-one"` at top-10 came back with **ten
+slots holding five distinct facts** — one sentence occupied six of the ten. Every
+duplicate is a fact the agent can no longer see. Duplication made the view
+*shallower*. And because each write loads the whole store, every copy in a 190 MB /
+2,366-memory medium slowed every write that came after it.
+
+**`remember` now strengthens what it already holds.** Before absorbing, the write
+path looks for a memory whose stored content is byte-identical to the new text after
+trimming. If it finds one, that memory's amplitude rises, its repeat count goes up,
+its recency is refreshed, and **its** id comes back. No second row. `remember` still
+returns a `Uuid` for a memory that contains the text, so no caller changed: every
+`remember*` call site either logs the id or uses it to stamp modality and temporal
+bounds on the row it just wrote, and all of that stays correct when the row is one
+that already existed.
+
+**Exact match only.** Fuzzy merging of near-identical memories already exists, and it
+already has the right home: dream consolidation decides that two wavefronts are the
+same thought with the whole field in view and a snapshot behind it. Doing that at
+write time would mean `remember` silently ruling that your new sentence "was" an old
+one on a similarity threshold — lossy, surprising, and unreviewable. Byte-identical
+text is the only repeat the write path can claim with certainty. Trimming surrounding
+whitespace is the single normalisation applied.
+
+**Bounded by construction.** A repeat closes a quarter of the remaining gap to the
+ceiling: `a' = a + 0.25·(CEILING − a)`, so `n` repeats reach
+`CEILING − (CEILING − a₀)·0.75ⁿ`. Every repeat is worth something, the tenth is worth
+about 7.5% of the first, and the ceiling is approached and never crossed — it is the
+same `AMPLITUDE_CEILING` dream consolidation's additive boosts respect, so a fact
+asserted 500 times by a cron job can dominate the field no more than the strongest
+dream-strengthened memory already could. A test walks 500 repeats and asserts the
+step never grows and the ceiling never breaks.
+
+**The count is the point.** `times_seen` records how many times the world showed you
+the fact, as distinct from `retrieval_count`, which records how many times *you* went
+looking. It is the salience signal this whole change exists to create, so it has to
+outlive the process: it rides a `.times_seen.json` sidecar next to the `.hrm`, with
+the same merge-on-write reconciliation `.reactivation.json` uses, for the same reason
+— appending to the bincode `WavefrontMeta` layout means extending a positional format
+and its fallback-struct chain, and a sidecar carries no format risk. A memory nobody
+ever repeated reads `1`, not `0`.
+
+**`kannaka dedupe` collapses what is already on disk.** The write path only stops new
+duplicates; the sets already written need a deliberate pass. It collapses rather than
+deletes, because the duplicate set is itself evidence — five copies mean the world
+showed you that fact five times, and a cleanup that simply dropped four of them would
+throw away the one useful thing the accident encoded. The oldest member is kept (the
+same row a later repeat will land on), it inherits the summed count, and its amplitude
+is advanced along the reinforcement curve once per folded copy, starting from the
+*strongest* member so nothing the store already held is lost. Rows carrying ADR-0049
+facet structure are excluded outright: deleting a decomposed parent dangles its facets.
+
+The command is a dry run by default and prints what it would fold. `--apply` takes the
+HRM write lock and refuses if another writer holds it, refuses outright under
+`KANNAKA_READONLY` (a read-only store drops the write on save, so the run would report
+deletions that never happened), and refuses to proceed without first writing a
+retention-exempt pre-collapse snapshot of the `.hrm`. Nothing schedules it.
+
+`KANNAKA_REINFORCE_ON_REPEAT=0` restores insert-every-time for a whole process, and
+`KannakaMemorySystem::remember_forcing_new` is the per-call opt-out for a future caller
+that genuinely needs one row per call. Nothing in the tree needs either today.
+
 ### Fixed — serve: an anonymous ask can no longer choose what it costs (#932)
 
 `swarm serve` answers `KANNAKA.ask.broadcast`, and the anonymous NATS identity may

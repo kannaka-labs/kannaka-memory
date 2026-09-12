@@ -32,6 +32,12 @@ use handlers_substrate::{
 mod handlers_facets;
 use handlers_facets::handle_facets;
 
+// Reinforce-on-repeat cleanup (`kannaka dedupe`): collapses duplicate sets
+// written before the write path started reinforcing. Operator-invoked only.
+#[path = "handlers/dedupe.rs"]
+mod handlers_dedupe;
+use handlers_dedupe::handle_dedupe;
+
 // KAX Compute District operator commands (`kannaka compute ...`): signed
 // wakes/grants, roster, fleet status, event tail, keygen. HTTP + NATS only —
 // never loads the HRM, mirrors the identity fast path.
@@ -5677,6 +5683,13 @@ fn main() {
         "facets" => {
             // #836 / ADR-0049: corpus facet migration. Dry-run by default.
             handle_facets(&mut sys, &cfg, &args[command_start + 1..]);
+        }
+
+        "dedupe" => {
+            // Reinforce-on-repeat cleanup: fold byte-identical duplicate sets
+            // into one memory that carries the count. Dry-run by default;
+            // never runs on a schedule.
+            handle_dedupe(&mut sys, &cfg, &args[command_start + 1..]);
         }
         "attention" => {
             if args.len() < command_start + 2 {
