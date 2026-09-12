@@ -6,7 +6,7 @@
 
 use super::color::{hsv_histogram, dominant_colors};
 use super::decode::FrameInfo;
-use super::{HSV_BINS, EDGE_BINS, FREQ_BANDS, REGION_GRID, FLOW_BINS, SPATIAL_FEATURE_DIM};
+use super::{EDGE_BINS, FLOW_BINS, FREQ_BANDS, REGION_GRID, SPATIAL_FEATURE_DIM};
 
 /// Aggregated spatial features across all frames.
 #[derive(Debug, Clone)]
