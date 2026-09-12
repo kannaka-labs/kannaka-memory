@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+### Fixed — serve: an anonymous ask can no longer choose what it costs (#932)
+
+`swarm serve` answers `KANNAKA.ask.broadcast`, and the anonymous NATS identity may
+publish there. Behind a 0.4 resonance gate the inbound text went straight to the
+node's configured provider: no rate limit, no ceiling, and no distinction between
+the operator's own ask and a stranger's broadcast. A node serving with a paid key
+was a public endpoint for that key. The invariant this closes is not the ADR's
+literal "pin served asks to local providers" — `kannaka-prime`, which *is* the
+public `ask_kannaka` product, answers from a remote gateway on a virtual key
+already capped at $25/30d, and pinning would take it off the air to fix an exposure
+it does not have. What matters is the ceiling, not the locality:
+
+> A served ask must never spend without a ceiling, and must never let the caller
+> choose what it costs.
+
+**The wire never chooses the route.** An inbound ask is answered with this node's
+own `[llm]` provider and model. Any routing-shaped field on the envelope —
+`provider`, `model`, `base_url`, `api_key`, `kind`, `route` — is ignored and named
+in the log, so an ask labelling itself `kind = "reason"` to reach the operator's
+expensive key gets exactly the provider every other ask gets. Nothing on the answer
+path ever read those fields; the point is that a test now holds it there, because
+the providers table (#931) adds a router in the same place.
+
+**A per-requester rate limit, on by default.** 60 asks per requester per hour and
+300 per hour in total, both settable with `KANNAKA_SERVE_ASKS_PER_HOUR` and
+`KANNAKA_SERVE_ASKS_PER_HOUR_TOTAL`, both printed at startup. It runs *before* the
+resonance probe, because that probe is a full recall and is the cheap half of the
+abuse on a 1-vCPU hub. A refused ask gets a short reply naming the limit rather
+than a timeout, and the refusal is logged once per requester per window, not once
+per ask. A requester is keyed by the envelope's `from`, else by the reply-inbox
+prefix — NATS core carries no publisher identity on a message, so **both are
+caller-chosen**: the per-requester limit bounds an honest neighbour, and the hourly
+total is what holds against a caller who rotates. The limiter's own map is capped,
+so identity rotation cannot turn the rate limit into the memory leak.
+
+**`hops`, ceiling 1 — a hired ask never hires.** The ask envelope gains `hops`; an
+envelope without the field reads as 0, so an old client is unchanged. `serve` marks
+the hop count of the ask it is answering, and the outbound publisher refuses to
+forward one that has already been hired. No serve path routes onward today, so the
+refusal is dormant by construction: it is here so #931's router lands on a ceiling
+that is already enforced instead of after one.
+
+**Refuse to start unbounded — loudly, not fatally.** `serve` now classifies what it
+can spend. A local brain or a keyless provider is free; a keyed provider with
+`[llm] max_usd_per_day` or `[llm] externally_capped = true` is bounded; a keyed
+provider with neither prints a banner naming both settings. It still starts: a hard
+refusal on by default would take prime off the air on upgrade, so that is opt-in
+with `KANNAKA_SERVE_REFUSE_UNBOUNDED=1`. `max_usd_per_day` is **declared, not
+enforced** — enforcing it needs per-call cost accounting, which is #931 — and the
+banner says so rather than letting a number in a config file read as a ceiling.
+Because the installer writes `provider = "openai"` for a local Ollama brain as well
+as for the hosted gateway, the base URL decides locality before the provider string
+does.
+
+This PR emits no `KANNAKA.events.*` at all, so the 48-character prompt preview the
+activity publisher sends on an anon-readable subject is not extended to served asks.
+
 ### Fixed — GhostSignals: present the stored bearer, and tell the truth about a 409 (#930)
 
 The hub now mints a per-row bearer and returns the plaintext token once

@@ -544,14 +544,36 @@ pub(crate) fn handle_ask_remote(
         Err(e) => { eprintln!("Failed to connect to NATS at {nats_url}: {e}"); process::exit(1); }
     };
 
+    // #932: `hops` — a hired ask never hires. When this process is answering a
+    // served ask (`swarm serve` sets the cell for the duration of the answer),
+    // publishing another ask IS forwarding, and the ceiling applies. When it is
+    // not, this ask originates here and goes out at hops = 0.
+    //
+    // Today no serve path routes onward, so this refusal is dormant by
+    // construction — it is here so the router #931 adds lands on top of a
+    // ceiling that is already enforced, instead of after one.
+    let inbound_hops = kannaka_memory::serve_guard::serving_hops();
+    if let Some(h) = inbound_hops {
+        if !kannaka_memory::serve_guard::may_forward(h) {
+            eprintln!(
+                "ask --remote: refusing to forward an ask already at {h} hop(s) (ceiling {}) — a hired ask never hires (#932)",
+                kannaka_memory::serve_guard::MAX_HOPS
+            );
+            process::exit(3);
+        }
+    }
+
     // #746: `mode` is additive — a pre-#746 server ignores the field and
     // answers exactly as before, so adding it cannot break an old peer.
+    // `hops` is additive the same way: a pre-#932 server never reads it, and a
+    // pre-#932 client omits it, which reads as 0.
     let request = serde_json::json!({
         "from": cfg.agent.id,
         "text": prompt,
         "recall_query": recall_query,
         "no_tools": no_tools,
         "mode": mode.wire_name(),
+        "hops": kannaka_memory::serve_guard::outbound_hops(inbound_hops),
     });
     let payload = match serde_json::to_vec(&request) {
         Ok(b) => b,

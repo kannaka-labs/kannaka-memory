@@ -122,6 +122,24 @@ pub struct LlmConfig {
     pub api_key: String,
     #[serde(default)]
     pub base_url: String,
+    /// ADR-0059 §3 / #932: the per-day ceiling the operator *declares* for this
+    /// provider, in USD.
+    ///
+    /// **Declared, not yet enforced.** Enforcing it needs per-call cost
+    /// accounting, which arrives with the providers table (#931); today its only
+    /// effect is to settle `swarm serve`'s startup posture (see
+    /// [`crate::serve_guard::spend_posture`]) — the per-requester rate limit is
+    /// what actually bounds spend in this release. Named for the ADR so the
+    /// field does not have to be renamed when #931 gives it teeth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd_per_day: Option<f64>,
+    /// The operator asserts this key is capped outside this process — a budgeted
+    /// gateway virtual key rather than a raw vendor key. This is
+    /// `kannaka-prime`'s case: `https://ninja-portal.com/v1` on a virtual key
+    /// capped at $25/30d. Silences the unbounded-spend warning at `serve`
+    /// startup; claims nothing this binary can verify.
+    #[serde(default)]
+    pub externally_capped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +489,8 @@ impl Default for LlmConfig {
             model: String::new(),
             api_key: String::new(),
             base_url: String::new(),
+            max_usd_per_day: None,
+            externally_capped: false,
         }
     }
 }
