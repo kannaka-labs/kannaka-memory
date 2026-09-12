@@ -136,14 +136,31 @@ pub(crate) fn handle_swarm_serve(
                     "[swarm serve] NOTE: max_usd_per_day is DECLARED, not enforced by this build (#931 adds per-call cost accounting); the rate limit below is what bounds spend today"
                 );
             }
+            // A gateway the operator interposed is evidence of a budget — it is
+            // where virtual keys and caps live — so this says what it knows and
+            // does not shout. `kannaka-prime` has exactly this shape, and
+            // shouting at the one node everybody watches, about a key that IS
+            // capped, is how a banner stops being read.
+            kannaka_memory::serve_guard::SpendPosture::UndeclaredGateway { base_url } => {
+                eprintln!(
+                    "[swarm serve] spend: this node can spend and has declared no ceiling here; it reaches its provider through {base_url}. If that key is capped upstream, record it with `[llm] externally_capped = true`; otherwise set `[llm] max_usd_per_day`."
+                );
+                if kannaka_memory::serve_guard::refuse_unbounded_requested() {
+                    eprintln!(
+                        "[swarm serve] KANNAKA_SERVE_REFUSE_UNBOUNDED=1 — refusing to serve with no declared ceiling"
+                    );
+                    process::exit(1);
+                }
+            }
             kannaka_memory::serve_guard::SpendPosture::Unbounded => {
                 eprintln!("[swarm serve] ============================================================");
                 eprintln!("[swarm serve] WARNING: serving KANNAKA.ask.broadcast with a KEYED provider");
-                eprintln!("[swarm serve] WARNING: and NO declared ceiling. The anonymous NATS identity");
-                eprintln!("[swarm serve] WARNING: may publish there, so this key is spendable by anyone");
-                eprintln!("[swarm serve] WARNING: on the bus (#932). Declare one in config.toml:");
+                eprintln!("[swarm serve] WARNING: against the vendor's own API, and NO declared ceiling");
+                eprintln!("[swarm serve] WARNING: anywhere. The anonymous NATS identity may publish");
+                eprintln!("[swarm serve] WARNING: there, so this key is spendable by anyone on the bus");
+                eprintln!("[swarm serve] WARNING: (#932). Declare a ceiling in config.toml:");
                 eprintln!("[swarm serve] WARNING:   [llm] max_usd_per_day = 2.00");
-                eprintln!("[swarm serve] WARNING:   [llm] externally_capped = true   # gateway/virtual key");
+                eprintln!("[swarm serve] WARNING:   [llm] externally_capped = true   # if capped upstream");
                 eprintln!("[swarm serve] WARNING: or set KANNAKA_SERVE_REFUSE_UNBOUNDED=1 to refuse to start.");
                 eprintln!("[swarm serve] ============================================================");
                 if kannaka_memory::serve_guard::refuse_unbounded_requested() {
@@ -665,10 +682,35 @@ fn _handle_serve_msg(
         );
     }
 
+    // An id that long is not a name, it is a payload: the broker's max_payload
+    // is 64MB, so `from` is attacker-SIZED as well as attacker-chosen. Refuse it
+    // here, before it costs a recall. (`requester_key` hashes an oversized id
+    // anyway, so the limiter is safe on its own — this is the cheaper refusal,
+    // not the bound.)
+    if kannaka_memory::serve_guard::id_is_oversized(from) {
+        let err = serde_json::json!({
+            "from": serve_agent_id,
+            "error": format!(
+                "`from` is {} bytes; this node accepts at most {}",
+                from.len(),
+                kannaka_memory::serve_guard::MAX_REQUESTER_ID_BYTES
+            ),
+        });
+        let _ = transport.reply(&reply_to, err.to_string().as_bytes());
+        return;
+    }
+
     // #932, behaviour 2: rate limit BEFORE the resonance probe. The probe is a
     // full recall against the medium, so it is itself the cheap half of the
     // abuse — metering after it would leave the 1-vCPU hub payable in CPU even
     // when it never spends a token.
+    //
+    // Only the REQUESTER's bucket is committed here. The hourly ceiling is
+    // committed further down, past the resonance gate, at the point the ask
+    // actually reaches the model — see `ServeRateLimiter::check`. Metering the
+    // ceiling here instead made a stranger's ~30-byte non-resonant publish, one
+    // every twelve seconds, enough to take the public ask_kannaka off the air
+    // for everybody: an outage cheaper than the abuse it was guarding.
     //
     // Keyed by the envelope's `from`, else the reply-inbox prefix. Both are
     // caller-chosen (NATS core carries no publisher identity on a message), so
@@ -759,6 +801,12 @@ fn _handle_serve_msg(
         eff.agent.persona = String::new();
     }
     let cfg = &eff;
+
+    // #932: the hourly ceiling is committed HERE — past the resonance gate,
+    // immediately before the model call — so it counts asks that actually
+    // spend. An ask the gate dropped cost one recall and nothing else, and must
+    // not be able to exhaust the node's hour on everybody else's behalf.
+    rate_limit.commit_global(now_secs);
 
     let result = match mode {
         kannaka_memory::agent::RemoteAskMode::Attention => {

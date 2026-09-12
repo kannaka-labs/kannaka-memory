@@ -27,34 +27,60 @@ the providers table (#931) adds a router in the same place.
 
 **A per-requester rate limit, on by default.** 60 asks per requester per hour and
 300 per hour in total, both settable with `KANNAKA_SERVE_ASKS_PER_HOUR` and
-`KANNAKA_SERVE_ASKS_PER_HOUR_TOTAL`, both printed at startup. It runs *before* the
-resonance probe, because that probe is a full recall and is the cheap half of the
-abuse on a 1-vCPU hub. A refused ask gets a short reply naming the limit rather
-than a timeout, and the refusal is logged once per requester per window, not once
-per ask. A requester is keyed by the envelope's `from`, else by the reply-inbox
-prefix — NATS core carries no publisher identity on a message, so **both are
-caller-chosen**: the per-requester limit bounds an honest neighbour, and the hourly
-total is what holds against a caller who rotates. The limiter's own map is capped,
-so identity rotation cannot turn the rate limit into the memory leak.
+`KANNAKA_SERVE_ASKS_PER_HOUR_TOTAL`, both printed at startup. A refused ask gets a
+short reply naming the limit rather than a timeout, and the refusal is logged once
+per requester per window, not once per ask.
+
+The two ceilings are metered in **different places, on purpose**. The per-requester
+bucket is committed before the resonance probe, because that probe is a full recall
+and is the cheap half of the abuse on a 1-vCPU hub — CPU the caller spends on
+itself. The hourly total is committed past the resonance gate, immediately before
+the model call, so it counts only asks that actually spend. Metering the total up
+front turns the control into a cheaper outage than the problem: `swarm serve`
+decides whether to answer a broadcast *after* the limiter runs, and anon may
+publish there, so a stranger sending ~30-byte non-resonant asks — every one dropped
+by that gate, none of them costing a token — would take the public `ask_kannaka`
+off the air for everybody at one publish every twelve seconds.
+
+A requester is keyed by the envelope's `from`, else by the reply-inbox prefix —
+NATS core carries no publisher identity on a message, so **both are caller-chosen**:
+the per-requester limit bounds an honest neighbour, and the hourly total is what
+holds against a caller who rotates. That key is also attacker-*sized*, since the
+broker's `max_payload` is 64MB: an id over 128 bytes is stored as a hash of itself
+(a hash, not a truncation, so one caller cannot land in another's bucket by sharing
+a prefix), and `serve` refuses an oversized `from` outright before it costs a
+recall. The limiter is therefore bounded in bytes, not just in entries — a cap on
+the number of tracked requesters would have left ~85 asks able to retain ~5.4GB on
+a box with 5.5GB.
 
 **`hops`, ceiling 1 — a hired ask never hires.** The ask envelope gains `hops`; an
 envelope without the field reads as 0, so an old client is unchanged. `serve` marks
 the hop count of the ask it is answering, and the outbound publisher refuses to
-forward one that has already been hired. No serve path routes onward today, so the
-refusal is dormant by construction: it is here so #931's router lands on a ceiling
-that is already enforced instead of after one.
+forward one that has already been hired. A wire value is clamped to one above the
+ceiling, and "this process is not serving anything" is an `Option`, never a
+reserved number — otherwise a forged `hops` of `4294967295` would clamp onto that
+reserved value and read back as "I originated this ask", handing the forger the
+budget it was meant to exhaust. No serve path routes onward today, so the refusal
+is dormant by construction: it is here so #931's router lands on a ceiling that is
+already enforced instead of after one.
 
 **Refuse to start unbounded — loudly, not fatally.** `serve` now classifies what it
 can spend. A local brain or a keyless provider is free; a keyed provider with
-`[llm] max_usd_per_day` or `[llm] externally_capped = true` is bounded; a keyed
-provider with neither prints a banner naming both settings. It still starts: a hard
-refusal on by default would take prime off the air on upgrade, so that is opt-in
-with `KANNAKA_SERVE_REFUSE_UNBOUNDED=1`. `max_usd_per_day` is **declared, not
-enforced** — enforcing it needs per-call cost accounting, which is #931 — and the
-banner says so rather than letting a number in a config file read as a ceiling.
-Because the installer writes `provider = "openai"` for a local Ollama brain as well
-as for the hosted gateway, the base URL decides locality before the provider string
-does.
+`[llm] max_usd_per_day` or `[llm] externally_capped = true` is bounded. A keyed
+provider with neither gets one of two notices, because they are not the same
+situation: against the vendor's own API it is the plain exposure and draws the loud
+banner; through a gateway the operator interposed it draws a single calm line
+saying what is actually known — this node can spend, has declared no ceiling here,
+and reaches its provider through that URL, so set `externally_capped` if the key is
+capped upstream. A gateway is where budgets live, and a false alarm on the one node
+everybody watches is how a banner stops being read. Either way `serve` still
+starts; the hard refusal is opt-in with `KANNAKA_SERVE_REFUSE_UNBOUNDED=1`.
+
+`max_usd_per_day` is **declared, not enforced** — enforcing it needs per-call cost
+accounting, which is #931 — and the banner says so rather than letting a number in
+a config file read as a ceiling. Because the installer writes `provider = "openai"`
+for a local Ollama brain as well as for the hosted gateway, the base URL decides
+locality before the provider string does.
 
 This PR emits no `KANNAKA.events.*` at all, so the 48-character prompt preview the
 activity publisher sends on an anon-readable subject is not extended to served asks.

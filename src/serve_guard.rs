@@ -26,7 +26,12 @@
 //!    routing-shaped field on the envelope is collected by [`wire_route_fields`]
 //!    so `serve` can log that it was ignored.
 //! 2. **A per-requester rate limit** — [`ServeRateLimiter`], on by default.
-//!    This is the actual abuse control in this PR.
+//!    This is the actual abuse control in this PR. It is deliberately split in
+//!    two: [`ServeRateLimiter::check`] before the work, and
+//!    [`ServeRateLimiter::commit_global`] at the spend. An abuse control that a
+//!    stranger can turn into an outage cheaper than the abuse is not a control,
+//!    and metering the hourly ceiling before the resonance gate did exactly
+//!    that — see `check`'s own doc comment.
 //! 3. **`hops`, ceiling [`MAX_HOPS`]** — [`may_forward`] / [`outbound_hops`]. A
 //!    hired ask never hires, so two brainless nodes cannot bounce one question
 //!    between them forever.
@@ -101,14 +106,29 @@ pub fn resolve_served_route(llm: &LlmConfig, req: &Value) -> ServedRoute {
 /// second; the second may not hire a third.
 pub const MAX_HOPS: u32 = 1;
 
+/// Every hop count at or above this one means the same thing — do not forward —
+/// so a wire value is clamped here rather than carried through the code as the
+/// number a stranger chose.
+pub const HOPS_CLAMP: u32 = MAX_HOPS + 1;
+
 /// The hop count an envelope declares. A missing, non-numeric or negative field
 /// is 0 — an envelope written before this field existed is a first-hop ask, and
 /// must keep working exactly as it always did.
+///
+/// The clamp is [`HOPS_CLAMP`], not `u32::MAX`. An earlier revision clamped to
+/// `u32::MAX` while `u32::MAX` was also the in-band sentinel for "this process
+/// is not serving anything", so a wire value of `4294967295` round-tripped
+/// through [`set_serving_hops`] and came back as "I originated this ask" — a
+/// forged number reinstating the hop budget it was supposed to exhaust. The
+/// sentinel is gone (see [`serving_hops`]) and the clamp no longer reaches it;
+/// both halves of that bug are closed independently, because the wire is the
+/// threat model and reasoning about the values *this* code produces is not a
+/// defence against values it merely receives.
 pub fn hops_of(req: &Value) -> u32 {
     req.get("hops")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
-        .min(u32::MAX as u64) as u32
+        .min(HOPS_CLAMP as u64) as u32
 }
 
 /// May a node holding an ask at `inbound` hops forward it to another node?
@@ -133,26 +153,29 @@ pub fn outbound_hops(inbound: Option<u32>) -> u32 {
 ///
 /// A process-wide cell rather than a parameter because the outbound publisher
 /// ([`crate`]'s `ask --remote` handler) and the serve loop do not share a call
-/// stack. `u32::MAX` is the sentinel for "not serving"; a real ask can never
-/// reach it because [`may_forward`] caps forwarding at [`MAX_HOPS`].
-static SERVING_HOPS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
+/// stack.
+///
+/// `Option<u32>` behind a mutex, **not** an atomic with an in-band sentinel.
+/// "Not serving" and "serving an ask whose hop count happens to equal the
+/// sentinel" are different facts, and a wire-supplied number must never be able
+/// to become the first by spelling the second. The type keeps them apart, so no
+/// clamp anywhere else in this module can reintroduce the collision.
+static SERVING_HOPS: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 /// Mark this process as answering a served ask at `hops` (or, with `None`, as
 /// no longer serving one). Call it around the answer, not around the whole loop.
 pub fn set_serving_hops(hops: Option<u32>) {
-    SERVING_HOPS.store(
-        hops.unwrap_or(u32::MAX),
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    // A poisoned lock means some other thread panicked mid-update. The cell is
+    // one `Option<u32>` with no invariant spanning two fields, so recovering
+    // the value is sound — and failing closed here would be worse than the
+    // panic it inherited: `serve` would stop being able to say it is serving.
+    let mut cell = SERVING_HOPS.lock().unwrap_or_else(|e| e.into_inner());
+    *cell = hops;
 }
 
 /// The hop count of the ask being served right now, if any.
 pub fn serving_hops() -> Option<u32> {
-    match SERVING_HOPS.load(std::sync::atomic::Ordering::SeqCst) {
-        u32::MAX => None,
-        h => Some(h),
-    }
+    *SERVING_HOPS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ── 2. Per-requester rate limit ────────────────────────────────────────────
@@ -180,6 +203,23 @@ pub const DEFAULT_ASKS_PER_HOUR_TOTAL: u32 = 300;
 /// the DoS. Past this, new identities are refused rather than recorded.
 pub const MAX_TRACKED_REQUESTERS: usize = 4096;
 
+/// Longest requester id this node will store verbatim, in bytes.
+///
+/// A cap on the *number* of tracked requesters bounds entries, not bytes, and
+/// the bytes are the ones an attacker picks: `from` comes off the wire and the
+/// broker's `max_payload` is 64MB (`config/nats-accounts.conf`), so ~85 asks
+/// under distinct 64MB ids would retain ~5.4GB — more than O1 has, and well
+/// inside a 300/hour ceiling. Anything longer than this is replaced by a hash
+/// of itself, which bounds what one entry can retain to a constant while
+/// keeping two different long ids in two different buckets.
+pub const MAX_REQUESTER_ID_BYTES: usize = 128;
+
+/// Bound on the bytes one tracked requester can retain: the `from:`/`inbox:`
+/// tag plus a capped id. Multiplied by [`MAX_TRACKED_REQUESTERS`] this is the
+/// limiter's whole memory footprint, and it is what
+/// [`ServeRateLimiter::tracked_bytes`] measures.
+pub const MAX_REQUESTER_KEY_BYTES: usize = MAX_REQUESTER_ID_BYTES + 8;
+
 /// Identity this node will rate-limit an inbound ask against.
 ///
 /// **Both inputs are chosen by the caller.** NATS core carries no publisher
@@ -197,19 +237,47 @@ pub const MAX_TRACKED_REQUESTERS: usize = 4096;
 /// per-requester limit is the polite bound on an honest neighbour, and the
 /// global ceiling is the bound that actually holds against a caller who rotates.
 /// Say so in the log, not only here.
+/// Every returned key is at most [`MAX_REQUESTER_KEY_BYTES`] bytes, whatever
+/// the caller sent — see [`bounded_id`].
 pub fn requester_key(from: Option<&str>, reply_to: Option<&str>) -> String {
     let declared = from.map(str::trim).filter(|s| !s.is_empty() && *s != "?");
     if let Some(id) = declared {
-        return format!("from:{id}");
+        return format!("from:{}", bounded_id(id));
     }
     match reply_to {
-        Some(inbox) => format!("inbox:{}", inbox_identity(inbox)),
+        Some(inbox) => format!("inbox:{}", bounded_id(&inbox_identity(inbox))),
         None => "anonymous".to_string(),
     }
 }
 
+/// Is this declared id short enough to be worth answering at all?
+///
+/// `requester_key` never stores an oversized id, so this is not what bounds the
+/// limiter — `serve` uses it to refuse an absurd envelope before it costs a
+/// recall, and because an id that long is not a name, it is a payload.
+pub fn id_is_oversized(from: &str) -> bool {
+    from.len() > MAX_REQUESTER_ID_BYTES
+}
+
+/// An id capped at [`MAX_REQUESTER_ID_BYTES`] bytes.
+///
+/// Short ids pass through unchanged, so the common case stays readable in the
+/// log. A long one becomes `#<32 hex>` — a hash, not a truncation, because
+/// truncating to a shared prefix would let one caller choose which *other*
+/// caller's bucket to exhaust by prefixing its id.
+pub fn bounded_id(id: &str) -> String {
+    if id.len() <= MAX_REQUESTER_ID_BYTES {
+        return id.to_string();
+    }
+    let digest = blake3::hash(id.as_bytes());
+    format!("#{}", &digest.to_hex().as_str()[..32])
+}
+
 /// The stable prefix of a reply inbox: `_INBOX.<tag>.<pid>`. Anything past the
 /// third token is fresh per request and would make every ask a new identity.
+///
+/// The tokens themselves are wire-sized, so the result still goes through
+/// [`bounded_id`] before it is stored.
 pub fn inbox_identity(reply_to: &str) -> String {
     reply_to
         .split('.')
@@ -337,11 +405,29 @@ impl ServeRateLimiter {
         self.global_limit
     }
 
-    /// Decide one inbound ask, and count it when the answer is yes.
+    /// Decide one inbound ask.
     ///
-    /// The global bucket is checked first: it is the ceiling that holds when a
-    /// caller rotates identity, and checking it first means a rotating caller
-    /// cannot spend the node's hour by seeding 300 fresh per-requester buckets.
+    /// Counts it against **the requester's** bucket when the answer is yes, and
+    /// leaves the global bucket alone: the global ceiling is committed by
+    /// [`commit_global`](Self::commit_global), at the point the ask actually
+    /// reaches the model.
+    ///
+    /// That split is the whole design, and getting it wrong made the control
+    /// worse than the problem. `swarm serve` decides whether to answer a
+    /// broadcast at all with a resonance gate *after* this call. If this
+    /// function committed the global bucket, a stranger publishing ~30-byte
+    /// non-resonant asks — every one silently dropped by that gate, none of
+    /// them costing a token — would still burn the node's hourly ceiling at one
+    /// ask every twelve seconds and take the public `ask_kannaka` off the air
+    /// for everybody. An abuse control that a 30-byte publish can turn into an
+    /// outage is a cheaper attack than the one it was written to stop.
+    ///
+    /// The per-requester bucket *is* committed here, because everything past
+    /// this point costs a full recall against the medium on a 1-vCPU hub. That
+    /// is CPU the caller spends on itself, and it denies nobody else.
+    ///
+    /// The global ceiling is still *checked* first, so a caller who rotates
+    /// identity cannot seed a hundred fresh buckets past an exhausted node.
     pub fn check(&mut self, key: &str, now_secs: u64) -> RateDecision {
         self.global.roll(now_secs);
         if self.global.count >= self.global_limit {
@@ -370,13 +456,33 @@ impl ServeRateLimiter {
         }
 
         bucket.count += 1;
-        self.global.count += 1;
         RateDecision::Allow
+    }
+
+    /// Commit one ask against the hourly ceiling. Call it where the spend
+    /// happens — after every gate that could still drop the ask, immediately
+    /// before the model call — so the ceiling bounds what it claims to bound.
+    pub fn commit_global(&mut self, now_secs: u64) {
+        self.global.roll(now_secs);
+        self.global.count = self.global.count.saturating_add(1);
     }
 
     /// Requesters currently tracked. For the log line only.
     pub fn tracked(&self) -> usize {
         self.requesters.len()
+    }
+
+    /// Bytes the tracked keys retain. The cap that matters is this one, not the
+    /// entry count: entries are bounded by [`MAX_TRACKED_REQUESTERS`], but the
+    /// bytes inside them come off the wire, so a test that counts entries would
+    /// pass while the map held gigabytes.
+    pub fn tracked_bytes(&self) -> usize {
+        self.requesters.keys().map(|k| k.len()).sum()
+    }
+
+    /// Asks committed against the hourly ceiling in the current window.
+    pub fn global_committed(&self) -> u32 {
+        self.global.count
     }
 }
 
@@ -396,15 +502,33 @@ pub enum SpendPosture {
     Free { why: &'static str },
     /// A keyed provider with a ceiling the operator has declared.
     Capped { how: String },
-    /// A keyed provider with no declared ceiling. This is the #932 exposure:
-    /// every anonymous broadcast this node answers spends the operator's money
-    /// against no stated limit.
+    /// A keyed provider with no declared ceiling, reached through a gateway the
+    /// operator interposed — a `base_url` that is neither this box nor the
+    /// vendor's own API host.
+    ///
+    /// This is `kannaka-prime`'s shape, and a gateway is where budgets live: the
+    /// operator put something in front of the vendor, and a virtual key with a
+    /// cap is the usual reason. That is evidence, not proof, so this still says
+    /// something — it just does not shout. Shouting at the one node everybody
+    /// watches, about a key that *is* capped, is how a banner stops being read.
+    UndeclaredGateway { base_url: String },
+    /// A keyed provider with no declared ceiling, against the vendor's own API.
+    /// This is the #932 exposure at its plainest: every anonymous broadcast this
+    /// node answers spends the operator's money against no stated limit and
+    /// nothing in between.
     Unbounded,
 }
 
 impl SpendPosture {
+    /// The vendor-direct, no-ceiling case — the one that gets the loud banner.
     pub fn is_unbounded(&self) -> bool {
         matches!(self, SpendPosture::Unbounded)
+    }
+
+    /// This node can spend and has declared no ceiling *here*, whether or not
+    /// something upstream caps it. What `KANNAKA_SERVE_REFUSE_UNBOUNDED` acts on.
+    pub fn declares_no_ceiling(&self) -> bool {
+        matches!(self, SpendPosture::Unbounded | SpendPosture::UndeclaredGateway { .. })
     }
 }
 
@@ -439,7 +563,38 @@ pub fn spend_posture(llm: &LlmConfig, key_present: bool) -> SpendPosture {
             how: "operator declares the key is capped upstream (externally_capped = true)".to_string(),
         };
     }
+    if !is_vendor_api_host(&llm.base_url) {
+        return SpendPosture::UndeclaredGateway { base_url: llm.base_url.clone() };
+    }
     SpendPosture::Unbounded
+}
+
+/// Does this `base_url` point at the model vendor's own API, rather than at
+/// something the operator put in front of it?
+///
+/// Empty counts as vendor: `client_from_config` fills in `api.anthropic.com` /
+/// `api.openai.com` for an empty `base_url`, so an unset URL is the vendor
+/// direct. Callers reach here only after the local check, so a gateway on this
+/// box has already been classified as free.
+pub fn is_vendor_api_host(base_url: &str) -> bool {
+    let u = base_url.trim();
+    if u.is_empty() {
+        return true;
+    }
+    let after_scheme = u.split("://").nth(1).unwrap_or(u);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "api.anthropic.com" | "api.openai.com" | "anthropic.com" | "openai.com"
+    )
 }
 
 /// Is this base URL served from the machine `serve` runs on?
@@ -502,6 +657,10 @@ pub fn refuse_unbounded_requested() -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `SERVING_HOPS` is process-wide and `cargo test` runs tests in parallel
+    /// threads, so the two tests that write it must not interleave.
+    static CELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn llm(provider: &str, model: &str, base_url: &str) -> LlmConfig {
         LlmConfig {
@@ -576,12 +735,40 @@ mod tests {
     }
 
     #[test]
+    fn a_forged_hop_count_cannot_become_not_serving() {
+        let _guard = CELL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The regression: `hops` clamped to u32::MAX, which was also the in-band
+        // sentinel for "this process originated the ask". A wire value of
+        // 4294967295 round-tripped back to None and handed the forger a fresh
+        // hop budget. Both halves are closed — the clamp, and the sentinel.
+        for forged in [u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX, 9_999_999] {
+            let h = hops_of(&json!({ "text": "hi", "hops": forged }));
+            assert_eq!(h, HOPS_CLAMP, "wire {forged} must clamp below any sentinel");
+            assert!(!may_forward(h), "a forged hop count must not be forwardable");
+            set_serving_hops(Some(h));
+            assert_eq!(
+                serving_hops(),
+                Some(h),
+                "wire {forged} must not read back as `not serving`"
+            );
+            set_serving_hops(None);
+        }
+    }
+
+    #[test]
     fn serving_hops_cell_round_trips() {
+        let _guard = CELL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(serving_hops(), None, "idle process is not serving");
         set_serving_hops(Some(0));
         assert_eq!(serving_hops(), Some(0));
         set_serving_hops(Some(1));
         assert_eq!(serving_hops(), Some(1));
+        set_serving_hops(Some(u32::MAX));
+        assert_eq!(
+            serving_hops(),
+            Some(u32::MAX),
+            "no u32 value may double as `not serving`"
+        );
         set_serving_hops(None);
         assert_eq!(serving_hops(), None);
     }
@@ -641,10 +828,12 @@ mod tests {
     #[test]
     fn the_global_ceiling_holds_when_a_caller_rotates_identity() {
         let mut rl = ServeRateLimiter::new(2, 5);
-        // Five asks, each under a fresh identity: the per-requester limit never
-        // fires, and the global ceiling is the only thing standing.
+        // Five asks, each under a fresh identity and each reaching the model:
+        // the per-requester limit never fires, and the global ceiling is the
+        // only thing standing.
         for i in 0..5 {
             assert!(rl.check(&format!("from:sock{i}"), 1000).is_allow(), "ask {i}");
+            rl.commit_global(1000);
         }
         match rl.check("from:sock99", 1000) {
             RateDecision::Global { limit, first_in_window } => {
@@ -661,6 +850,38 @@ mod tests {
     }
 
     #[test]
+    fn asks_that_never_reach_the_model_do_not_consume_global_budget() {
+        // The outage the earlier revision created: `swarm serve` decides whether
+        // to answer a broadcast with a resonance gate AFTER the limiter runs, and
+        // anon may publish KANNAKA.ask.broadcast. If passing `check` spent the
+        // hourly ceiling, a stranger publishing ~30-byte non-resonant asks — every
+        // one dropped by that gate, none of them costing a token — would take the
+        // public ask_kannaka off the air at one publish every twelve seconds.
+        let mut rl = ServeRateLimiter::new(u32::MAX, 5);
+        for i in 0..500 {
+            assert!(
+                rl.check(&format!("from:flood{i}"), 1000).is_allow(),
+                "non-resonant ask {i} passes the limiter"
+            );
+            // ...and is then dropped by the resonance gate. No commit_global.
+        }
+        assert_eq!(
+            rl.global_committed(),
+            0,
+            "an ask that never reached the model must not have spent the ceiling"
+        );
+        // The product is still on the air for everybody.
+        for i in 0..5 {
+            assert!(rl.check("from:honest", 1000).is_allow(), "honest ask {i}");
+            rl.commit_global(1000);
+        }
+        assert!(
+            !rl.check("from:honest", 1000).is_allow(),
+            "and the ceiling still bounds what actually spends"
+        );
+    }
+
+    #[test]
     fn a_refusal_says_something_polite() {
         let mut rl = ServeRateLimiter::new(1, 10);
         assert!(rl.check("from:a", 0).is_allow());
@@ -669,6 +890,67 @@ mod tests {
         assert!(text.contains("rate limited"), "{text}");
         assert!(!text.contains("from:a"), "a refusal is not a reconnaissance surface: {text}");
         assert_eq!(RateDecision::Allow.refusal_text(), None);
+    }
+
+    #[test]
+    fn an_oversized_id_is_stored_as_a_bounded_hash() {
+        // `from` comes off the wire and the broker's max_payload is 64MB, so the
+        // id is attacker-SIZED, not just attacker-chosen. Counting entries would
+        // pass while the map held gigabytes.
+        let huge = "A".repeat(900_000);
+        let key = requester_key(Some(&huge), None);
+        assert!(
+            key.len() <= MAX_REQUESTER_KEY_BYTES,
+            "a 900KB id produced a {}-byte key",
+            key.len()
+        );
+        assert!(id_is_oversized(&huge));
+        assert!(!id_is_oversized("kannaka-prime"));
+        // A hash, not a truncation: one caller must not be able to land in
+        // another's bucket by sharing a prefix.
+        let sibling = format!("{huge}-different-tail");
+        assert_ne!(
+            requester_key(Some(&huge), None),
+            requester_key(Some(&sibling), None),
+            "two long ids must stay two buckets"
+        );
+        assert_eq!(
+            requester_key(Some(&huge), None),
+            requester_key(Some(&huge), None),
+            "and the same id must stay one bucket"
+        );
+        // Short ids are untouched, so the log stays readable.
+        assert_eq!(requester_key(Some("kannaka-prime"), None), "from:kannaka-prime");
+        // The inbox fallback is bounded the same way — its tokens are wire-sized too.
+        let huge_inbox = format!("_INBOX.req.{}", "9".repeat(900_000));
+        assert!(requester_key(None, Some(&huge_inbox)).len() <= MAX_REQUESTER_KEY_BYTES);
+    }
+
+    #[test]
+    fn identity_rotation_cannot_grow_the_limiter_beyond_a_byte_bound() {
+        // Global ceiling above the tracking cap so the map, not the ceiling, is
+        // what this test exercises.
+        let mut rl = ServeRateLimiter::new(1, u32::MAX);
+        // Fill it the way an attacker would: one huge distinct id per ask.
+        let pad = "Z".repeat(4096);
+        for i in 0..MAX_TRACKED_REQUESTERS {
+            let key = requester_key(Some(&format!("{pad}{i}")), None);
+            assert!(rl.check(&key, 1000).is_allow(), "ask {i}");
+        }
+        assert_eq!(rl.tracked(), MAX_TRACKED_REQUESTERS);
+        // BYTES, not entries — the check has to be as strong as the thing it
+        // checks. 4096 ids of 4KB each would be 16MiB retained; hashed, it is
+        // two orders of magnitude less.
+        let bytes = rl.tracked_bytes();
+        assert!(
+            bytes <= MAX_TRACKED_REQUESTERS * MAX_REQUESTER_KEY_BYTES,
+            "limiter retained {bytes} bytes, over the {} byte bound",
+            MAX_TRACKED_REQUESTERS * MAX_REQUESTER_KEY_BYTES
+        );
+        assert!(
+            bytes < 4096 * MAX_TRACKED_REQUESTERS / 8,
+            "retained {bytes} bytes — the cap is not actually bounding the keys"
+        );
     }
 
     #[test]
@@ -722,31 +1004,69 @@ mod tests {
 
     #[test]
     fn prime_on_a_capped_remote_gateway_is_not_unbounded() {
-        // The live kannaka-prime config, plus the marker this PR adds.
+        // The live kannaka-prime config, EXACTLY as it upgrades: the new
+        // `externally_capped` field defaults to false, so nothing in the file
+        // has changed. It must not draw the loud banner — prime is the one node
+        // everybody watches, and a false alarm there is how a banner stops being
+        // read. A gateway the operator interposed is evidence of a budget.
         let mut c = llm("openai", "kannaka-claude-haiku", "https://ninja-portal.com/v1");
-        assert_eq!(
-            spend_posture(&c, true),
-            SpendPosture::Unbounded,
-            "undeclared, a remote gateway key looks exactly like any other paid key"
+        assert!(!c.externally_capped, "the field is new — prime upgrades with it unset");
+        match spend_posture(&c, true) {
+            SpendPosture::UndeclaredGateway { base_url } => {
+                assert_eq!(base_url, "https://ninja-portal.com/v1");
+            }
+            other => panic!("expected UndeclaredGateway, got {other:?}"),
+        }
+        assert!(
+            !spend_posture(&c, true).is_unbounded(),
+            "prime must not draw the vendor-direct banner"
         );
+        assert!(
+            spend_posture(&c, true).declares_no_ceiling(),
+            "it still has not declared one here, and the notice must say so"
+        );
+        // Once the operator sets the flag, it is settled outright.
         c.externally_capped = true;
         match spend_posture(&c, true) {
             SpendPosture::Capped { how } => assert!(how.contains("externally_capped"), "{how}"),
             other => panic!("expected Capped, got {other:?}"),
         }
+        assert!(!spend_posture(&c, true).declares_no_ceiling());
+    }
+
+    #[test]
+    fn a_vendor_direct_key_still_gets_the_loud_banner() {
+        // The gateway carve-out must not swallow the plain case it exists beside.
+        for base in ["", "https://api.anthropic.com", "https://api.openai.com/v1"] {
+            let c = llm(
+                if base.contains("openai") { "openai" } else { "anthropic" },
+                "m",
+                base,
+            );
+            assert_eq!(
+                spend_posture(&c, true),
+                SpendPosture::Unbounded,
+                "a vendor-direct key with no ceiling is the plain #932 exposure: {base:?}"
+            );
+        }
+        assert!(is_vendor_api_host(""));
+        assert!(is_vendor_api_host("https://API.OpenAI.com/v1"));
+        assert!(!is_vendor_api_host("https://ninja-portal.com/v1"));
+        assert!(!is_vendor_api_host("https://api.openai.com.evil.example/v1"));
     }
 
     #[test]
     fn a_local_brain_never_warns() {
         // The installer writes provider = "openai" for the local Ollama brain,
-        // so the base URL has to be what decides.
+        // so the base URL has to be what decides. `declares_no_ceiling` is the
+        // assertion, not `is_unbounded`: a local node must draw NEITHER notice.
         let local_openai = llm("openai", "kannaka-brain", "http://localhost:11434/v1");
-        assert!(!spend_posture(&local_openai, true).is_unbounded());
-        assert!(!spend_posture(&llm("ollama", "kannaka-brain", ""), true).is_unbounded());
-        assert!(!spend_posture(&llm("none", "", ""), true).is_unbounded());
-        assert!(!spend_posture(&llm("", "", ""), false).is_unbounded());
+        assert!(!spend_posture(&local_openai, true).declares_no_ceiling());
+        assert!(!spend_posture(&llm("ollama", "kannaka-brain", ""), true).declares_no_ceiling());
+        assert!(!spend_posture(&llm("none", "", ""), true).declares_no_ceiling());
+        assert!(!spend_posture(&llm("", "", ""), false).declares_no_ceiling());
         assert!(
-            !spend_posture(&llm("anthropic", "claude-sonnet-5", ""), false).is_unbounded(),
+            !spend_posture(&llm("anthropic", "claude-sonnet-5", ""), false).declares_no_ceiling(),
             "no key means nothing to spend"
         );
     }
