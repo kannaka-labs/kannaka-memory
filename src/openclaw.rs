@@ -2534,6 +2534,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The facet guard, exercised rather than merely reasoned about.
+    ///
+    /// ADR-0049 says parent retention is an invariant: deleting a decomposed
+    /// parent dangles every facet that points at it, and deleting a facet drops
+    /// an atom recall depends on. `collapse_exact_duplicates` therefore excludes
+    /// both from grouping. A guard whose reasoning is written down but never
+    /// fired is a check that has never been shown to work, so this test does two
+    /// things at once:
+    ///
+    /// - it proves the guard FIRES: three byte-identical compound memories, all
+    ///   decomposed into facets, are left alone instead of collapsed;
+    /// - it proves the guard is SELECTIVE: an ordinary duplicate pair in the
+    ///   same store still collapses. A blanket "skip everything" would pass the
+    ///   first assertion and fail this one.
+    ///
+    /// The fixture needs a CHIRAL store, because the `is_facet` / `decomposed`
+    /// flags live on the canonical `WavefrontMeta` in the right hemisphere and a
+    /// freshly-created `HrmStore` is flat. One save-and-reload cycle converts it,
+    /// which is why this test re-inits the system.
+    #[test]
+    fn collapse_never_folds_a_facet_structured_row_but_still_folds_ordinary_ones() {
+        use crate::hrm_store::HrmStore;
+
+        // Two sentences, each a standalone clause with no leading pronoun and no
+        // binding connective — the shape ADR-0049 decomposition actually splits.
+        const COMPOUND: &str =
+            "The grid job wrote the colony-one verdict again. \
+             Rogue publishes that verdict on every scheduled run.";
+        // One clause: decomposition leaves it alone, so it stays unprotected.
+        const ATOMIC: &str = "the write lock is advisory only on windows";
+
+        let dir = temp_dir("collapse_facets");
+
+        let compound_ids: Vec<Uuid> = {
+            let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            let ids = (0..3)
+                .map(|_| sys.remember_forcing_new(COMPOUND, "semantic", 0.4).unwrap())
+                .collect::<Vec<_>>();
+            for _ in 0..2 {
+                sys.remember_forcing_new(ATOMIC, "semantic", 0.4).unwrap();
+            }
+            sys.save().unwrap();
+            ids
+        };
+
+        // Reload: the store is now chiral, so the facet flags have somewhere to
+        // live. Decompose, flush, and drop — mirroring `kannaka facets backfill
+        // --apply`, which is a separate process from the `kannaka dedupe` that
+        // follows it. (`backfill_all_facets` does not rebuild the memory cache,
+        // unlike `recompute_encoding` and `chiral_dream`, so the minted facet
+        // rows only reach the cache on the next load. Testing across the reload
+        // is therefore both the honest steady state and the one an operator
+        // actually gets.)
+        let minted = {
+            let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            let hrm = sys
+                .engine
+                .store
+                .as_any_mut()
+                .downcast_mut::<HrmStore>()
+                .expect("reloaded store must be an HrmStore");
+            assert!(
+                hrm.chiral_medium().is_some(),
+                "fixture precondition: the reloaded store must be chiral, or \
+                 facet_structured_ids has nothing to read"
+            );
+            let stats = hrm.backfill_all_facets(true);
+            assert_eq!(
+                stats.parents_decomposed, 3,
+                "fixture precondition: all three compound copies must decompose: {stats:?}"
+            );
+            assert!(
+                stats.facets_minted >= 3,
+                "fixture precondition: decomposition must mint facets: {stats:?}"
+            );
+            sys.engine.store.flush().unwrap();
+            stats.facets_minted
+        };
+
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let protected = sys.engine.store.facet_structured_ids();
+        assert_eq!(
+            protected.len(),
+            3 + minted,
+            "every decomposed parent and every minted facet must be protected"
+        );
+        for id in &compound_ids {
+            assert!(protected.contains(id), "decomposed parent {id} is not protected");
+        }
+
+        let report = sys.collapse_exact_duplicates(false).unwrap();
+
+        // FIRES: the three identical compound parents are duplicates by content,
+        // and are nonetheless not offered for collapse.
+        assert_eq!(
+            report.skipped_facet_structured,
+            3 + minted,
+            "the guard must account for every facet-structured row it skipped"
+        );
+        for g in &report.groups {
+            assert!(
+                !compound_ids.contains(&g.keeper),
+                "a decomposed parent was chosen as a keeper: {:?}",
+                g.keeper
+            );
+            for f in &g.folded {
+                assert!(
+                    !compound_ids.contains(f),
+                    "a decomposed parent was queued for deletion: {f} — this \
+                     dangles its facets"
+                );
+            }
+        }
+
+        // SELECTIVE: the ordinary duplicate pair in the same store still folds.
+        assert_eq!(
+            report.groups.len(),
+            1,
+            "exactly the unprotected pair should be collapsible, got {:?}",
+            report.groups.iter().map(|g| &g.preview).collect::<Vec<_>>()
+        );
+        assert_eq!(report.groups[0].preview, ATOMIC);
+        assert_eq!(report.duplicates(), 1, "one of the two atomic copies folds");
+
+        // And applying it really does leave the facet structure intact.
+        let before = sys.engine.store.count();
+        let applied = sys.collapse_exact_duplicates(true).unwrap();
+        assert_eq!(applied.errors, 0);
+        assert_eq!(
+            sys.engine.store.count(),
+            before - 1,
+            "only the one unprotected duplicate is removed"
+        );
+        for id in &compound_ids {
+            assert!(
+                sys.get_memory(id).unwrap().is_some(),
+                "decomposed parent {id} was deleted"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The dream digest is DURABLE history — JetStream captures
     /// `KANNAKA.events.dream.>` for 90 days — so its field names and nesting
     /// are an archive schema, not just a message shape. Pin them.
