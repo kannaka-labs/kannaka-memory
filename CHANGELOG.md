@@ -116,6 +116,15 @@ folded ids out of `.times_seen.json` and that sidecar's merge only ever raises a
 restoring the medium alone would leave an inflation nothing could later correct. Nothing
 schedules it.
 
+**One interaction is known and deliberately not fixed here.** `stage_prune` skips dampening
+entirely for any memory above amplitude 0.5 when `protect_established` or the belief phase is
+on, and a single repeat from a verdict-typical 0.4 crosses that line. On a node running with
+either switch enabled, a reinforced LongTerm memory is never dampened, never ghosted and never
+compacted. Both default off, and the ShortTerm rule above removes the ADR-0054 half of the
+problem, but the threshold itself belongs to `stage_prune` and moving it from here would be
+changing consolidation's retention policy through a side door. Check `KANNAKA_BELIEF_PHASE` on
+the live nodes before enabling either switch.
+
 **Peer re-sends no longer earn reputation.** Both swarm absorb sites now use
 `remember_reporting`: a byte-identical re-send strengthens the memory but commits no
 promotion and increments no absorb counter, because those are "a new contribution landed"
