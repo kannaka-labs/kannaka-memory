@@ -1067,7 +1067,7 @@ fn is_builtin_subcommand(verb: &str) -> bool {
         | "kannaktopus"
         | "neighbors" | "cmf" | "invariant" | "topology" | "bias"
         // perception
-        | "hear" | "see"
+        | "hear" | "see" | "watch"
         // reasoning
         | "ask" | "chat" | "agent" | "voice"
         // swarm / nats
@@ -3883,6 +3883,170 @@ fn main() {
                     println!("  Centroid: {:.2} kHz", features.spectral_centroid_khz);
                     if !features.feature_tags.is_empty() {
                         println!("  Tags: {}", features.feature_tags.join(", "));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        // ADR-0008: the eye. Deliberately NOT `see` -- that verb is the SGA
+        // glyph path and keeps its meaning. `watch` is temporal perception:
+        // frames, shots, motion, visual tempo.
+        #[cfg(feature = "video")]
+        "watch" => {
+            if args.len() < command_start + 2 {
+                eprintln!("Usage: kannaka watch <video-file> [--fps N] [--json] [--long-term]");
+                eprintln!("  kannaka watch ./clip.mp4");
+                eprintln!("  kannaka watch ./clip.mp4 --fps 4 --json");
+                eprintln!(
+                    "  Clips are short-term by default (triage-eligible); --long-term to keep."
+                );
+                process::exit(1);
+            }
+
+            let mut fps = kannaka_memory::eye::DEFAULT_FPS;
+            let mut long_term = false;
+            let want_json = args.iter().any(|a| a == "--json");
+            let mut i = command_start + 2;
+            while i < args.len() {
+                if args[i] == "--fps" && i + 1 < args.len() {
+                    match args[i + 1].parse::<f32>() {
+                        Ok(n) if n > 0.0 && n <= 60.0 => fps = n,
+                        _ => {
+                            eprintln!("--fps must be a number in (0, 60]");
+                            process::exit(1);
+                        }
+                    }
+                    i += 2;
+                } else if args[i] == "--long-term" {
+                    long_term = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+
+            let path = std::path::PathBuf::from(&args[command_start + 1]);
+            if !path.exists() {
+                eprintln!("File not found: {}", path.display());
+                process::exit(1);
+            }
+
+            // ffmpeg is a runtime dependency and is genuinely absent on some
+            // fleet nodes. Say so here, once, in words an operator can act on,
+            // rather than letting it surface as a decode failure.
+            if !kannaka_memory::eye::ffmpeg_available() {
+                eprintln!("ffmpeg not found on PATH - the eye needs it to decode.");
+                eprintln!("  Install ffmpeg (which also provides ffprobe) and re-run.");
+                eprintln!("    Debian/Ubuntu: sudo apt-get install -y ffmpeg");
+                eprintln!("    Oracle/RHEL:   sudo dnf install -y ffmpeg");
+                eprintln!("    Windows:       winget install Gyan.FFmpeg");
+                process::exit(1);
+            }
+
+            warn_if_readonly("watch");
+
+            match sys.store_video(&path, fps) {
+                Ok((id, features)) => {
+                    // Mirrors `hear` (ADR-0031 Phase 2b): perception captures are
+                    // high-rate and semantically redundant, so they land ShortTerm
+                    // and are promoted only if a dream strengthens them.
+                    if !long_term {
+                        if let Some(hrm) = sys
+                            .engine
+                            .store
+                            .as_any_mut()
+                            .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                        {
+                            hrm.set_tier(&id, kannaka_memory::medium::types::Tier::ShortTerm);
+                            let _ = sys.save();
+                        }
+                    }
+
+                    let colors: Vec<String> = features
+                        .dominant_colors
+                        .iter()
+                        .map(|c| {
+                            format!("{} ({:.0}deg s{:.2} v{:.2})", c.name, c.hue, c.saturation, c.value)
+                        })
+                        .collect();
+
+                    if want_json {
+                        let out = serde_json::json!({
+                            "id": id.to_string(),
+                            "path": path.display().to_string(),
+                            "tier": if long_term { "long-term" } else { "short-term" },
+                            "modality": "visual",
+                            "duration_secs": features.duration_secs,
+                            "frame_count": features.frame_count,
+                            "analysis_fps": features.analysis_fps,
+                            "shot_count": features.shot_count,
+                            "shot_boundaries": features.shot_boundaries,
+                            "motion": {
+                                "mean_px": features.motion_mean,
+                                "std_px": features.motion_std,
+                                "max_px": features.motion_max,
+                            },
+                            "mean_brightness": features.mean_brightness(),
+                            "mean_contrast": features.mean_contrast(),
+                            "visual_tempo_bpm": features.visual_tempo_bpm(),
+                            "dominant_colors": features
+                                .dominant_colors
+                                .iter()
+                                .map(|c| serde_json::json!({
+                                    "name": c.name,
+                                    "hue": c.hue,
+                                    "saturation": c.saturation,
+                                    "value": c.value,
+                                }))
+                                .collect::<Vec<_>>(),
+                            "tags": features.feature_tags,
+                            "feature_dim": features.vector.len(),
+                            "spatial_dim": features.spatial.vector.len(),
+                            "temporal_dim": features.temporal.vector.len(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                    } else {
+                        println!(
+                            "Watched: {id}{}",
+                            if long_term { "" } else { " (short-term)" }
+                        );
+                        println!(
+                            "  Duration: {:.1}s ({} frames @ {:.1} fps)",
+                            features.duration_secs, features.frame_count, features.analysis_fps
+                        );
+                        if features.shot_boundaries.is_empty() {
+                            println!("  Shots: 1 (no cuts)");
+                        } else {
+                            println!(
+                                "  Shots: {} (cuts at frames {})",
+                                features.shot_count,
+                                features
+                                    .shot_boundaries
+                                    .iter()
+                                    .map(|b| b.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                        println!(
+                            "  Motion: {:.2} px/step (peak {:.2})",
+                            features.motion_mean, features.motion_max
+                        );
+                        println!(
+                            "  Brightness: {:.0}/255   Contrast: {:.1}",
+                            features.mean_brightness(),
+                            features.mean_contrast()
+                        );
+                        println!("  Visual tempo: {:.0} bpm", features.visual_tempo_bpm());
+                        if !colors.is_empty() {
+                            println!("  Colours: {}", colors.join(", "));
+                        }
+                        if !features.feature_tags.is_empty() {
+                            println!("  Tags: {}", features.feature_tags.join(", "));
+                        }
                     }
                 }
                 Err(e) => {

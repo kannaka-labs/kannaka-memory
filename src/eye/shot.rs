@@ -96,3 +96,88 @@ pub fn shot_statistics(boundaries: &[usize], total_frames: usize) -> ShotStats {
         regularity,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 192-dim feature row whose first 48 dims (the HSV histogram that shot
+    /// detection reads) are a one-hot on `bin`.
+    fn frame_with_color(bin: usize) -> Vec<f32> {
+        let mut f = vec![0.0f32; 192];
+        f[bin] = 1.0;
+        f
+    }
+
+    #[test]
+    fn a_hard_cut_between_two_solid_colors_yields_exactly_one_boundary() {
+        // Four frames of one colour, then four of another: one cut.
+        let mut frames: Vec<Vec<f32>> = (0..4).map(|_| frame_with_color(3)).collect();
+        frames.extend((0..4).map(|_| frame_with_color(20)));
+
+        let boundaries = detect_shots(&frames);
+        assert_eq!(
+            boundaries,
+            vec![4],
+            "the cut is at frame 4 (the first frame of the new shot)"
+        );
+    }
+
+    #[test]
+    fn two_hard_cuts_yield_two_boundaries() {
+        let mut frames: Vec<Vec<f32>> = (0..4).map(|_| frame_with_color(3)).collect();
+        frames.extend((0..4).map(|_| frame_with_color(20)));
+        frames.extend((0..4).map(|_| frame_with_color(40)));
+        assert_eq!(detect_shots(&frames), vec![4, 8]);
+    }
+
+    #[test]
+    fn a_static_sequence_yields_no_boundaries() {
+        let frames: Vec<Vec<f32>> = (0..10).map(|_| frame_with_color(5)).collect();
+        assert!(
+            detect_shots(&frames).is_empty(),
+            "identical frames contain no cut"
+        );
+    }
+
+    #[test]
+    fn a_single_frame_yields_no_boundaries() {
+        assert!(detect_shots(&[frame_with_color(1)]).is_empty());
+        assert!(detect_shots(&[]).is_empty());
+    }
+
+    #[test]
+    fn shot_statistics_with_no_boundaries_describe_one_whole_shot() {
+        let stats = shot_statistics(&[], 40);
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.mean_length, 40.0);
+        assert_eq!(stats.std_length, 0.0);
+        assert_eq!(stats.regularity, 1.0);
+    }
+
+    #[test]
+    fn shot_statistics_split_the_clip_at_each_boundary() {
+        // Boundaries at 10 and 20 over 30 frames = three shots of 10.
+        let stats = shot_statistics(&[10, 20], 30);
+        assert_eq!(stats.count, 3);
+        assert!((stats.mean_length - 10.0).abs() < 1e-5);
+        assert!((stats.std_length - 0.0).abs() < 1e-5);
+        assert!((stats.max_length - 10.0).abs() < 1e-5);
+        assert!(
+            (stats.regularity - 1.0).abs() < 1e-5,
+            "evenly spaced cuts are perfectly regular"
+        );
+    }
+
+    #[test]
+    fn irregular_cuts_score_below_regular_ones() {
+        let regular = shot_statistics(&[10, 20], 30);
+        let irregular = shot_statistics(&[2, 25], 30);
+        assert!(
+            irregular.regularity < regular.regularity,
+            "regularity {} should be below {}",
+            irregular.regularity,
+            regular.regularity
+        );
+    }
+}

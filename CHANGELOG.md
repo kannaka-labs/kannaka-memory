@@ -2,6 +2,95 @@
 
 ## [Unreleased]
 
+### Added — eye: the video perception engine has had no callers since March (ADR-0008)
+
+`src/eye/` has been in the tree since 2026-03-01: 1,607 lines of decoder, spatial
+features, temporal features, block-matching optical flow and shot detection, behind
+a `video` feature that was not in `default` and a `VideoPipeline` that nothing ever
+constructed. One file had tests. The eye could not be reached from the CLI, from
+`OpenClawSystem`, or from anything else. It perceived nothing.
+
+**`kannaka watch <video-file>`** runs a clip through the whole path — ffmpeg decode
+at 2 fps and 320 px wide, 192 spatial dims per frame, 128 sequence-level temporal
+dims, projected through the EYE codebook (seed `0x3E5E`) into the same
+10,000-dimensional space as text and audio — and prints duration, frames sampled,
+shot count and cut positions, motion magnitude, brightness, contrast, visual tempo
+and named dominant colours. `--json` for the machine-readable form, `--fps N` to
+sample harder, `--long-term` to keep the clip out of short-term triage.
+
+The verb is `watch`, not `see`. `see` is the SGA glyph path and keeps its meaning;
+`watch` is temporal — shots, motion, arc.
+
+**Into the HRM**, mirroring `store_audio`. `store_video` absorbs a perceptually
+descriptive content string ("video:watched moving cut bright | 4 shots …"), never
+the `video:/tmp/<hash>.mp4` path the encoder produces — embedding the path is how
+the audio side once collapsed every capture into one hive with `xi_diversity` 0.
+The wavefront is then tagged `Modality::Visual` explicitly rather than left to a
+keyword vote, gets the ADR-0008 wave parameters (frequency 0.03, phase π/2, decay
+3e-7), and lands `ShortTerm` like a `hear` does, promoted only if a dream
+strengthens it.
+
+**ffmpeg is a runtime dependency and is genuinely absent on some fleet nodes.**
+`ffprobe` is now probed alongside `ffmpeg` — it is a separate binary, and a PATH
+with only one of the two used to fail later as an opaque "ffprobe JSON parse
+error". A missing decoder gives the operator a named, actionable message with the
+install line for their platform, never a panic, and every test that needs a real
+decode skips cleanly instead of failing.
+
+### Fixed — eye: 32 of the 192 spatial dims were a hardcoded zero in every video
+
+`extract_frame_features` reserves 32 dims for the optical-flow histogram and fills
+them with zeros, because flow is a property of a frame *pair* and a single frame
+cannot see one. Nothing ever filled them in: `motion.rs` — block matching, flow
+histogram, motion statistics, 149 lines — had no caller anywhere in the crate. A
+sixth of the spatial vector was a constant, and the pipeline could not tell a
+locked-off tripod from a whip pan.
+
+`VideoPipeline::analyze` now fills that band from block matching between
+consecutive frames, and reports mean/std/peak motion in pixels. Frame 0 inherits
+frame 1's flow rather than staying zero, so a clip no longer opens with a spurious
+jump that the temporal motion trajectory reads as a burst of movement.
+
+Two defects surfaced the moment the code was exercised:
+
+**Block matching reported maximum motion for a static frame.** The search keeps
+the first candidate with the lowest sum of absolute differences, and it starts at
+`(-8, -8)`. A flat or uniform block matches every offset equally, so a tripod shot
+of a clear sky came back panning diagonally at the corner of the search window.
+Ties now break toward the smallest displacement, which is also the right prior for
+real footage: given equal evidence, the block did not move.
+
+**`dominant_colors` lost half of any frame with vertical structure.** The k-means
+centroids were seeded at evenly spaced sample *indices*, and samples arrive in
+row-major order, so the stride `samples.len() / k` lines up with the row period. A
+frame that is red on the left and blue on the right seeded all four centroids on
+red pixels — and identical centroids send every sample to cluster 0, collapsing
+k-means to one average colour. Seeding is now farthest-point. The results are also
+ordered by cluster population instead of by brightness, which is what "most
+dominant" was supposed to mean all along; sorting by value let a one-pixel
+highlight outrank the colour covering the frame.
+
+### Changed — eye: `video` is a default feature and no longer pulls in `image`
+
+The module cannot be reached from a default build otherwise, which is how it sat
+dead for six months. `video = ["image"]` enabled the `image` crate and its whole
+decoder tree; nothing in `src/eye/` ever referenced it — the decode is an ffmpeg
+subprocess. The feature is now `video = []` and the dependency is gone, so
+default builds gain the eye and lose a codec tree. ADR-0008 principle 4 holds: no
+GPU, no neural inference, algorithmic features only.
+
+### Tests — eye: five of seven files had none
+
+`decode.rs`, `shot.rs`, `motion.rs`, `spatial.rs`, `color.rs` and `mod.rs` now have
+51 tests between them, all on frame sequences synthesised in memory — no video
+fixture on disk, no network fetch, no ffmpeg required. A hard cut between two solid
+colours produces exactly one boundary; a static sequence produces none; a 4 px/frame
+pan measures 4 px in the pan direction and nothing in the other; an identical frame
+pair measures zero. `VideoPipeline::encode_frames` exposes the whole perception path
+minus the decoder so tests, and any caller holding frames from elsewhere, can reach
+it directly.
+
+
 ### Changed — remember: a fact seen again is reinforced, not duplicated
 
 Rogue's grid job re-wrote the same verdicts on every run, and the store did what it

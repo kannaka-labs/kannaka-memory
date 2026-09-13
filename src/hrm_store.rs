@@ -2799,6 +2799,7 @@ mod tests {
 
     #[test]
     fn backfill_all_facets_migrates_then_is_idempotent() {
+        let _flag = crate::facet::lock_decompose_flag();
         // #836 regression: write-time decomposition never touches memories
         // stored before the flag existed. The sweep must (a) count correctly
         // in dry-run without mutating, (b) mint facets on --apply, and
