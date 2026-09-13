@@ -693,6 +693,7 @@ impl KannakaMemorySystem {
         steps: usize,
         tier: crate::medium::types::Tier,
         protect_active: bool,
+        age_days: f64,
     ) -> f32 {
         // A ShortTerm row keeps its place in the decay distribution: it gets the
         // count, not the energy. See `move_reinforcement_energy`.
@@ -703,7 +704,7 @@ impl KannakaMemorySystem {
         for _ in 0..steps {
             Self::apply_reinforcement_curve(&mut proposed);
         }
-        crate::consolidation::bounded_by_retention(current, proposed, protect_active)
+        crate::consolidation::bounded_by_retention(current, proposed, protect_active, age_days)
     }
 
     /// One step of the bounded reinforcement curve. See [`REINFORCE_GAIN`].
@@ -762,11 +763,15 @@ impl KannakaMemorySystem {
             if mem.tier == crate::medium::types::Tier::ShortTerm {
                 continue;
             }
+            // The memory's real age: "established" is strong AND old (#950), and a
+            // repeat must not be able to buy protection for something written
+            // minutes ago any more than a large importance could.
+            let age = crate::consolidation::age_days(mem.created_at);
             let bounded =
-                Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, protect);
+                Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, protect, age);
             // Unbounded, for comparison only: did the boundary actually bite here?
             let unbounded =
-                Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, false);
+                Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, false, age);
             if unbounded > bounded {
                 *clamped = true;
             }
@@ -1101,17 +1106,21 @@ impl KannakaMemorySystem {
             // Predicted from the KEEPER's own amplitude with the group's
             // strongest member as the floor — exactly the two arguments
             // `move_reinforcement_energy` will pass on the apply path.
-            let keeper_amplitude = members
-                .iter()
-                .find(|m| m.id == keeper_id)
-                .map(|m| m.amplitude)
-                .unwrap_or(amplitude_before);
+            // Amplitude AND age come from the same lookup on purpose. Taking them
+            // from two places is how a dry run comes to promise a number the apply
+            // path refuses — the defect this review already found twice.
+            let keeper_row = members.iter().find(|m| m.id == keeper_id);
+            let keeper_amplitude = keeper_row.map(|m| m.amplitude).unwrap_or(amplitude_before);
+            let keeper_age = keeper_row
+                .map(|m| crate::consolidation::age_days(m.created_at))
+                .unwrap_or(0.0);
             let amplitude_after = Self::reinforced_amplitude(
                 keeper_amplitude,
                 amplitude_before,
                 folded.len(),
                 keeper_tier,
                 self.established_protection_active(),
+                keeper_age,
             );
 
             if apply {
@@ -3086,6 +3095,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Build the accident: five identical copies, as the live store held them.
+    /// Backdate a memory so the #950 age half of `is_established_protected` is
+    /// satisfied. A test that writes a row and immediately expects it to be
+    /// "established" is asserting the bug: an ordinary write is minutes old, and
+    /// on prime the median protected memory was 1.6 days old against 2.4 for the
+    /// unprotected ones — amplitude was selecting for recency, not seniority.
+    fn backdate(sys: &mut KannakaMemorySystem, id: &Uuid, days: i64) {
+        if let Ok(Some(mem)) = sys.engine.store.get_mut(id) {
+            mem.created_at = chrono::Utc::now() - chrono::Duration::days(days);
+        }
+    }
+
     fn seed_five_copies(sys: &mut KannakaMemorySystem) -> Vec<Uuid> {
         (0..5)
             .map(|_| sys.remember_forcing_new(FACT, "semantic", 0.4).unwrap())
@@ -4325,6 +4345,11 @@ mod tests {
             bounded_by_retention, is_established_protected, ESTABLISHED_AMPLITUDE,
         };
 
+        // Old enough that the age half of the predicate is satisfied, so this test
+        // exercises the AMPLITUDE half. The young case is asserted at the end.
+        const OLD: f64 = 365.0;
+        const YOUNG: f64 = 0.0;
+
         let below = 0.4_f32;
         // One curve step from a verdict-typical amplitude — the measured 0.4 -> 0.8.
         let mut one_step = below;
@@ -4336,25 +4361,45 @@ mod tests {
 
         // Protection ON: the repeat stops AT the boundary, which is not protected
         // because the guard tests `>`.
-        let capped = bounded_by_retention(below, one_step, true);
+        let capped = bounded_by_retention(below, one_step, true, OLD);
         assert_eq!(capped, ESTABLISHED_AMPLITUDE);
         assert!(
-            !is_established_protected(true, capped),
+            !is_established_protected(true, capped, OLD),
             "a repeat manufactured pruning immunity"
         );
 
         // Protection OFF: nothing to buy immunity from, so the full curve applies.
-        assert_eq!(bounded_by_retention(below, one_step, false), one_step);
+        assert_eq!(bounded_by_retention(below, one_step, false, OLD), one_step);
 
         // A memory that earned its place the hard way is unrestricted: the cap is
         // about crossing the line, not about living above it.
         let above = 0.9_f32;
         let mut above_step = above;
         KannakaMemorySystem::apply_reinforcement_curve(&mut above_step);
-        assert_eq!(bounded_by_retention(above, above_step, true), above_step);
+        assert_eq!(bounded_by_retention(above, above_step, true, OLD), above_step);
 
         // And it never weakens anything.
-        assert_eq!(bounded_by_retention(above, 0.1, true), above);
+        assert_eq!(bounded_by_retention(above, 0.1, true, OLD), above);
+
+        // #950: a memory too young to be established is not protected at ANY
+        // amplitude, so there is no boundary for the clamp to defend and the full
+        // curve applies. This is the half that was missing: amplitude alone said
+        // "established" about a row written seconds ago.
+        assert!(
+            !is_established_protected(true, 1.9, YOUNG),
+            "a brand-new memory at near-ceiling amplitude must not count as established"
+        );
+        assert_eq!(
+            bounded_by_retention(below, one_step, true, YOUNG),
+            one_step,
+            "nothing to protect yet, so nothing to clamp"
+        );
+        // And the day it IS old enough, the clamp is live again — so age delays the
+        // protection rather than granting a permanent exemption from the bound.
+        assert_eq!(
+            bounded_by_retention(below, one_step, true, OLD),
+            ESTABLISHED_AMPLITUDE
+        );
     }
 
     /// The same thing end to end, through `remember`, with the protection forced
@@ -4371,11 +4416,16 @@ mod tests {
         sys.consolidation.protect_established = true;
 
         let id = sys.remember_with_importance(FACT, 0.4).unwrap();
+        // Old enough for protection to be reachable at all, so this test is about
+        // whether a REPEAT can buy it rather than about the row being too young.
+        backdate(&mut sys, &id, 400);
+        let age = crate::consolidation::age_days(sys.get_memory(&id).unwrap().unwrap().created_at);
+        assert!(age > 365.0, "fixture: the row must be old enough to be protectable");
         for n in 1..=20 {
             sys.remember(FACT).unwrap();
             let a = sys.get_memory(&id).unwrap().unwrap().amplitude;
             assert!(
-                !is_established_protected(true, a),
+                !is_established_protected(true, a, age),
                 "repeat {n} bought pruning immunity: amplitude {a}"
             );
             assert!(a <= ESTABLISHED_AMPLITUDE, "repeat {n}: {a}");
@@ -4387,7 +4437,7 @@ mod tests {
         // An explicit `--importance` cannot buy it either: a repeat is a repeat.
         let o = sys.remember_reporting(FACT, "semantic", 0.99).unwrap();
         assert!(
-            !is_established_protected(true, o.amplitude),
+            !is_established_protected(true, o.amplitude, age),
             "--importance on a repeat bought immunity: {}",
             o.amplitude
         );
@@ -4446,9 +4496,16 @@ mod tests {
             sys.remember_forcing_new(FACT, "semantic", 0.15).unwrap();
         }
         let keeper = sys.find_exact_repeat(FACT).unwrap();
+        // Backdated so the #950 age half is satisfied and this test is about the
+        // AMPLITUDE boundary. Without it the keeper is seconds old, nothing can be
+        // protected at any amplitude, and every assertion below passes vacuously.
+        backdate(&mut sys, &keeper, 400);
+        let keeper_age =
+            crate::consolidation::age_days(sys.get_memory(&keeper).unwrap().unwrap().created_at);
+        assert!(keeper_age > 365.0, "fixture: the keeper must be old enough to be protectable");
         let keeper_before = sys.get_memory(&keeper).unwrap().unwrap().amplitude;
         assert!(
-            !is_established_protected(true, keeper_before),
+            !is_established_protected(true, keeper_before, keeper_age),
             "precondition: the keeper must start BELOW the line, else this proves \
              nothing — it was {keeper_before}"
         );
@@ -4456,7 +4513,7 @@ mod tests {
         let dry = sys.collapse_exact_duplicates(false).unwrap();
         assert_eq!(dry.groups.len(), 1);
         assert!(
-            !is_established_protected(true, dry.groups[0].amplitude_after),
+            !is_established_protected(true, dry.groups[0].amplitude_after, keeper_age),
             "the dry run promised an amplitude that buys immunity: {}",
             dry.groups[0].amplitude_after
         );
@@ -4465,7 +4522,7 @@ mod tests {
         assert_eq!(applied.errors, 0);
         let after = sys.get_memory(&keeper).unwrap().unwrap().amplitude;
         assert!(
-            !is_established_protected(true, after),
+            !is_established_protected(true, after, keeper_age),
             "the apply bought immunity: {after}"
         );
         // And the dry run promised exactly what the apply delivered.

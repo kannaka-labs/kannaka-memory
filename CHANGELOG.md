@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Fixed — retention: "established" now means established, not merely recent (#950)
+
+`stage_prune` skips destructive dampening for *established* memories under the
+belief substrate. It decided establishment from amplitude alone, and an ordinary
+write lands at 0.5–0.6 — already above the 0.5 floor. So a memory written a
+minute ago was "established".
+
+Measured on prime, the one node that runs `KANNAKA_BELIEF_PHASE=on`: **676 of
+1054 memories were protected, and their median age was 1.6 days against 2.4 days
+for the unprotected ones.** 75% of the protected set was under a week old. The
+predicate was not merely too broad, it was inverted relative to its own name —
+it selected for recency of writing, so four fifths of the store was shielded from
+the dampening the belief substrate exists to apply.
+
+Establishment now requires strength **and** age: `amplitude > 0.5` and at least
+`KANNAKA_ESTABLISHED_MIN_AGE_DAYS` (default 7). On prime that moves protection
+from 676 memories to 166, whose median age is 38.8 days. Of the 510 that lose it,
+369 are ShortTerm perception rows that ADR-0054 wants cleared anyway. The choice
+of 7 is not delicate: 3 days gives 170 and 14 gives 153, so any value past the
+knee behaves the same.
+
+`retrieval_count` would be the natural "has earned its keep" signal and cannot be
+used — `rebuild_cache` resets it to 0 and it is absent from `WavefrontMeta`, so it
+does not survive a save. `times_seen` only moves under reinforcement, which is
+dark by default. `created_at` is persisted, and is what is left.
+
+**Nothing changes on a node without the belief substrate.** The switch is the
+first clause of the predicate, so on every other fleet member the result is false
+before and after. `KANNAKA_ESTABLISHED_MIN_AGE_DAYS=0` restores the old
+amplitude-only rule exactly; an unparseable or negative value falls back to the
+default rather than to 0, because a typo must not silently reinstate the bug.
+
 ## [0.16.4] — 2026-09-13
 
 ### Added — eye: the video perception engine has had no callers since March (ADR-0008)

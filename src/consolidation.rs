@@ -56,9 +56,59 @@ pub(crate) const ESTABLISHED_AMPLITUDE: f32 = 0.5;
 /// to skip dampening; reinforcement asks it to decide whether a repeat would
 /// cross the boundary. Duplicating the expression instead of sharing it is how
 /// two places come to disagree, so they share it.
-pub(crate) fn is_established_protected(protect_established: bool, amplitude: f32) -> bool {
+///
+/// **Established means strong AND old, not merely strong** (#950). Amplitude on
+/// its own does not mean seniority: an ordinary write lands at 0.5–0.6, which is
+/// already above the floor, so an amplitude-only test protects a memory written
+/// a minute ago. Measured on prime 2026-09-13, where the belief substrate makes
+/// this guard live: 676 of 1054 memories were protected, **their median age was
+/// 1.6 days against 2.4 days for the unprotected ones**, and 75% of them were
+/// under a week old. The predicate was inverted relative to its own name — it
+/// was selecting for recency of writing.
+///
+/// `retrieval_count` would be the natural "has earned its keep" signal and
+/// cannot be used: `rebuild_cache` resets it to 0 and it is absent from
+/// `WavefrontMeta`, so it does not survive a save. `times_seen` only moves under
+/// reinforcement, which is dark by default. `created_at` is persisted and is
+/// what is left.
+/// How long a memory must have existed before its strength counts as
+/// *established* rather than merely *recent*. Override with
+/// `KANNAKA_ESTABLISHED_MIN_AGE_DAYS`; **0 restores the pre-2026-09-13
+/// amplitude-only behaviour exactly**, which is the escape hatch if this turns
+/// out too aggressive on a particular store.
+pub(crate) const ESTABLISHED_MIN_AGE_DAYS: f64 = 7.0;
+
+/// The configured minimum age, read once per call (cheap: one env lookup).
+pub(crate) fn established_min_age_days() -> f64 {
+    parse_min_age_days(std::env::var("KANNAKA_ESTABLISHED_MIN_AGE_DAYS").ok().as_deref())
+}
+
+/// The parsing half, pure so it can be tested without mutating a process-global
+/// variable that every other test in this binary shares.
+///
+/// Anything unparseable, negative, or non-finite falls back to the default
+/// rather than to zero — a typo must not silently restore the bug this fixes.
+pub(crate) fn parse_min_age_days(raw: Option<&str>) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .unwrap_or(ESTABLISHED_MIN_AGE_DAYS)
+}
+
+/// Age of a memory in days. Negative clock skew is clamped to zero rather than
+/// making a future-stamped memory instantly established.
+pub(crate) fn age_days(created_at: chrono::DateTime<chrono::Utc>) -> f64 {
+    let secs = (chrono::Utc::now() - created_at).num_seconds();
+    if secs <= 0 { 0.0 } else { secs as f64 / 86_400.0 }
+}
+
+pub(crate) fn is_established_protected(
+    protect_established: bool,
+    amplitude: f32,
+    age_days: f64,
+) -> bool {
     (protect_established || crate::medium::chiral::belief_phase_enabled())
         && amplitude > ESTABLISHED_AMPLITUDE
+        && age_days >= established_min_age_days()
 }
 
 /// The amplitude a REPEAT may produce.
@@ -78,18 +128,27 @@ pub(crate) fn is_established_protected(protect_established: bool, amplitude: f32
 ///
 /// Pure, and takes `protect_active` rather than reading the environment, so both
 /// branches are testable without mutating process state.
-pub(crate) fn bounded_by_retention(current: f32, proposed: f32, protect_active: bool) -> f32 {
+pub(crate) fn bounded_by_retention(
+    current: f32,
+    proposed: f32,
+    protect_active: bool,
+    age_days: f64,
+) -> f32 {
     // Never weaken, whatever else happens.
     let proposed = proposed.max(current);
-    if is_established_protected(protect_active, current) {
+    if is_established_protected(protect_active, current, age_days) {
         // Already established the hard way: reinforcement is unrestricted.
         return proposed;
     }
-    if is_established_protected(protect_active, proposed) {
+    if is_established_protected(protect_active, proposed, age_days) {
         // Stop AT the boundary. `is_established_protected` tests `>`, so landing
         // exactly on it is still unprotected.
         return ESTABLISHED_AMPLITUDE.max(current);
     }
+    // Too young to be protected at ANY amplitude, so the clamp has nothing to
+    // defend and the full curve applies. It becomes live the day the memory is
+    // old enough, which is the point: reinforcement still cannot be what carries
+    // it across, because by then the amplitude bound applies again.
     proposed
 }
 
@@ -1145,11 +1204,16 @@ impl ConsolidationEngine {
                     if mem.tier == crate::medium::types::Tier::Pinned {
                         continue;
                     }
-                    // Signal protection. ADR-0037: ALWAYS protect established
-                    // memories (amplitude > 0.5) under the belief substrate — the
-                    // phase-scattered field would otherwise dampen strong signal
-                    // memories on the destructive pairs the re-phase creates.
-                    if is_established_protected(self.protect_established, mem.amplitude) {
+                    // Signal protection. ADR-0037: under the belief substrate the
+                    // phase-scattered field manufactures destructive pairs, which
+                    // would otherwise dampen genuinely established memories.
+                    // "Established" is strong AND old — amplitude alone selected
+                    // for memories written minutes ago (#950).
+                    if is_established_protected(
+                        self.protect_established,
+                        mem.amplitude,
+                        age_days(mem.created_at),
+                    ) {
                         continue;
                     }
                     // Capture liveness BEFORE dampening: only a LIVE->ghost transition may
@@ -4236,8 +4300,84 @@ mod tests {
     /// The condition is set here through `protect_established`, the other arm of
     /// the same disjunction, so the test is deterministic and does not mutate
     /// process environment shared with every other test.
+    /// #950: a memory written a minute ago is not "established", however loud.
+    ///
+    /// The measured defect, on prime 2026-09-13 where the belief substrate makes
+    /// this guard live: 676 of 1054 memories were protected, and **their median
+    /// age was 1.6 days against 2.4 days for the unprotected ones** — 75% of the
+    /// protected set was under a week old. An ordinary write lands at 0.5–0.6,
+    /// already above the floor, so an amplitude-only test was selecting for
+    /// recency of writing. The predicate was inverted relative to its own name.
+    ///
+    /// This drives the real `stage_prune`, and carries a control: the SAME
+    /// amplitude, backdated, must be skipped in the same run. Without the control
+    /// the test passes just as happily with protection switched off entirely.
+    /// The documented rollback path, and the fact that a typo cannot take it.
+    #[test]
+    fn the_min_age_override_parses_safely() {
+        use crate::consolidation::{parse_min_age_days, ESTABLISHED_MIN_AGE_DAYS};
+
+        assert_eq!(parse_min_age_days(None), ESTABLISHED_MIN_AGE_DAYS);
+        // 0 is the escape hatch: it restores the pre-#950 amplitude-only rule
+        // exactly, which is what an operator reaches for if this is too strict.
+        assert_eq!(parse_min_age_days(Some("0")), 0.0);
+        assert_eq!(parse_min_age_days(Some(" 30 ")), 30.0);
+        assert_eq!(parse_min_age_days(Some("1.5")), 1.5);
+        // A typo must fall back to the DEFAULT, never to 0 — silently restoring
+        // the bug because someone wrote "seven" is the worst available outcome.
+        for bad in ["seven", "", "-1", "nan", "inf"] {
+            assert_eq!(
+                parse_min_age_days(Some(bad)),
+                ESTABLISHED_MIN_AGE_DAYS,
+                "{bad:?} must fall back to the default, not disable the guard"
+            );
+        }
+    }
+
+    #[test]
+    fn a_freshly_written_memory_is_not_established_however_strong() {
+        let mut engine = make_engine();
+        let strong = ESTABLISHED_AMPLITUDE + 0.2;
+
+        let young = insert_with_phase_and_layer(&mut engine, "written a moment ago", 0.0, 0);
+        let old = insert_with_phase_and_layer(&mut engine, "held this strength for a year", 0.0, 0);
+        let partner = insert_with_phase_and_layer(&mut engine, "an anti-phase neighbour", 3.14, 0);
+        for (id, amp) in [(young, strong), (old, strong), (partner, 0.4_f32)] {
+            let mem = engine.store.get_mut(&id).ok().flatten().unwrap();
+            mem.amplitude = amp;
+        }
+        // Only the control is aged. Identical amplitude, so age is the ONLY
+        // difference between them and the assertions cannot be about strength.
+        if let Ok(Some(m)) = engine.store.get_mut(&old) {
+            m.created_at = chrono::Utc::now() - chrono::Duration::days(400);
+        }
+
+        let mut eng = ConsolidationEngine::default();
+        eng.protect_established = true;
+        let pairs = vec![
+            InterferencePair { id_a: young, id_b: partner, similarity: 0.9, kind: Interference::Destructive },
+            InterferencePair { id_a: old, id_b: partner, similarity: 0.9, kind: Interference::Destructive },
+        ];
+        eng.stage_prune(&mut engine, &pairs);
+
+        let after_young = engine.store.get(&young).unwrap().unwrap().amplitude;
+        assert!(
+            after_young < strong,
+            "a memory written moments ago was protected from dampening at {strong} -> {after_young}"
+        );
+        let after_old = engine.store.get(&old).unwrap().unwrap().amplitude;
+        assert_eq!(
+            after_old, strong,
+            "the aged control was dampened, so protection was not on and the other              assertion proves nothing"
+        );
+    }
+
     #[test]
     fn a_reinforced_memory_is_still_reachable_by_stage_prune() {
+        // #950: established is strong AND old. These rows are created now, so
+        // every one of them must be backdated or NOTHING is protected and the
+        // control below cannot tell protection from its absence.
+        const OLD: f64 = 365.0;
         let mut engine = make_engine();
 
         // The strongest amplitude repetition can produce from a verdict-typical
@@ -4247,10 +4387,10 @@ mod tests {
         for _ in 0..50 {
             let mut proposed = reinforced;
             proposed += 0.25 * (AMPLITUDE_CEILING - proposed);
-            reinforced = bounded_by_retention(reinforced, proposed, true);
+            reinforced = bounded_by_retention(reinforced, proposed, true, OLD);
         }
         assert!(
-            !is_established_protected(true, reinforced),
+            !is_established_protected(true, reinforced, OLD),
             "fixture: 50 repeats must not reach the protected band ({reinforced})"
         );
 
@@ -4260,6 +4400,11 @@ mod tests {
         // which is what proves this test can tell protection from its absence.
         let established =
             insert_with_phase_and_layer(&mut engine, "a hard-won established fact", 0.0, 0);
+        for id in [repeated, partner, established] {
+            if let Ok(Some(m)) = engine.store.get_mut(&id) {
+                m.created_at = chrono::Utc::now() - chrono::Duration::days(400);
+            }
+        }
 
         for (id, amp) in [
             (repeated, reinforced),
