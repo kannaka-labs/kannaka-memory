@@ -6,7 +6,7 @@
 
 use super::color::{hsv_histogram, dominant_colors};
 use super::decode::FrameInfo;
-use super::{HSV_BINS, EDGE_BINS, FREQ_BANDS, REGION_GRID, FLOW_BINS, SPATIAL_FEATURE_DIM};
+use super::{EDGE_BINS, FLOW_BINS, FREQ_BANDS, REGION_GRID, SPATIAL_FEATURE_DIM};
 
 /// Aggregated spatial features across all frames.
 #[derive(Debug, Clone)]
@@ -39,8 +39,10 @@ pub fn extract_frame_features(frame: &FrameInfo) -> Vec<f32> {
     let regions = region_statistics(frame);
     features.extend_from_slice(&regions);
 
-    // 5. Optical flow placeholder (32 dims — filled with zeros for single frame)
-    // Actual flow computed between frame pairs in temporal features
+    // 5. Optical flow (32 dims) — left zero here and filled by the pipeline.
+    // Flow is a property of a frame PAIR, which a single frame cannot see;
+    // `VideoPipeline::analyze` writes this section at `FLOW_OFFSET` once it
+    // has the predecessor. A frame analysed on its own keeps zeros.
     features.extend(std::iter::repeat(0.0f32).take(FLOW_BINS));
 
     // 6. Contrast/brightness (8 dims)
@@ -261,9 +263,10 @@ pub fn aggregate_spatial(per_frame: &[Vec<f32>]) -> SpatialFeatures {
         *v /= n;
     }
 
-    // Extract brightness/contrast from the aggregated contrast_brightness section
-    // Indices: after HSV(48) + freq(32) + edges(36) + regions(20) + flow(32) = 168
-    let brightness_idx = 168;
+    // Extract brightness/contrast from the aggregated contrast_brightness
+    // section. `CONTRAST_OFFSET` names the boundary so this stops being a
+    // hand-summed literal that silently goes stale if a section resizes.
+    let brightness_idx = super::CONTRAST_OFFSET;
     let mean_brightness = if dim > brightness_idx {
         mean_vec[brightness_idx] * 255.0
     } else {
@@ -305,4 +308,128 @@ fn bin_values(values: &[f32], n_bins: usize) -> Vec<f32> {
     }
 
     hist
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eye::{CONTRAST_OFFSET, DOMINANT_OFFSET, FLOW_OFFSET, REGION_OFFSET};
+
+    fn frame_from<F: Fn(u32, u32) -> (u8, u8, u8)>(w: u32, h: u32, f: F) -> FrameInfo {
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = f(x, y);
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        FrameInfo { rgb, width: w, height: h, index: 0 }
+    }
+
+    fn solid(w: u32, h: u32, r: u8, g: u8, b: u8) -> FrameInfo {
+        frame_from(w, h, move |_, _| (r, g, b))
+    }
+
+    #[test]
+    fn frame_features_are_exactly_the_declared_dimension() {
+        let f = extract_frame_features(&solid(80, 60, 12, 200, 90));
+        assert_eq!(f.len(), SPATIAL_FEATURE_DIM);
+        assert!(f.iter().all(|v| v.is_finite()), "no NaN or inf in features");
+    }
+
+    #[test]
+    fn the_feature_sections_tile_the_vector_without_overlap() {
+        // The offsets must still add up to the declared dimension; a section
+        // that changes size without its offset moving would silently overwrite
+        // its neighbour.
+        assert_eq!(DOMINANT_OFFSET + 16, SPATIAL_FEATURE_DIM);
+        assert!(FLOW_OFFSET < CONTRAST_OFFSET);
+        assert!(REGION_OFFSET < FLOW_OFFSET);
+    }
+
+    #[test]
+    fn a_single_frame_carries_no_optical_flow() {
+        // Flow needs a frame pair; on its own a frame leaves that band zero
+        // and the pipeline fills it in. This is the documented contract the
+        // pipeline relies on.
+        let f = extract_frame_features(&solid(80, 60, 200, 40, 40));
+        assert!(
+            f[FLOW_OFFSET..FLOW_OFFSET + FLOW_BINS].iter().all(|&v| v == 0.0),
+            "the flow band of a lone frame must be zero"
+        );
+    }
+
+    #[test]
+    fn a_black_frame_and_a_white_frame_differ_in_the_brightness_dim() {
+        let black = extract_frame_features(&solid(80, 60, 0, 0, 0));
+        let white = extract_frame_features(&solid(80, 60, 255, 255, 255));
+        assert!(black[CONTRAST_OFFSET] < 0.05, "black is dark");
+        assert!(white[CONTRAST_OFFSET] > 0.95, "white is bright");
+    }
+
+    #[test]
+    fn region_statistics_locate_a_bright_quadrant() {
+        // REGION_GRID is (rows, cols) = (4, 5). Light only the top-left cell.
+        let (rows, cols) = REGION_GRID;
+        let (w, h) = (80u32, 60u32);
+        let rw = w / cols as u32;
+        let rh = h / rows as u32;
+        let f = extract_frame_features(&frame_from(w, h, move |x, y| {
+            if x < rw && y < rh {
+                (255, 255, 255)
+            } else {
+                (0, 0, 0)
+            }
+        }));
+
+        let regions = &f[REGION_OFFSET..REGION_OFFSET + rows * cols];
+        assert!(regions[0] > 0.9, "top-left region is lit: {}", regions[0]);
+        for (i, &v) in regions.iter().enumerate().skip(1) {
+            assert!(v < 0.1, "region {i} should be dark, got {v}");
+        }
+    }
+
+    #[test]
+    fn aggregate_of_identical_frames_reproduces_the_frame() {
+        let one = extract_frame_features(&solid(80, 60, 30, 120, 210));
+        let agg = aggregate_spatial(&vec![one.clone(); 5]);
+        assert_eq!(agg.vector.len(), SPATIAL_FEATURE_DIM);
+        for (i, (&a, &b)) in agg.vector.iter().zip(&one).enumerate() {
+            assert!((a - b).abs() < 1e-5, "dim {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn aggregate_reports_brightness_on_the_0_to_255_scale() {
+        let white = extract_frame_features(&solid(80, 60, 255, 255, 255));
+        let agg = aggregate_spatial(&[white]);
+        assert!(
+            agg.mean_brightness > 250.0,
+            "a white clip is near 255, got {}",
+            agg.mean_brightness
+        );
+
+        let black = extract_frame_features(&solid(80, 60, 0, 0, 0));
+        let agg = aggregate_spatial(&[black]);
+        assert!(
+            agg.mean_brightness < 5.0,
+            "a black clip is near 0, got {}",
+            agg.mean_brightness
+        );
+    }
+
+    #[test]
+    fn an_edgy_frame_carries_more_edge_energy_than_a_flat_one() {
+        let flat = extract_frame_features(&solid(80, 60, 128, 128, 128));
+        let stripes = extract_frame_features(&frame_from(80, 60, |x, _| {
+            if x % 8 < 4 { (255, 255, 255) } else { (0, 0, 0) }
+        }));
+        let edge_sum = |v: &Vec<f32>| -> f32 {
+            v[crate::eye::EDGE_OFFSET..crate::eye::EDGE_OFFSET + EDGE_BINS]
+                .iter()
+                .sum()
+        };
+        assert!(edge_sum(&flat) < 0.01, "a flat frame has no edges");
+        assert!(edge_sum(&stripes) > 0.9, "stripes normalize to ~1 of edge mass");
+    }
 }

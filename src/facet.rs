@@ -70,6 +70,39 @@ pub fn decompose_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Serializes the tests that MUTATE `KANNAKA_FACET_DECOMPOSE`.
+///
+/// The flag is process-global and `cargo test` runs tests in parallel threads
+/// inside one process, so a test asserting "flag OFF stores exactly one
+/// wavefront" can be broken by a different test switching the flag ON at that
+/// instant. That is what happened: `write_path_flag_default_off_then_on_...`
+/// and `single_clause_content_is_never_decomposed_even_with_the_flag_on` fight
+/// over the same variable. The race is invisible at `--test-threads 1` and
+/// surfaces only when scheduling happens to interleave them, which makes it the
+/// worst kind of red build — one that blames whichever PR last changed the test
+/// count.
+///
+/// Every test that calls `set_var`/`remove_var` on this flag must hold this
+/// guard for its whole body and leave the flag unset.
+///
+/// This does NOT make the flag safe in general: a test elsewhere that merely
+/// *reads* the flag through `decompose_enabled` (any `absorb` does) can still
+/// observe it ON while a flag test holds the lock. Closing that hole means
+/// making the setting injectable rather than ambient, which is a real refactor
+/// of every `decompose_enabled` call site and is not attempted here.
+#[cfg(test)]
+static FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the flag lock, ignoring poisoning.
+///
+/// A panicking test poisons the mutex; without this every later flag test would
+/// report a lock error instead of its own assertion, hiding the real failure
+/// behind the first one.
+#[cfg(test)]
+pub(crate) fn lock_decompose_flag() -> std::sync::MutexGuard<'static, ()> {
+    FLAG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Decompose `content` into atomic facet texts.
 ///
 /// Returns an empty vec when the content should not be decomposed at all —

@@ -3688,6 +3688,7 @@ The market square opens for trading at nine each morning.";
     /// must be a live right id.
     #[test]
     fn backfill_canonicalizes_left_ids_and_never_double_mints() {
+        let _flag = crate::facet::lock_decompose_flag();
         let p = pipeline();
         let mut cm = ChiralMedium::new();
         let parent = cm.store(COMPOUND, 0.9, &p).unwrap();
@@ -3758,6 +3759,9 @@ The market square opens for trading at nine each morning.";
 
     #[test]
     fn write_path_flag_default_off_then_on_then_idempotent_backfill() {
+        // KANNAKA_FACET_DECOMPOSE is process-global; hold the lock so a
+        // concurrent flag test cannot flip it mid-assertion.
+        let _flag = crate::facet::lock_decompose_flag();
         let p = pipeline();
 
         // ── flag OFF (the default): storing a compound mints nothing extra ──
@@ -3830,6 +3834,7 @@ The market square opens for trading at nine each morning.";
 
     #[test]
     fn single_clause_content_is_never_decomposed_even_with_the_flag_on() {
+        let _flag = crate::facet::lock_decompose_flag();
         let p = pipeline();
         std::env::set_var("KANNAKA_FACET_DECOMPOSE", "1");
         let mut cm = ChiralMedium::new();
