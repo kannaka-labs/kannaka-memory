@@ -94,6 +94,12 @@ pub struct RememberOutcome {
     /// Amplitude carrying the fact afterwards — the number to report, since a
     /// repeat's `importance` is a floor and not the result.
     pub amplitude: f32,
+    /// True when the curve wanted to go higher and the retention boundary stopped
+    /// it (see `consolidation::bounded_by_retention`). Surfaced rather than
+    /// swallowed: a repeat that looks like it did nothing is confusing, and an
+    /// operator watching a fact refuse to strengthen deserves to know the reason
+    /// is a deliberate rule and not a broken write.
+    pub clamped_by_retention: bool,
 }
 
 /// One memory that a duplicate-collapse pass would fold, or folded.
@@ -140,6 +146,10 @@ pub struct DuplicateCollapseReport {
     /// Keepers promoted to the highest tier in their group (ADR-0031: a collapse
     /// must never demote a Pinned memory).
     pub tier_promotions: usize,
+    /// Keepers whose energy was held at the established retention boundary rather
+    /// than carried across it. Reported so a collapse that deliberately declines
+    /// to strengthen does not look like one that failed to.
+    pub clamped_by_retention: usize,
     /// Deletions that failed (apply mode only).
     pub errors: usize,
 }
@@ -716,6 +726,7 @@ impl KannakaMemorySystem {
         id: &Uuid,
         steps: usize,
         floor: f32,
+        clamped: &mut bool,
     ) -> Result<Vec<Uuid>, SystemError> {
         // Empty unless `id` is a decomposed parent.
         let facets = self.engine.store.facets_of(id);
@@ -732,8 +743,15 @@ impl KannakaMemorySystem {
             if mem.tier == crate::medium::types::Tier::ShortTerm {
                 continue;
             }
-            mem.amplitude =
+            let bounded =
                 Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, protect);
+            // Unbounded, for comparison only: did the boundary actually bite here?
+            let unbounded =
+                Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, false);
+            if unbounded > bounded {
+                *clamped = true;
+            }
+            mem.amplitude = bounded;
             moved.push(target);
         }
         Ok(moved)
@@ -763,7 +781,7 @@ impl KannakaMemorySystem {
     /// and their own amplitudes. Making salience a swarm-wide quantity means
     /// putting the COUNT on the wire and reconciling with MAX, which is an ADR,
     /// not a side effect of this function.
-    pub fn reinforce(&mut self, id: &Uuid, importance: f64) -> Result<(u32, f32), SystemError> {
+    pub fn reinforce(&mut self, id: &Uuid, importance: f64) -> Result<(u32, f32, bool), SystemError> {
         let now = Utc::now();
 
         let amplitude_before = self
@@ -780,7 +798,8 @@ impl KannakaMemorySystem {
         }
 
         let floor = (importance as f32).clamp(0.0, 1.0);
-        let moved = self.move_reinforcement_energy(id, 1, floor)?;
+        let mut clamped = false;
+        let moved = self.move_reinforcement_energy(id, 1, floor, &mut clamped)?;
 
         // Every row that took part in the sighting gets the count, including the
         // facets, because the count is per-row salience and the facets are the
@@ -823,7 +842,7 @@ impl KannakaMemorySystem {
             .get(id)?
             .map(|m| m.amplitude)
             .unwrap_or(amplitude_before);
-        Ok((times_seen, amplitude_after))
+        Ok((times_seen, amplitude_after, clamped))
     }
 
     /// Persist "this agent observed the fact at `when`" on the canonical
@@ -854,7 +873,8 @@ impl KannakaMemorySystem {
     ) -> Result<RememberOutcome, SystemError> {
         if reinforce_on_repeat_enabled() {
             if let Some(existing) = self.find_exact_repeat(text) {
-                let (times_seen, amplitude) = self.reinforce(&existing, importance)?;
+                let (times_seen, amplitude, clamped_by_retention) =
+                    self.reinforce(&existing, importance)?;
                 // Deliberately NO flux publish. `FluxEventPayload::MemoryStored`
                 // would assert a store that did not happen, into a subject
                 // JetStream keeps for 90 days; `MemoryBoosted` describes this
@@ -870,6 +890,7 @@ impl KannakaMemorySystem {
                     kind: RememberOutcomeKind::Reinforced,
                     times_seen,
                     amplitude,
+                    clamped_by_retention,
                 });
             }
         }
@@ -885,6 +906,8 @@ impl KannakaMemorySystem {
             kind: RememberOutcomeKind::Inserted,
             times_seen: 1,
             amplitude,
+            // A first absorb takes its importance directly; no boundary involved.
+            clamped_by_retention: false,
         })
     }
 
@@ -1077,7 +1100,16 @@ impl KannakaMemorySystem {
                     mem.times_seen = times_seen_after;
                     mem.updated_at = newest_update;
                 }
-                self.move_reinforcement_energy(&keeper_id, folded.len(), amplitude_before)?;
+                let mut clamped = false;
+                self.move_reinforcement_energy(
+                    &keeper_id,
+                    folded.len(),
+                    amplitude_before,
+                    &mut clamped,
+                )?;
+                if clamped {
+                    report.clamped_by_retention += 1;
+                }
                 // ADR-0031: the pin follows the fact, not the row id — the same
                 // reading the resonance-merge carrier already uses. Under the
                 // current `keeper_of` rule the keeper already holds the highest
@@ -4216,6 +4248,30 @@ mod tests {
             "--importance on a repeat bought immunity: {}",
             o.amplitude
         );
+        // And the refusal is REPORTED, not swallowed: a repeat that declines to
+        // strengthen must not look like a write that failed.
+        assert!(
+            o.clamped_by_retention,
+            "the boundary bit but the outcome did not say so"
+        );
+
+        // A store with no protection reports no clamp, so the flag tracks the
+        // rule rather than being stuck on.
+        let free_dir = temp_dir("reinforce_unclamped");
+        let mut free = KannakaMemorySystem::init(free_dir.clone()).unwrap();
+        assert!(
+            !free.established_protection_active(),
+            "precondition: this environment must have belief phase OFF"
+        );
+        free.remember_with_importance(FACT, 0.4).unwrap();
+        let unclamped = free.remember_reporting(FACT, "semantic", 0.4).unwrap();
+        assert!(!unclamped.clamped_by_retention);
+        assert!(
+            unclamped.amplitude > ESTABLISHED_AMPLITUDE,
+            "with nothing to protect, the full curve applies: {}",
+            unclamped.amplitude
+        );
+        let _ = std::fs::remove_dir_all(&free_dir);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

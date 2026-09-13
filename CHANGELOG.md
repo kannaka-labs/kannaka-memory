@@ -206,10 +206,16 @@ restoring the medium alone would leave an inflation nothing could later correct.
 schedules it.
 
 **A repeat cannot buy immunity from pruning.** `stage_prune` skips dampening entirely for an
-*established* memory, and a verdict-typical 0.4 became 0.8 on ONE repeat. That switch is not
-hypothetical: `kannaka-memory.service` on O1 sets `KANNAKA_BELIEF_PHASE=on` and its data dir is
-prime's own store, the node behind the public `ask_kannaka`. So a cron job re-asserting one line
-made that memory immortal on its first run — never dampened, never ghosted, never compacted.
+*established* memory, and a verdict-typical 0.4 became 0.8 on ONE repeat.
+
+This is not a switch to check before enabling. It is **on in production today**:
+`/etc/systemd/system/kannaka-memory.service.d/belief.conf` on O1 sets `KANNAKA_BELIEF_PHASE=on`
+alongside `KANNAKA_EXEMPLAR_COUPLING=on`, that unit's `KANNAKA_DATA_DIR` is `/home/opc/.kannaka`
+— prime's own store, behind the public `ask_kannaka` — and its journal confirms it at runtime
+(`[couple] always-on belief coupling ENABLED ... (needs belief on)`). debain1, debain2 and
+docker1 have it unset; O1 has it set, and O1 is the one that matters. So without this fix a cron
+job re-asserting one line made that memory immortal on prime on its first run: never dampened,
+never ghosted, never compacted.
 
 The rule that closes it is the same one the ShortTerm case above follows, now stated once:
 **reinforcement moves a memory within its retention class and never across a retention
@@ -221,6 +227,14 @@ it got there the hard way. An explicit `--importance` on a repeat cannot buy it 
 The threshold and the predicate now live in one place each, `ESTABLISHED_AMPLITUDE` and
 `is_established_protected`, because `stage_prune` and the write path both have to agree about
 them and a bare `0.5` in one of them is how they would drift apart.
+
+A clamped repeat **says so**. `RememberOutcome.clamped_by_retention` and the dedupe report's
+`held at the retention line` counter surface it, because a repeat that quietly declines to
+strengthen looks like a write that failed. And the claim is checked against the real
+`stage_prune` rather than against the predicate they share: a memory carried to the highest
+amplitude repetition can reach is still dampened by a destructive pair, while a control that
+earned its place above the line is skipped in the same run — so the test cannot pass by having
+protection switched off.
 
 **Peer re-sends no longer earn reputation.** Both swarm absorb sites now use
 `remember_reporting`: a byte-identical re-send strengthens the memory but commits no

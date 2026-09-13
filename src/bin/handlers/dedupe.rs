@@ -118,6 +118,12 @@ pub(crate) fn handle_dedupe(
             report.skipped_ghosts
         );
     }
+    if report.clamped_by_retention > 0 {
+        println!(
+            "  held at the retention line: {}  <- strengthened, but not across the boundary that would make them un-prunable",
+            report.clamped_by_retention
+        );
+    }
     if report.tier_promotions > 0 {
         println!(
             "  keepers promoted in tier:  {}  <- a pinned duplicate keeps its pin",

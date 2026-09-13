@@ -227,8 +227,16 @@ pub fn dispatch_tool(
                             o.id, o.amplitude
                         ),
                         crate::openclaw::RememberOutcomeKind::Reinforced => format!(
-                            "reinforced {} (seen {}x, amplitude={:.3}, category={category})",
-                            o.id, o.times_seen, o.amplitude
+                            "reinforced {} (seen {}x, amplitude={:.3}, category={category}){}",
+                            o.id,
+                            o.times_seen,
+                            o.amplitude,
+                            if o.clamped_by_retention {
+                                " — held at the established retention boundary: a repeat \
+                                 may sharpen a memory but not make it un-prunable"
+                            } else {
+                                ""
+                            }
                         ),
                     };
                     (msg, false)
