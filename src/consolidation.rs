@@ -39,6 +39,60 @@ use rayon::prelude::*;
 /// into `store.energy`, so this also bounds the on-disk energy.
 pub(crate) const AMPLITUDE_CEILING: f32 = 2.0;
 
+/// The amplitude above which ADR-0037 calls a memory *established*, and
+/// `stage_prune` stops dampening it altogether when the belief substrate is
+/// active. Crossing this line means "never dampened, never ghosted, never
+/// compacted", so it is a retention boundary and not merely a number.
+///
+/// It used to be a bare `0.5` inside the guard. It is named here because two
+/// things must agree about it: the guard itself, and
+/// `KannakaMemorySystem::move_reinforcement_energy`, which refuses to carry a
+/// memory across it. A single definition means a change moves both.
+pub(crate) const ESTABLISHED_AMPLITUDE: f32 = 0.5;
+
+/// Is this memory inside `stage_prune`'s established-signal protection?
+///
+/// The one definition of that predicate. `stage_prune` asks it to decide whether
+/// to skip dampening; reinforcement asks it to decide whether a repeat would
+/// cross the boundary. Duplicating the expression instead of sharing it is how
+/// two places come to disagree, so they share it.
+pub(crate) fn is_established_protected(protect_established: bool, amplitude: f32) -> bool {
+    (protect_established || crate::medium::chiral::belief_phase_enabled())
+        && amplitude > ESTABLISHED_AMPLITUDE
+}
+
+/// The amplitude a REPEAT may produce.
+///
+/// Reinforcement moves a memory within its retention class; it never moves one
+/// across a retention boundary. Crossing the established line is the dream's
+/// decision (earned over nights of corroboration) or the operator's (`kannaka
+/// boost`, `kannaka pin`) — never a side effect of the same sentence arriving
+/// again.
+///
+/// Measured, and the reason this function exists: on a node with the belief
+/// substrate on — which `kannaka-memory.service` on O1 is, backing the public
+/// `ask_kannaka` — a verdict-typical amplitude of 0.4 becomes 0.8 after ONE
+/// repeat, and `stage_prune` then skips it forever. A cron job that re-asserts a
+/// line would make it immortal on the first run. Capping at the boundary keeps
+/// repetition able to sharpen recall ranking without letting it buy immunity.
+///
+/// Pure, and takes `protect_active` rather than reading the environment, so both
+/// branches are testable without mutating process state.
+pub(crate) fn bounded_by_retention(current: f32, proposed: f32, protect_active: bool) -> f32 {
+    // Never weaken, whatever else happens.
+    let proposed = proposed.max(current);
+    if is_established_protected(protect_active, current) {
+        // Already established the hard way: reinforcement is unrestricted.
+        return proposed;
+    }
+    if is_established_protected(protect_active, proposed) {
+        // Stop AT the boundary. `is_established_protected` tests `>`, so landing
+        // exactly on it is still unprotected.
+        return ESTABLISHED_AMPLITUDE.max(current);
+    }
+    proposed
+}
+
 /// Classification of interference between two memories.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Interference {
@@ -1095,9 +1149,7 @@ impl ConsolidationEngine {
                     // memories (amplitude > 0.5) under the belief substrate — the
                     // phase-scattered field would otherwise dampen strong signal
                     // memories on the destructive pairs the re-phase creates.
-                    if (self.protect_established || crate::medium::chiral::belief_phase_enabled())
-                        && mem.amplitude > 0.5
-                    {
+                    if is_established_protected(self.protect_established, mem.amplitude) {
                         continue;
                     }
                     // Capture liveness BEFORE dampening: only a LIVE->ghost transition may

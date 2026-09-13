@@ -205,14 +205,22 @@ folded ids out of `.times_seen.json` and that sidecar's merge only ever raises a
 restoring the medium alone would leave an inflation nothing could later correct. Nothing
 schedules it.
 
-**One interaction is known and deliberately not fixed here.** `stage_prune` skips dampening
-entirely for any memory above amplitude 0.5 when `protect_established` or the belief phase is
-on, and a single repeat from a verdict-typical 0.4 crosses that line. On a node running with
-either switch enabled, a reinforced LongTerm memory is never dampened, never ghosted and never
-compacted. Both default off, and the ShortTerm rule above removes the ADR-0054 half of the
-problem, but the threshold itself belongs to `stage_prune` and moving it from here would be
-changing consolidation's retention policy through a side door. Check `KANNAKA_BELIEF_PHASE` on
-the live nodes before enabling either switch.
+**A repeat cannot buy immunity from pruning.** `stage_prune` skips dampening entirely for an
+*established* memory, and a verdict-typical 0.4 became 0.8 on ONE repeat. That switch is not
+hypothetical: `kannaka-memory.service` on O1 sets `KANNAKA_BELIEF_PHASE=on` and its data dir is
+prime's own store, the node behind the public `ask_kannaka`. So a cron job re-asserting one line
+made that memory immortal on its first run — never dampened, never ghosted, never compacted.
+
+The rule that closes it is the same one the ShortTerm case above follows, now stated once:
+**reinforcement moves a memory within its retention class and never across a retention
+boundary.** Crossing the established line is the dream's decision, earned over nights of
+corroboration, or the operator's through `kannaka boost` or `kannaka pin` — never a side effect
+of the same sentence arriving again. A memory already above the line is unrestricted, because
+it got there the hard way. An explicit `--importance` on a repeat cannot buy it either.
+
+The threshold and the predicate now live in one place each, `ESTABLISHED_AMPLITUDE` and
+`is_established_protected`, because `stage_prune` and the write path both have to agree about
+them and a bare `0.5` in one of them is how they would drift apart.
 
 **Peer re-sends no longer earn reputation.** Both swarm absorb sites now use
 `remember_reporting`: a byte-identical re-send strengthens the memory but commits no

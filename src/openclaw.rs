@@ -635,6 +635,48 @@ impl KannakaMemorySystem {
         Self::keeper_of(&self.duplicate_candidates(text))
     }
 
+    /// Is `stage_prune`'s established-signal protection live on this node?
+    ///
+    /// The same disjunction the guard itself uses: the consolidation engine's
+    /// `protect_established`, or the belief substrate being on. Asked so that
+    /// reinforcement can refuse to carry a memory across a boundary that would
+    /// make it permanently un-prunable.
+    fn established_protection_active(&self) -> bool {
+        self.consolidation.protect_established
+            || crate::medium::chiral::belief_phase_enabled()
+    }
+
+    /// What `steps` repeats do to ONE row's amplitude.
+    ///
+    /// The single definition, and every path goes through it:
+    /// `move_reinforcement_energy` to actually move the energy, and
+    /// `collapse_exact_duplicates` to predict what a dry run would produce. They
+    /// used to be two expressions over the same inputs, and they disagreed the
+    /// moment the inputs differed — the dry run reasoned from the group's
+    /// strongest member while the apply reasoned from the keeper's own
+    /// amplitude, so a collapse could promise a number the apply would refuse.
+    ///
+    /// Pure: takes the node's protection state rather than reading it, so both
+    /// branches are testable without mutating process state.
+    fn reinforced_amplitude(
+        current: f32,
+        floor: f32,
+        steps: usize,
+        tier: crate::medium::types::Tier,
+        protect_active: bool,
+    ) -> f32 {
+        // A ShortTerm row keeps its place in the decay distribution: it gets the
+        // count, not the energy. See `move_reinforcement_energy`.
+        if tier == crate::medium::types::Tier::ShortTerm {
+            return current;
+        }
+        let mut proposed = current.max(floor.min(REINFORCE_CEILING));
+        for _ in 0..steps {
+            Self::apply_reinforcement_curve(&mut proposed);
+        }
+        crate::consolidation::bounded_by_retention(current, proposed, protect_active)
+    }
+
     /// One step of the bounded reinforcement curve. See [`REINFORCE_GAIN`].
     fn apply_reinforcement_curve(amplitude: &mut f32) {
         if *amplitude < REINFORCE_CEILING {
@@ -678,6 +720,8 @@ impl KannakaMemorySystem {
         // Empty unless `id` is a decomposed parent.
         let facets = self.engine.store.facets_of(id);
         let targets: Vec<Uuid> = if facets.is_empty() { vec![*id] } else { facets };
+        // Read once, before the mutable borrows.
+        let protect = self.established_protection_active();
         let mut moved = Vec::new();
         for target in targets {
             let Some(mem) = self.engine.store.get_mut(&target)? else { continue };
@@ -688,12 +732,8 @@ impl KannakaMemorySystem {
             if mem.tier == crate::medium::types::Tier::ShortTerm {
                 continue;
             }
-            if floor > mem.amplitude {
-                mem.amplitude = floor.min(REINFORCE_CEILING);
-            }
-            for _ in 0..steps {
-                Self::apply_reinforcement_curve(&mut mem.amplitude);
-            }
+            mem.amplitude =
+                Self::reinforced_amplitude(mem.amplitude, floor, steps, mem.tier, protect);
             moved.push(target);
         }
         Ok(moved)
@@ -1016,13 +1056,21 @@ impl KannakaMemorySystem {
             // ShortTerm row is left in the decay set (see
             // `move_reinforcement_energy`). Computed on a dry run without touching
             // anything by replaying the curve on a copy.
-            let mut amplitude_after = amplitude_before;
-            for _ in 0..folded.len() {
-                Self::apply_reinforcement_curve(&mut amplitude_after);
-            }
-            if keeper_tier == crate::medium::types::Tier::ShortTerm {
-                amplitude_after = amplitude_before;
-            }
+            // Predicted from the KEEPER's own amplitude with the group's
+            // strongest member as the floor — exactly the two arguments
+            // `move_reinforcement_energy` will pass on the apply path.
+            let keeper_amplitude = members
+                .iter()
+                .find(|m| m.id == keeper_id)
+                .map(|m| m.amplitude)
+                .unwrap_or(amplitude_before);
+            let amplitude_after = Self::reinforced_amplitude(
+                keeper_amplitude,
+                amplitude_before,
+                folded.len(),
+                keeper_tier,
+                self.established_protection_active(),
+            );
 
             if apply {
                 if let Some(mem) = self.engine.store.get_mut(&keeper_id)? {
@@ -4076,6 +4124,154 @@ mod tests {
             sys.get_memory(&parent).unwrap().unwrap().times_seen,
             2,
             "the statement's own count still moves"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Finding A (promoted to CONFIRMED): pruning immunity
+    // -----------------------------------------------------------------------
+
+    /// A repeat must not buy a memory immunity from pruning.
+    ///
+    /// `stage_prune` skips dampening entirely for an *established* memory, and
+    /// on a node with the belief substrate on that is every memory above
+    /// `ESTABLISHED_AMPLITUDE`. `kannaka-memory.service` on O1 sets
+    /// `KANNAKA_BELIEF_PHASE=on` and its data dir is prime's own store — the node
+    /// backing the public `ask_kannaka`. A verdict-typical 0.4 became 0.8 on ONE
+    /// repeat, after which the memory was never dampened, never ghosted and never
+    /// compacted. A cron job re-asserting a line made it immortal on its first
+    /// run.
+    ///
+    /// Both branches of the predicate are exercised through the pure function, so
+    /// neither depends on process environment.
+    #[test]
+    fn a_repeat_cannot_cross_the_established_retention_boundary() {
+        use crate::consolidation::{
+            bounded_by_retention, is_established_protected, ESTABLISHED_AMPLITUDE,
+        };
+
+        let below = 0.4_f32;
+        // One curve step from a verdict-typical amplitude — the measured 0.4 -> 0.8.
+        let mut one_step = below;
+        KannakaMemorySystem::apply_reinforcement_curve(&mut one_step);
+        assert!(
+            one_step > ESTABLISHED_AMPLITUDE,
+            "fixture precondition: an unbounded step must cross the line ({one_step})"
+        );
+
+        // Protection ON: the repeat stops AT the boundary, which is not protected
+        // because the guard tests `>`.
+        let capped = bounded_by_retention(below, one_step, true);
+        assert_eq!(capped, ESTABLISHED_AMPLITUDE);
+        assert!(
+            !is_established_protected(true, capped),
+            "a repeat manufactured pruning immunity"
+        );
+
+        // Protection OFF: nothing to buy immunity from, so the full curve applies.
+        assert_eq!(bounded_by_retention(below, one_step, false), one_step);
+
+        // A memory that earned its place the hard way is unrestricted: the cap is
+        // about crossing the line, not about living above it.
+        let above = 0.9_f32;
+        let mut above_step = above;
+        KannakaMemorySystem::apply_reinforcement_curve(&mut above_step);
+        assert_eq!(bounded_by_retention(above, above_step, true), above_step);
+
+        // And it never weakens anything.
+        assert_eq!(bounded_by_retention(above, 0.1, true), above);
+    }
+
+    /// The same thing end to end, through `remember`, with the protection forced
+    /// on in-process rather than by environment.
+    #[test]
+    fn many_repeats_never_make_a_memory_unprunable_on_a_protected_node() {
+        use crate::consolidation::{is_established_protected, ESTABLISHED_AMPLITUDE};
+
+        let dir = temp_dir("reinforce_immunity");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Exactly what O1 runs, without touching the environment other tests share.
+        sys.consolidation.protect_established = true;
+
+        let id = sys.remember_with_importance(FACT, 0.4).unwrap();
+        for n in 1..=20 {
+            sys.remember(FACT).unwrap();
+            let a = sys.get_memory(&id).unwrap().unwrap().amplitude;
+            assert!(
+                !is_established_protected(true, a),
+                "repeat {n} bought pruning immunity: amplitude {a}"
+            );
+            assert!(a <= ESTABLISHED_AMPLITUDE, "repeat {n}: {a}");
+        }
+        // The count still accrues in full — the salience signal is unharmed, only
+        // the retention side effect is refused.
+        assert_eq!(sys.get_memory(&id).unwrap().unwrap().times_seen, 21);
+
+        // An explicit `--importance` cannot buy it either: a repeat is a repeat.
+        let o = sys.remember_reporting(FACT, "semantic", 0.99).unwrap();
+        assert!(
+            !is_established_protected(true, o.amplitude),
+            "--importance on a repeat bought immunity: {}",
+            o.amplitude
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The collapse is a replay of the repeats that should have happened, so it
+    /// obeys the same boundary: folding duplicates into a keeper that sits below
+    /// the established line must not push it over.
+    ///
+    /// Its own store, because the sibling test's keeper legitimately ends up
+    /// ABOVE the line by a route that has nothing to do with reinforcement —
+    /// `Medium::store` adds interference energy to every similar wavefront it
+    /// meets, so inserting a duplicate lifts its neighbours. Asserting the
+    /// boundary there would have been vacuous, and the precondition below exists
+    /// so this one cannot become vacuous the same way.
+    #[test]
+    fn a_collapse_does_not_push_its_keeper_over_the_established_boundary() {
+        use crate::consolidation::is_established_protected;
+
+        let dir = temp_dir("collapse_immunity");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        sys.consolidation.protect_established = true;
+
+        // Low importance and only two copies: enough to form a duplicate set,
+        // little enough that the interference between them leaves the keeper
+        // below the line. Three copies at 0.4 already crosses it on their own.
+        for _ in 0..2 {
+            sys.remember_forcing_new(FACT, "semantic", 0.15).unwrap();
+        }
+        let keeper = sys.find_exact_repeat(FACT).unwrap();
+        let keeper_before = sys.get_memory(&keeper).unwrap().unwrap().amplitude;
+        assert!(
+            !is_established_protected(true, keeper_before),
+            "precondition: the keeper must start BELOW the line, else this proves \
+             nothing — it was {keeper_before}"
+        );
+
+        let dry = sys.collapse_exact_duplicates(false).unwrap();
+        assert_eq!(dry.groups.len(), 1);
+        assert!(
+            !is_established_protected(true, dry.groups[0].amplitude_after),
+            "the dry run promised an amplitude that buys immunity: {}",
+            dry.groups[0].amplitude_after
+        );
+
+        let applied = sys.collapse_exact_duplicates(true).unwrap();
+        assert_eq!(applied.errors, 0);
+        let after = sys.get_memory(&keeper).unwrap().unwrap().amplitude;
+        assert!(
+            !is_established_protected(true, after),
+            "the apply bought immunity: {after}"
+        );
+        // And the dry run promised exactly what the apply delivered.
+        assert!(
+            (applied.groups[0].amplitude_after - after).abs() < 1e-6,
+            "dry run said {} but apply produced {after}",
+            applied.groups[0].amplitude_after
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
