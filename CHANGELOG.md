@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.4] — 2026-09-13
+
 ### Added — eye: the video perception engine has had no callers since March (ADR-0008)
 
 `src/eye/` has been in the tree since 2026-03-01: 1,607 lines of decoder, spatial
