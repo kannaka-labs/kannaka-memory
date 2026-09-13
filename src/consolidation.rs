@@ -4219,4 +4219,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    // -----------------------------------------------------------------------
+    // Reinforcement must not put a memory out of stage_prune's reach
+    // -----------------------------------------------------------------------
+
+    /// The claim the branch makes is that a repeat cannot grant immortality on a
+    /// node configured the way prime is. This asserts it against the real
+    /// `stage_prune`, not against the predicate it shares — a memory carried to
+    /// the highest amplitude repetition can reach is still dampened when a
+    /// destructive pair meets it.
+    ///
+    /// `/etc/systemd/system/kannaka-memory.service.d/belief.conf` on O1 sets
+    /// `KANNAKA_BELIEF_PHASE=on`, and that unit's `KANNAKA_DATA_DIR` is
+    /// `/home/opc/.kannaka` — prime's own store, behind the public `ask_kannaka`.
+    /// The condition is set here through `protect_established`, the other arm of
+    /// the same disjunction, so the test is deterministic and does not mutate
+    /// process environment shared with every other test.
+    #[test]
+    fn a_reinforced_memory_is_still_reachable_by_stage_prune() {
+        let mut engine = make_engine();
+
+        // The strongest amplitude repetition can produce from a verdict-typical
+        // 0.4 on a protected node. Derived, not written down, so that a change to
+        // the clamp moves the fixture with it.
+        let mut reinforced = 0.4_f32;
+        for _ in 0..50 {
+            let mut proposed = reinforced;
+            proposed += 0.25 * (AMPLITUDE_CEILING - proposed);
+            reinforced = bounded_by_retention(reinforced, proposed, true);
+        }
+        assert!(
+            !is_established_protected(true, reinforced),
+            "fixture: 50 repeats must not reach the protected band ({reinforced})"
+        );
+
+        let repeated = insert_with_phase_and_layer(&mut engine, "rogue posted the verdict", 0.0, 0);
+        let partner = insert_with_phase_and_layer(&mut engine, "an anti-phase neighbour", 3.14, 0);
+        // A control that DID earn its place above the line: it must be skipped,
+        // which is what proves this test can tell protection from its absence.
+        let established =
+            insert_with_phase_and_layer(&mut engine, "a hard-won established fact", 0.0, 0);
+
+        for (id, amp) in [
+            (repeated, reinforced),
+            (partner, 0.4_f32),
+            (established, ESTABLISHED_AMPLITUDE + 0.2),
+        ] {
+            let mem = engine.store.get_mut(&id).ok().flatten().unwrap();
+            mem.amplitude = amp;
+        }
+
+        let mut eng = ConsolidationEngine::default();
+        eng.protect_established = true; // exactly what prime runs, via the other arm
+        let pairs = vec![
+            InterferencePair {
+                id_a: repeated,
+                id_b: partner,
+                similarity: 0.9,
+                kind: Interference::Destructive,
+            },
+            InterferencePair {
+                id_a: established,
+                id_b: partner,
+                similarity: 0.9,
+                kind: Interference::Destructive,
+            },
+        ];
+
+        eng.stage_prune(&mut engine, &pairs);
+
+        let after_repeated = engine.store.get(&repeated).unwrap().unwrap().amplitude;
+        assert!(
+            after_repeated < reinforced,
+            "a reinforced memory was NOT reachable by stage_prune: {reinforced} -> {after_repeated}"
+        );
+
+        // The control confirms the guard is live in this very run, so the
+        // assertion above is about reinforcement staying under the line and not
+        // about protection being switched off.
+        let after_established = engine.store.get(&established).unwrap().unwrap().amplitude;
+        assert_eq!(
+            after_established,
+            ESTABLISHED_AMPLITUDE + 0.2,
+            "the established control was dampened, so protection was not actually on \
+             and the other assertion proves nothing"
+        );
+    }
+
 }
