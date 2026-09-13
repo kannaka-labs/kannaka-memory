@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.5] — 2026-09-13
+
 ### Fixed — retention: "established" now means established, not merely recent (#950)
 
 `stage_prune` skips destructive dampening for *established* memories under the
