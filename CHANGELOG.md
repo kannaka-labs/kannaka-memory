@@ -241,9 +241,20 @@ protection switched off.
 promotion and increments no absorb counter, because those are "a new contribution landed"
 signals and paying them for repetition is a lever worth closing before it is used.
 
-`KANNAKA_REINFORCE_ON_REPEAT=0` restores insert-every-time for a whole process, and
-`KannakaMemorySystem::remember_forcing_new` is the per-call opt-out for a future caller
-that genuinely needs one row per call. Nothing in the tree needs either today.
+**It ships dark. `KANNAKA_REINFORCE_ON_REPEAT` defaults to OFF** and is opted into with
+`1`/`true`/`on`/`yes`. Unset, `remember` inserts exactly as it always has, so rolling this
+binary onto a node changes nothing about how that node writes. This is the same posture
+ADR-0049's facet decomposition shipped under, and for the same reason: a change to the write
+semantics of the substrate should be a decision someone makes, not something a deploy
+acquires. Operator decision 2026-09-13.
+
+The flag is read once at construction into `KannakaMemorySystem::reinforce_on_repeat`, and
+`set_reinforce_on_repeat` turns it on for one system. Tests use the setter rather than the
+variable, because `cargo test` runs threads in one process and a process-global switch is the
+race `facet::lock_decompose_flag` exists to contain.
+
+`KannakaMemorySystem::remember_forcing_new` remains the per-call opt-out for a caller that
+genuinely needs one row per call, whatever the gate says.
 
 ### Fixed — serve: an anonymous ask can no longer choose what it costs (#932)
 
