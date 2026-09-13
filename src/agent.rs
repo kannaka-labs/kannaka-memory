@@ -215,8 +215,24 @@ pub fn dispatch_tool(
             }
             let importance = input.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
             let category = input.get("category").and_then(|v| v.as_str()).unwrap_or("semantic");
-            match sys.remember_with_category(content, category, importance) {
-                Ok(id) => (format!("remembered {id} (importance={importance:.2}, category={category})"), false),
+            // `remember_reporting`, not `remember_with_category`: a repeat is
+            // reinforced rather than inserted, and on that path `importance` is
+            // only a floor. Echoing the requested number back would claim an
+            // effect it may not have had, so report the RESULTING amplitude.
+            match sys.remember_reporting(content, category, importance) {
+                Ok(o) => {
+                    let msg = match o.kind {
+                        crate::openclaw::RememberOutcomeKind::Inserted => format!(
+                            "remembered {} (importance={importance:.2}, amplitude={:.3}, category={category})",
+                            o.id, o.amplitude
+                        ),
+                        crate::openclaw::RememberOutcomeKind::Reinforced => format!(
+                            "reinforced {} (seen {}x, amplitude={:.3}, category={category})",
+                            o.id, o.times_seen, o.amplitude
+                        ),
+                    };
+                    (msg, false)
+                }
                 Err(e) => (format!("remember failed: {e}"), true),
             }
         }

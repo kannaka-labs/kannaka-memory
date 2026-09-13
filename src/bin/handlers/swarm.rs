@@ -1392,6 +1392,8 @@ pub(crate) fn handle_swarm_absorb(
     );
 
     let mut absorbed = 0usize;
+    // Re-sends of content already held: strengthened, but not a new contribution.
+    let mut reinforced = 0usize;
     let mut skipped_threshold = 0usize;
     let mut skipped_self = 0usize;
     let my_id = &cfg.agent.id;
@@ -1488,8 +1490,24 @@ pub(crate) fn handle_swarm_absorb(
                 Live => {
                     // Tag with provenance so we can identify swarm-origin memories later.
                     let category = format!("swarm:{source}");
-                    match sys.remember_with_category(content, &category, clean.amplitude as f64) {
-                        Ok(id) => {
+                    match sys.remember_reporting(content, &category, clean.amplitude as f64) {
+                        Ok(o) if o.kind
+                            == kannaka_memory::openclaw::RememberOutcomeKind::Reinforced =>
+                        {
+                            // A byte-identical re-send added no row. Reputation and
+                            // the absorb counters are "a new contribution landed"
+                            // signals, so neither is paid for repetition — otherwise
+                            // a peer earns promotion by looping one memory. The
+                            // memory itself is still strengthened.
+                            eprintln!(
+                                "      already held; reinforced {} (seen {}x, amplitude {:.3}) \
+                                 — no promotion, not counted as an absorb",
+                                o.id, o.times_seen, o.amplitude
+                            );
+                            reinforced += 1;
+                        }
+                        Ok(o) => {
+                            let id = o.id;
                             // #8: commit the pending promotion ONLY after the medium
                             // write succeeds (no-op when dormant / non-Live).
                             kannaka_memory::commit_promotion(
@@ -1525,6 +1543,9 @@ pub(crate) fn handle_swarm_absorb(
         if dry_run { " (DRY RUN)" } else { "" }
     );
     println!("  absorbed:    {absorbed}");
+    if reinforced > 0 {
+        println!("  reinforced:  {reinforced}  (already held; strengthened, no new row)");
+    }
     println!("  skipped (threshold/length): {skipped_threshold}");
     println!("  skipped (self-origin):      {skipped_self}");
 }
@@ -1840,6 +1861,8 @@ pub(crate) fn handle_swarm_autoabsorb(
 
     let my_id = &cfg.agent.id;
     let mut absorbed = 0usize;
+    // Re-sends of content already held: strengthened, but not a new contribution.
+    let mut reinforced = 0usize;
     let mut skipped_self = 0usize;
     let mut skipped_capped = 0usize;
     let mut skipped_resonant = 0usize;
@@ -1927,8 +1950,21 @@ pub(crate) fn handle_swarm_autoabsorb(
             match decision {
                 Live => {
                     let category = format!("swarm:{source}");
-                    match sys.remember_with_category(content, &category, clean.amplitude as f64) {
-                        Ok(id) => {
+                    match sys.remember_reporting(content, &category, clean.amplitude as f64) {
+                        Ok(o) if o.kind
+                            == kannaka_memory::openclaw::RememberOutcomeKind::Reinforced =>
+                        {
+                            // See the peer-absorb site: a re-send of held content
+                            // earns no promotion and no daily-counter increment.
+                            eprintln!(
+                                "[autoabsorb]   already held; reinforced {} (seen {}x, \
+                                 amplitude {:.3}) — no promotion, not counted as an absorb",
+                                o.id, o.times_seen, o.amplitude
+                            );
+                            reinforced += 1;
+                        }
+                        Ok(o) => {
+                            let id = o.id;
                             // #8: commit the pending promotion ONLY after the medium
                             // write succeeds (no-op when dormant / non-Live).
                             kannaka_memory::commit_promotion(

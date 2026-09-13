@@ -181,17 +181,28 @@ pub trait MediumBackend: Send + Sync {
     fn get(&self, id: &Uuid) -> Result<Option<&HyperMemory>, StoreError>;
     fn get_mut(&mut self, id: &Uuid) -> Result<Option<&mut HyperMemory>, StoreError>;
 
-    /// Ids that carry ADR-0049 facet structure: a minted facet row, or a
-    /// parent that has already been decomposed into facets.
+    /// Ids of ADR-0049 facet rows — the minted atoms, not their parents.
     ///
-    /// Maintenance tools must never delete either. Deleting a decomposed
-    /// parent dangles every facet that points at it ("parent retention is an
-    /// invariant" — `WavefrontMeta::decomposed`), and deleting a facet drops
-    /// an atom recall depends on. Backends with no facet structure return the
-    /// empty set, which is why the default is `HashSet::new()` rather than an
-    /// error: absence of facets is a correct answer, not an unsupported one.
-    fn facet_structured_ids(&self) -> std::collections::HashSet<Uuid> {
+    /// A facet is an internal atom of a parent, not a statement anyone wrote, so
+    /// it is never grouped as a duplicate in its own right and never deleted
+    /// except alongside the parent that minted it. Backends with no facet
+    /// structure return the empty set, which is why the default is
+    /// `HashSet::new()` rather than an error: absence of facets is a correct
+    /// answer, not an unsupported one.
+    fn facet_row_ids(&self) -> std::collections::HashSet<Uuid> {
         std::collections::HashSet::new()
+    }
+
+    /// The ADR-0049 facet rows minted from `parent`, or empty when `parent` is
+    /// not a decomposed parent.
+    ///
+    /// A decomposed parent is retained resolve-only: the facets are what recall
+    /// is meant to score. So anything that strengthens a memory has to ask this
+    /// question first — strengthening the parent instead of its facets re-creates
+    /// exactly the smearing ADR-0049 exists to remove.
+    fn facets_of(&self, parent: &Uuid) -> Vec<Uuid> {
+        let _ = parent;
+        Vec::new()
     }
     fn all_memories(&self) -> Result<Vec<&HyperMemory>, StoreError>;
     fn all_ids(&self) -> Result<Vec<Uuid>, StoreError>;

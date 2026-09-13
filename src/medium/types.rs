@@ -96,6 +96,22 @@ pub enum Tier {
     Pinned,
 }
 
+impl Tier {
+    /// Retention precedence, low to high. Anywhere a group of memories collapses
+    /// to one survivor, the survivor must carry the group's HIGHEST tier —
+    /// otherwise a merge silently demotes a Pinned memory, which ADR-0031
+    /// forbids. Existing users: the resonance-merge carrier in
+    /// `HrmStore::plan_consolidation`, and duplicate collapse in
+    /// `KannakaMemorySystem::collapse_exact_duplicates`.
+    pub fn rank(self) -> u8 {
+        match self {
+            Tier::ShortTerm => 0,
+            Tier::LongTerm => 1,
+            Tier::Pinned => 2,
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // ADR-0036: Consolidation as resonance-merge.
 // Phase 0 is dry-run ONLY — the planner computes what it WOULD merge/decay and

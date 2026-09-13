@@ -1613,11 +1613,7 @@ impl HrmStore {
 
         // Strongest tier wins: Pinned > LongTerm > ShortTerm.
         fn tier_rank(t: Tier) -> u8 {
-            match t {
-                Tier::ShortTerm => 0,
-                Tier::LongTerm => 1,
-                Tier::Pinned => 2,
-            }
+            t.rank()
         }
         // Effective strength for representative selection: energy decayed by age.
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -2494,7 +2490,23 @@ impl MediumBackend for HrmStore {
         Ok(self.memory_cache.get_mut(id))
     }
 
-    fn facet_structured_ids(&self) -> std::collections::HashSet<Uuid> {
+    fn facets_of(&self, parent: &Uuid) -> Vec<Uuid> {
+        // parent_id lives on the canonical WavefrontMeta in the right
+        // hemisphere, not on the cached HyperMemory. A flat store has no facet
+        // structure, so it has no facets for anyone.
+        match self.chiral {
+            Some(ref chiral) => chiral
+                .right
+                .metadata
+                .iter()
+                .filter(|m| m.is_facet && m.parent_id == Some(*parent))
+                .map(|m| m.id)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn facet_row_ids(&self) -> std::collections::HashSet<Uuid> {
         // ADR-0049 flags live on the canonical WavefrontMeta, not on the cached
         // HyperMemory, so this reads the right hemisphere directly. A flat
         // (non-chiral) store has no facet structure and returns the empty set.
@@ -2503,7 +2515,7 @@ impl MediumBackend for HrmStore {
                 .right
                 .metadata
                 .iter()
-                .filter(|m| m.is_facet || m.decomposed)
+                .filter(|m| m.is_facet)
                 .map(|m| m.id)
                 .collect(),
             None => std::collections::HashSet::new(),

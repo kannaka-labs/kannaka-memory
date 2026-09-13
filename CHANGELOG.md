@@ -43,6 +43,31 @@ asserted 500 times by a cron job can dominate the field no more than the stronge
 dream-strengthened memory already could. A test walks 500 repeats and asserts the
 step never grows and the ceiling never breaks.
 
+An explicit `--importance` above the memory's current amplitude is honoured as a floor
+before that step, so `kannaka remember "x" --importance 0.95` on something already held
+raises it rather than dropping the number on the floor — the same silent-drop class
+`remember_with_importance` was written to fix. A lower importance never weakens anything.
+
+**Four things a repeat deliberately does not do.** It does not touch a **ShortTerm**
+row's energy, because `compute_decay_set` picks the weakest half of that distribution and
+lifting a row out of it makes ADR-0054's evict path permanently unreachable — for exactly
+the `audio:` perceptions and cron repeats that config exists to clear. Those rows get the
+count. It does not strengthen a **decomposed parent**; the facets gain instead, because
+recall ranks on `similarity × energy` and ADR-0049 names "a parent can't out-rank its own
+facets" as a blocker it defuses. It does not revive a **ghost**: an ADR-0037 ghost is a
+memory the dream chose to let go, so the same text arriving again becomes a new memory and
+the ghost is left to age out. And it does not **replicate** — `times_seen` is not on the
+wire and a local `sync_version` is not comparable across agents, so no counter is bumped
+and no `MemoryStored` event is published for a store that did not happen. Making salience
+swarm-wide means putting the count on the wire with MAX reconciliation, which is an ADR.
+
+**Recency lands on `observed_at`**, not `updated_at`. That is the field that already means
+"when this agent observed the fact", the one in `WavefrontMeta`, and the one
+`temporal_weight` reads. `updated_at` is neither persisted nor consulted by any recall
+path, and `updated_at != created_at` with `retrieval_count == 0` is this codebase's ghost
+stamp — writing it onto healthy rows would file every reinforced memory in
+`.reactivation.json` under a signature meaning "ghosted, keep recoverable".
+
 **The count is the point.** `times_seen` records how many times the world showed you
 the fact, as distinct from `retrieval_count`, which records how many times *you* went
 looking. It is the salience signal this whole change exists to create, so it has to
@@ -56,17 +81,45 @@ ever repeated reads `1`, not `0`.
 duplicates; the sets already written need a deliberate pass. It collapses rather than
 deletes, because the duplicate set is itself evidence — five copies mean the world
 showed you that fact five times, and a cleanup that simply dropped four of them would
-throw away the one useful thing the accident encoded. The oldest member is kept (the
-same row a later repeat will land on), it inherits the summed count, and its amplitude
-is advanced along the reinforcement curve once per folded copy, starting from the
-*strongest* member so nothing the store already held is lost. Rows carrying ADR-0049
-facet structure are excluded outright: deleting a decomposed parent dangles its facets.
+throw away the one useful thing the accident encoded. The keeper inherits the summed
+count, and the energy is advanced along the reinforcement curve once per folded copy,
+starting from the *strongest* member so nothing the store already held is lost.
 
-The command is a dry run by default and prints what it would fold. `--apply` takes the
-HRM write lock and refuses if another writer holds it, refuses outright under
+**The keeper comes from the same function the write path uses.** One rule, called twice:
+highest retention tier, then oldest, then id. When the two paths had separate rules they
+disagreed on a mixed set — dedupe kept one row while the next `remember` strengthened a
+different one, so the duplicates were never actually resolved. Preferring the highest tier
+is also what keeps a **Pinned** duplicate from being the casualty: ADR-0031 says Pinned is
+never evicted and never demoted, and a collapse that deleted the pinned row and left an
+unpinned keeper did both.
+
+**A duplicated decomposed parent folds together with its whole facet constellation.**
+Previously every row in a facet-decomposed store was either a facet or a decomposed
+parent, so the tool cleaned nothing while printing "0 duplicate sets" — which reads as
+"your store is clean" when it means "I cannot see your duplicates". Compound memories are
+precisely what ADR-0049 targets and precisely the shape a verdict line takes. Deleting a
+parent with its own atoms removes a self-contained copy and leaves the keeper's atoms
+intact. Facet rows are never grouped in their own right, and the report says so in those
+words rather than as a count of declined duplicates.
+
+**Ghosts are not in the candidate set at all**, so `max(amplitude)` over a group can never
+resurrect one.
+
+The command is a dry run by default and prints what it would fold. The dry run takes **no
+write lock**, so the safe informational mode stays available while the node is up.
+`--apply` takes the lock and refuses if another writer holds it, refuses outright under
 `KANNAKA_READONLY` (a read-only store drops the write on save, so the run would report
-deletions that never happened), and refuses to proceed without first writing a
-retention-exempt pre-collapse snapshot of the `.hrm`. Nothing schedules it.
+deletions that never happened), refuses to proceed without a retention-exempt pre-collapse
+snapshot, and exits non-zero if any deletion failed so a script can see a partial run. The
+snapshot is a **bundle**: the `.hrm` plus the sidecars, because the collapse's flush prunes
+folded ids out of `.times_seen.json` and that sidecar's merge only ever raises a count, so
+restoring the medium alone would leave an inflation nothing could later correct. Nothing
+schedules it.
+
+**Peer re-sends no longer earn reputation.** Both swarm absorb sites now use
+`remember_reporting`: a byte-identical re-send strengthens the memory but commits no
+promotion and increments no absorb counter, because those are "a new contribution landed"
+signals and paying them for repetition is a lever worth closing before it is used.
 
 `KANNAKA_REINFORCE_ON_REPEAT=0` restores insert-every-time for a whole process, and
 `KannakaMemorySystem::remember_forcing_new` is the per-call opt-out for a future caller

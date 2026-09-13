@@ -2083,6 +2083,10 @@ fn main() {
                                 "strength": r.strength,
                                 "age_hours": r.age_hours,
                                 "layer": r.layer,
+                                // How many times the world showed this fact.
+                                // Without this the count is only readable by
+                                // cat-ing the sidecar.
+                                "times_seen": r.times_seen,
                             })
                         })
                         .collect::<Vec<_>>()

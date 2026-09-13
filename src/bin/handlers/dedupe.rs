@@ -43,23 +43,29 @@ pub(crate) fn handle_dedupe(
         }
     }
 
-    // Single-writer guard. A collapse that races the swarm-join writer or a
-    // running dream would be a lost update on a one-way file.
-    let lock = try_acquire_write_lock();
-    if lock.is_none() {
-        eprintln!(
-            "[dedupe] REFUSING: another process holds the HRM write lock \
-             (a swarm join writer or a running dream). Stop it, then re-run."
-        );
-        std::process::exit(1);
-    }
-    #[cfg(not(unix))]
-    if apply {
+    // Single-writer guard — for `--apply` ONLY. A dry run mutates nothing, so
+    // taking the lock for it would make the safe, informational mode unavailable
+    // exactly when an operator most wants it: while the node is up and the
+    // writer holds the lock.
+    let lock = if apply {
+        let lock = try_acquire_write_lock();
+        if lock.is_none() {
+            eprintln!(
+                "[dedupe] REFUSING --apply: another process holds the HRM write lock \
+                 (a swarm join writer or a running dream). Stop it, then re-run. \
+                 A dry run needs no lock and is safe to run now."
+            );
+            std::process::exit(1);
+        }
+        #[cfg(not(unix))]
         eprintln!(
             "[dedupe] NOTE: the write lock is advisory-only on this platform — \
              confirm no kannaka writer daemon is running before trusting this run."
         );
-    }
+        lock
+    } else {
+        None
+    };
 
     if apply && readonly_env() {
         eprintln!(
@@ -94,10 +100,28 @@ pub(crate) fn handle_dedupe(
     } else {
         println!("  copies that WOULD fold:    {}", report.duplicates());
     }
-    if report.skipped_facet_structured > 0 {
+    if report.facets_folded > 0 {
         println!(
-            "  skipped (facet structure): {}",
-            report.skipped_facet_structured
+            "  facets folded with them:   {}  <- a parent's atoms belong to that copy",
+            report.facets_folded
+        );
+    }
+    if report.facet_rows_not_grouped > 0 {
+        println!(
+            "  facet rows not grouped:    {}  <- atoms of a parent, not statements; removed only with their parent",
+            report.facet_rows_not_grouped
+        );
+    }
+    if report.skipped_ghosts > 0 {
+        println!(
+            "  skipped (ADR-0037 ghosts): {}  <- deliberately forgotten; never resurrected here",
+            report.skipped_ghosts
+        );
+    }
+    if report.tier_promotions > 0 {
+        println!(
+            "  keepers promoted in tier:  {}  <- a pinned duplicate keeps its pin",
+            report.tier_promotions
         );
     }
     if report.errors > 0 {
@@ -107,10 +131,11 @@ pub(crate) fn handle_dedupe(
     let show = if verbose { report.groups.len() } else { 20 };
     for g in report.groups.iter().take(show) {
         println!(
-            "  x{:<3} {:.3} -> {:.3}  keep {}  \"{}\"",
+            "  x{:<3} {:.3} -> {:.3}  {:?}  keep {}  \"{}\"",
             g.folded.len() + 1,
             g.amplitude_before,
             g.amplitude_after,
+            g.tier_after,
             g.keeper,
             g.preview.replace('\n', " ")
         );
@@ -134,6 +159,17 @@ pub(crate) fn handle_dedupe(
     }
 
     drop(lock);
+
+    // A partial failure must be detectable by a script. Printing the count and
+    // exiting 0 made a half-applied collapse look like a clean run.
+    if report.errors > 0 {
+        eprintln!(
+            "[dedupe] {} deletion(s) failed — the collapse is PARTIAL. The \
+             pre-collapse snapshot bundle is the restore point.",
+            report.errors
+        );
+        std::process::exit(1);
+    }
 }
 
 fn readonly_env() -> bool {
@@ -172,10 +208,37 @@ fn pre_collapse_snapshot(
     gz.write_all(&bytes).map_err(|e| format!("gzip: {e}"))?;
     let out = gz.finish().map_err(|e| format!("gzip finish: {e}"))?;
     std::fs::write(&path, &out).map_err(|e| format!("write {}: {e}", path.display()))?;
+
+    // The `.hrm` alone is NOT a restore point for this operation. The collapse
+    // flushes, and that flush runs `save_times_seen_merge(prune_stale = true)`,
+    // which drops the folded ids out of `.times_seen.json`. Restoring only the
+    // medium would give the rows back with their counts reset to 1 while the
+    // keeper kept its summed count — and because the sidecar merge only ever
+    // RAISES an entry, no later run could correct the inflation. So the sidecars
+    // are part of the bundle.
+    let mut copied = Vec::new();
+    for ext in ["times_seen.json", "reactivation.json", "links.json", "clusters.json"] {
+        let side = hrm.with_extension(ext);
+        if !side.exists() {
+            continue;
+        }
+        let dest = dir.join(format!("{ts}-{agent_id}-pre-dedupe.{ext}"));
+        match std::fs::copy(&side, &dest) {
+            Ok(_) => copied.push(ext),
+            // A sidecar we cannot copy means an incomplete restore point, and
+            // this is the snapshot that gates a one-way delete. Refuse.
+            Err(e) => return Err(format!("copy sidecar {}: {e}", side.display())),
+        }
+    }
     println!(
         "[dedupe] pre-collapse snapshot: {} ({} KB, exempt from retention pruning)",
         path.display(),
         out.len() / 1024
     );
+    if copied.is_empty() {
+        println!("[dedupe]   no sidecars present to snapshot");
+    } else {
+        println!("[dedupe]   sidecars in the bundle: {}", copied.join(", "));
+    }
     Ok(())
 }
