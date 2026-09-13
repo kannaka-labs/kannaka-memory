@@ -63,14 +63,23 @@ const REINFORCE_GAIN: f32 = 0.25;
 /// `store.energy`, so this bounds the on-disk energy too).
 const REINFORCE_CEILING: f32 = crate::consolidation::AMPLITUDE_CEILING;
 
-/// Environment escape hatch. Reinforcement is ON by default; set
-/// `KANNAKA_REINFORCE_ON_REPEAT=0` (or `false`/`off`) to restore the old
-/// insert-every-time behaviour for a whole process.
+/// `KANNAKA_REINFORCE_ON_REPEAT` — **default OFF**, opt-in with `1`/`true`/`on`/`yes`.
+///
+/// Reinforcement changes the write semantics of the substrate, so it ships dark,
+/// the way ADR-0049's facet decomposition did. Unset, `remember` inserts exactly
+/// as it always has, and rolling a new binary onto a node changes nothing about
+/// how that node writes. Operator decision 2026-09-13.
+///
+/// Read once at construction into `KannakaMemorySystem::reinforce_on_repeat`.
+/// Tests use `set_reinforce_on_repeat` rather than this, because the variable is
+/// process-global and `cargo test` shares one process across threads.
 fn reinforce_on_repeat_enabled() -> bool {
-    match std::env::var("KANNAKA_REINFORCE_ON_REPEAT") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => true,
-    }
+    std::env::var("KANNAKA_REINFORCE_ON_REPEAT")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 /// What a `remember` actually did. Returned by [`KannakaMemorySystem::remember_reporting`]
@@ -353,6 +362,15 @@ pub struct KannakaMemorySystem {
     /// if post-dream Ξ falls below `xi_trigger`. None = disabled (default). Set
     /// by the bin via `set_triage_policy` from `[triage]` config.
     triage_policy: Option<TriageParams>,
+    /// Reinforce a byte-identical repeat instead of inserting a second row.
+    ///
+    /// **Dormant by default.** This changes the write semantics of the substrate,
+    /// so it ships dark like ADR-0049's facet decomposition did: enabled by
+    /// `KANNAKA_REINFORCE_ON_REPEAT=1` at construction, or
+    /// `set_reinforce_on_repeat(true)`. Unset, `remember` inserts exactly as it
+    /// always has, and a node's behaviour does not change under it on a deploy.
+    reinforce_on_repeat: bool,
+
     /// ADR-0040 — cerebellar novelty detector. DORMANT by default; enabled by
     /// `KANNAKA_NOVELTY=1` at construction or `set_novelty_enabled(true)`. When
     /// on, each `recall` observes the top hit's familiarity and records the
@@ -479,6 +497,7 @@ impl KannakaMemorySystem {
             flux,
             nats_url: None,
             triage_policy: None,
+            reinforce_on_repeat: reinforce_on_repeat_enabled(),
             novelty: if std::env::var("KANNAKA_NOVELTY").map(|v| v == "1").unwrap_or(false) {
                 Some(crate::novelty::NoveltyDetector::new())
             } else {
@@ -871,7 +890,7 @@ impl KannakaMemorySystem {
         category: &str,
         importance: f64,
     ) -> Result<RememberOutcome, SystemError> {
-        if reinforce_on_repeat_enabled() {
+        if self.reinforce_on_repeat {
             if let Some(existing) = self.find_exact_repeat(text) {
                 let (times_seen, amplitude, clamped_by_retention) =
                     self.reinforce(&existing, importance)?;
@@ -1283,6 +1302,15 @@ impl KannakaMemorySystem {
     /// Enabling starts a fresh baseline; disabling clears the detector and the
     /// last signal. Dormant by default (also gated by `KANNAKA_NOVELTY=1` at
     /// construction).
+    /// Turn reinforce-on-repeat on or off for this system.
+    ///
+    /// Tests use this rather than mutating `KANNAKA_REINFORCE_ON_REPEAT`, which
+    /// is process-global and shared with every other test running in parallel —
+    /// the race `facet::lock_decompose_flag` exists to contain.
+    pub fn set_reinforce_on_repeat(&mut self, on: bool) {
+        self.reinforce_on_repeat = on;
+    }
+
     pub fn set_novelty_enabled(&mut self, on: bool) {
         self.novelty = on.then(crate::novelty::NoveltyDetector::new);
         if !on {
@@ -2810,10 +2838,101 @@ mod tests {
 
     /// THE behaviour. Remembering held text returns the id already held and
     /// makes that memory stronger — it does not insert a second copy.
+    /// Reinforcement ships dark: a fresh system does NOT reinforce.
+    ///
+    /// This is the test that catches a flipped default. Every other test in this
+    /// family calls `set_reinforce_on_repeat(true)` first, so none of them would
+    /// notice if `reinforce_on_repeat_enabled` started returning true when the
+    /// variable is unset. Operator decision 2026-09-13: changing the write
+    /// semantics of the substrate must be opted into, not acquired by rolling a
+    /// binary, exactly as ADR-0049's facet decomposition was.
+    /// `kannaka dedupe` must work with reinforcement OFF.
+    ///
+    /// The two halves are independent by design: the write path stops making new
+    /// duplicates, and `dedupe` cleans the ones already on disk. An operator
+    /// running dark still has a store to clean, and would be stuck if the
+    /// retrospective half were gated on the prospective one.
+    ///
+    /// Every other collapse test enables the gate for its own `remember` line, so
+    /// none of them would catch that coupling if it were introduced. This one
+    /// never touches the setter.
+    #[test]
+    fn dedupe_works_on_a_node_running_dark() {
+        let dir = temp_dir("dedupe_dark");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        // Written the way a dark node writes them: one row per call.
+        let first = sys.remember(FACT).unwrap();
+        for _ in 0..3 {
+            sys.remember(FACT).unwrap();
+        }
+        assert_eq!(sys.all_memories().unwrap().len(), 4, "fixture: four separate rows");
+
+        let report = sys.collapse_exact_duplicates(true).unwrap();
+        assert!(report.applied);
+        assert_eq!(report.duplicates(), 3, "three copies folded away");
+        assert_eq!(
+            sys.all_memories().unwrap().len(),
+            1,
+            "dedupe must clean a dark node's store without the gate"
+        );
+        assert_eq!(
+            sys.get_memory(&first).unwrap().unwrap().times_seen,
+            4,
+            "the keeper carries the count of what it absorbed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reinforcement_is_off_unless_asked_for() {
+        // If a developer exported the variable, this test is measuring their
+        // shell rather than the default, and says so instead of failing oddly.
+        assert!(
+            std::env::var("KANNAKA_REINFORCE_ON_REPEAT").is_err(),
+            "precondition: KANNAKA_REINFORCE_ON_REPEAT must be unset to test the default"
+        );
+
+        let dir = temp_dir("reinforce_dark_by_default");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        let first = sys.remember(FACT).unwrap();
+        let second = sys.remember(FACT).unwrap();
+        assert_ne!(
+            first, second,
+            "the same sentence twice must still be two rows when the gate is off"
+        );
+        assert_eq!(sys.all_memories().unwrap().len(), 2);
+        assert_eq!(
+            sys.get_memory(&first).unwrap().unwrap().times_seen,
+            1,
+            "a second insert must not count as a repeat on the first row"
+        );
+
+        // And the switch genuinely switches, so the assertion above is about the
+        // default rather than about reinforcement being broken.
+        sys.set_reinforce_on_repeat(true);
+        let third = sys.remember(FACT).unwrap();
+        assert!(
+            third == first || third == second,
+            "with the gate on, a repeat must land on an existing row"
+        );
+        assert_eq!(
+            sys.all_memories().unwrap().len(),
+            2,
+            "and must not add a third"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reinforce_exact_repeat_returns_same_id_and_raises_strength() {
         let dir = temp_dir("reinforce_same_id");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         let first = sys.remember(FACT).unwrap();
         let before = sys.get_memory(&first).unwrap().unwrap().amplitude;
@@ -2841,6 +2960,8 @@ mod tests {
     fn near_but_not_identical_text_still_inserts_separately() {
         let dir = temp_dir("reinforce_near_miss");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         let base = sys.remember(FACT).unwrap();
 
@@ -2875,6 +2996,8 @@ mod tests {
     fn reinforcement_has_diminishing_returns_and_a_ceiling() {
         let dir = temp_dir("reinforce_ceiling");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         let id = sys.remember(FACT).unwrap();
         let mut prev = sys.get_memory(&id).unwrap().unwrap().amplitude;
@@ -2915,6 +3038,8 @@ mod tests {
         let dir = temp_dir("reinforce_reload");
         let id = {
             let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            // Ships dark: the write-path gate is off unless asked for.
+            sys.set_reinforce_on_repeat(true);
             let id = sys.remember(FACT).unwrap();
             for _ in 0..3 {
                 sys.remember(FACT).unwrap();
@@ -3011,6 +3136,8 @@ mod tests {
     fn collapse_apply_folds_into_one_memory_that_carries_the_count() {
         let dir = temp_dir("collapse_apply");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
         let ids = seed_five_copies(&mut sys);
         let unrelated = sys
             .remember_forcing_new("an unrelated fact", "semantic", 0.4)
@@ -3705,6 +3832,8 @@ mod tests {
     fn collapse_never_deletes_a_pinned_duplicate_and_never_drops_the_pin() {
         let dir = temp_dir("collapse_pinned");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         let older = sys.remember_forcing_new(FACT, "semantic", 0.4).unwrap();
         let newer = sys.remember_forcing_new(FACT, "semantic", 0.4).unwrap();
@@ -3781,6 +3910,8 @@ mod tests {
     fn a_repeat_counts_a_shortterm_row_without_making_it_undecayable() {
         let dir = temp_dir("reinforce_shortterm");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         let id = sys.remember_forcing_new("audio:heard the same jingle", "audio", 0.4).unwrap();
         set_tier(&mut sys, &id, Tier::ShortTerm);
@@ -3824,6 +3955,8 @@ mod tests {
     fn a_repeat_does_not_revive_a_ghost_or_renew_its_window() {
         let dir = temp_dir("reinforce_ghost");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         // The ghost is the OLDER row, so the oldest-wins tie-break would pick it
         // if ghosts were candidates at all.
@@ -3894,6 +4027,8 @@ mod tests {
         let dir = temp_dir("reinforce_observed");
         let id = {
             let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            // Ships dark: the write-path gate is off unless asked for.
+            sys.set_reinforce_on_repeat(true);
             let id = sys.remember(FACT).unwrap();
             let created = sys.get_memory(&id).unwrap().unwrap().created_at;
             assert!(sys.get_memory(&id).unwrap().unwrap().observed_at.is_none());
@@ -3935,6 +4070,8 @@ mod tests {
     fn a_repeat_honours_a_higher_importance_as_a_floor() {
         let dir = temp_dir("reinforce_importance");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
 
         let id = sys.remember_with_importance(FACT, 0.2).unwrap();
         assert!((sys.get_memory(&id).unwrap().unwrap().amplitude - 0.2).abs() < 1e-5);
@@ -4026,6 +4163,8 @@ mod tests {
         assert!(per_parent >= 1);
 
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
         let rows_before = sys.engine.store.count();
 
         let dry = sys.collapse_exact_duplicates(false).unwrap();
@@ -4125,6 +4264,8 @@ mod tests {
         let parent = parents[0];
 
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
         let facets = sys.engine.store.facets_of(&parent);
         assert!(!facets.is_empty(), "fixture precondition: the parent has facets");
 
@@ -4224,6 +4365,8 @@ mod tests {
 
         let dir = temp_dir("reinforce_immunity");
         let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        sys.set_reinforce_on_repeat(true);
         // Exactly what O1 runs, without touching the environment other tests share.
         sys.consolidation.protect_established = true;
 
@@ -4259,6 +4402,8 @@ mod tests {
         // rule rather than being stuck on.
         let free_dir = temp_dir("reinforce_unclamped");
         let mut free = KannakaMemorySystem::init(free_dir.clone()).unwrap();
+        // Ships dark: the write-path gate is off unless asked for.
+        free.set_reinforce_on_repeat(true);
         assert!(
             !free.established_protection_active(),
             "precondition: this environment must have belief phase OFF"
