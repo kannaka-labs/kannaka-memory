@@ -67,6 +67,12 @@ fn default_agent() -> String {
     "local".to_string()
 }
 
+/// A memory that exists has been seen at least once. See
+/// [`HyperMemory::times_seen`] for why the default is 1 and not 0.
+fn default_times_seen() -> u32 {
+    1
+}
+
 // ---------------------------------------------------------------------------
 // HyperMemory
 // ---------------------------------------------------------------------------
@@ -143,6 +149,21 @@ pub struct HyperMemory {
     /// Each retrieval adds energy to the wave function (EXP-003: f(x) term).
     #[serde(default)]
     pub retrieval_count: u32,
+    /// How many times the world has SHOWN this fact — one per `remember` of
+    /// the identical text, not per recall. `retrieval_count` above counts the
+    /// times *we* went looking; this counts the times the fact came to us,
+    /// which is the salience signal a repeated observation actually carries.
+    ///
+    /// A memory stored once and never repeated reads `1`, not `0` — the
+    /// default exists so records serialized before this field came back as a
+    /// truthful count rather than claiming the fact was never seen.
+    ///
+    /// Persisted by `HrmStore` in the `.times_seen.json` sidecar, for the same
+    /// reason `retrieval_count` uses `.reactivation.json`: appending to the
+    /// bincode `WavefrontMeta` layout means extending a positional format and
+    /// its fallback-struct chain, and a sidecar carries zero format risk.
+    #[serde(default = "default_times_seen")]
+    pub times_seen: u32,
     /// Sensory modality of this memory (NCS Phase 1.1)
     #[serde(default)]
     pub modality: Modality,
@@ -192,6 +213,7 @@ impl HyperMemory {
             disputed: false,
             updated_at: None,
             retrieval_count: 0,
+            times_seen: default_times_seen(),
             modality: Modality::default(),
             tier: crate::medium::types::Tier::default(),
             effective_at: None,

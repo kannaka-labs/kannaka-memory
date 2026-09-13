@@ -91,6 +91,146 @@ minus the decoder so tests, and any caller holding frames from elsewhere, can re
 it directly.
 
 
+### Changed — remember: a fact seen again is reinforced, not duplicated
+
+Rogue's grid job re-wrote the same verdicts on every run, and the store did what it
+was told: it inserted them all. One identical sentence existed **five times**, each
+at strength **0.400**, at ages 84.28 / 60.20 / 12.17 / 2.79 / 2.58 hours. If
+repetition deepened a memory there would be one memory with a rising strength.
+Instead there were five weak ones, none of which knew about the others.
+
+The cost lands on recall, which is what makes this a correctness bug and not
+housekeeping. `recall "what happened in colony-one"` at top-10 came back with **ten
+slots holding five distinct facts** — one sentence occupied six of the ten. Every
+duplicate is a fact the agent can no longer see. Duplication made the view
+*shallower*. And because each write loads the whole store, every copy in a 190 MB /
+2,366-memory medium slowed every write that came after it.
+
+**`remember` now strengthens what it already holds.** Before absorbing, the write
+path looks for a memory whose stored content is byte-identical to the new text after
+trimming. If it finds one, that memory's amplitude rises, its repeat count goes up,
+its recency is refreshed, and **its** id comes back. No second row. `remember` still
+returns a `Uuid` for a memory that contains the text, so no caller changed: every
+`remember*` call site either logs the id or uses it to stamp modality and temporal
+bounds on the row it just wrote, and all of that stays correct when the row is one
+that already existed.
+
+**Exact match only.** Fuzzy merging of near-identical memories already exists, and it
+already has the right home: dream consolidation decides that two wavefronts are the
+same thought with the whole field in view and a snapshot behind it. Doing that at
+write time would mean `remember` silently ruling that your new sentence "was" an old
+one on a similarity threshold — lossy, surprising, and unreviewable. Byte-identical
+text is the only repeat the write path can claim with certainty. Trimming surrounding
+whitespace is the single normalisation applied.
+
+**Bounded by construction.** A repeat closes a quarter of the remaining gap to the
+ceiling: `a' = a + 0.25·(CEILING − a)`, so `n` repeats reach
+`CEILING − (CEILING − a₀)·0.75ⁿ`. Every repeat is worth something, the tenth is worth
+about 7.5% of the first, and the ceiling is approached and never crossed — it is the
+same `AMPLITUDE_CEILING` dream consolidation's additive boosts respect, so a fact
+asserted 500 times by a cron job can dominate the field no more than the strongest
+dream-strengthened memory already could. A test walks 500 repeats and asserts the
+step never grows and the ceiling never breaks.
+
+An explicit `--importance` above the memory's current amplitude is honoured as a floor
+before that step, so `kannaka remember "x" --importance 0.95` on something already held
+raises it rather than dropping the number on the floor — the same silent-drop class
+`remember_with_importance` was written to fix. A lower importance never weakens anything.
+
+**Four things a repeat deliberately does not do.** It does not touch a **ShortTerm**
+row's energy, because `compute_decay_set` picks the weakest half of that distribution and
+lifting a row out of it makes ADR-0054's evict path permanently unreachable — for exactly
+the `audio:` perceptions and cron repeats that config exists to clear. Those rows get the
+count. It does not strengthen a **decomposed parent**; the facets gain instead, because
+recall ranks on `similarity × energy` and ADR-0049 names "a parent can't out-rank its own
+facets" as a blocker it defuses. It does not revive a **ghost**: an ADR-0037 ghost is a
+memory the dream chose to let go, so the same text arriving again becomes a new memory and
+the ghost is left to age out. And it does not **replicate** — `times_seen` is not on the
+wire and a local `sync_version` is not comparable across agents, so no counter is bumped
+and no `MemoryStored` event is published for a store that did not happen. Making salience
+swarm-wide means putting the count on the wire with MAX reconciliation, which is an ADR.
+
+**Recency lands on `observed_at`**, not `updated_at`. That is the field that already means
+"when this agent observed the fact", the one in `WavefrontMeta`, and the one
+`temporal_weight` reads. `updated_at` is neither persisted nor consulted by any recall
+path, and `updated_at != created_at` with `retrieval_count == 0` is this codebase's ghost
+stamp — writing it onto healthy rows would file every reinforced memory in
+`.reactivation.json` under a signature meaning "ghosted, keep recoverable".
+
+**The count is the point.** `times_seen` records how many times the world showed you
+the fact, as distinct from `retrieval_count`, which records how many times *you* went
+looking. It is the salience signal this whole change exists to create, so it has to
+outlive the process: it rides a `.times_seen.json` sidecar next to the `.hrm`, with
+the same merge-on-write reconciliation `.reactivation.json` uses, for the same reason
+— appending to the bincode `WavefrontMeta` layout means extending a positional format
+and its fallback-struct chain, and a sidecar carries no format risk. A memory nobody
+ever repeated reads `1`, not `0`.
+
+**`kannaka dedupe` collapses what is already on disk.** The write path only stops new
+duplicates; the sets already written need a deliberate pass. It collapses rather than
+deletes, because the duplicate set is itself evidence — five copies mean the world
+showed you that fact five times, and a cleanup that simply dropped four of them would
+throw away the one useful thing the accident encoded. The keeper inherits the summed
+count, and the energy is advanced along the reinforcement curve once per folded copy,
+starting from the *strongest* member so nothing the store already held is lost.
+
+**The keeper comes from the same function the write path uses.** One rule, called twice:
+highest retention tier, then oldest, then id. When the two paths had separate rules they
+disagreed on a mixed set — dedupe kept one row while the next `remember` strengthened a
+different one, so the duplicates were never actually resolved. Preferring the highest tier
+is also what keeps a **Pinned** duplicate from being the casualty: ADR-0031 says Pinned is
+never evicted and never demoted, and a collapse that deleted the pinned row and left an
+unpinned keeper did both.
+
+**A duplicated decomposed parent folds together with its whole facet constellation.**
+Previously every row in a facet-decomposed store was either a facet or a decomposed
+parent, so the tool cleaned nothing while printing "0 duplicate sets" — which reads as
+"your store is clean" when it means "I cannot see your duplicates". Compound memories are
+precisely what ADR-0049 targets and precisely the shape a verdict line takes. Deleting a
+parent with its own atoms removes a self-contained copy and leaves the keeper's atoms
+intact. Facet rows are never grouped in their own right, and the report says so in those
+words rather than as a count of declined duplicates.
+
+**Ghosts are not in the candidate set at all**, so `max(amplitude)` over a group can never
+resurrect one.
+
+The command is a dry run by default and prints what it would fold. The dry run takes **no
+write lock**, so the safe informational mode stays available while the node is up.
+`--apply` takes the lock and refuses if another writer holds it, refuses outright under
+`KANNAKA_READONLY` (a read-only store drops the write on save, so the run would report
+deletions that never happened), refuses to proceed without a retention-exempt pre-collapse
+snapshot, and exits non-zero if any deletion failed so a script can see a partial run. The
+snapshot is a **bundle**: the `.hrm` plus the sidecars, because the collapse's flush prunes
+folded ids out of `.times_seen.json` and that sidecar's merge only ever raises a count, so
+restoring the medium alone would leave an inflation nothing could later correct. Nothing
+schedules it.
+
+**A repeat cannot buy immunity from pruning.** `stage_prune` skips dampening entirely for an
+*established* memory, and a verdict-typical 0.4 became 0.8 on ONE repeat. That switch is not
+hypothetical: `kannaka-memory.service` on O1 sets `KANNAKA_BELIEF_PHASE=on` and its data dir is
+prime's own store, the node behind the public `ask_kannaka`. So a cron job re-asserting one line
+made that memory immortal on its first run — never dampened, never ghosted, never compacted.
+
+The rule that closes it is the same one the ShortTerm case above follows, now stated once:
+**reinforcement moves a memory within its retention class and never across a retention
+boundary.** Crossing the established line is the dream's decision, earned over nights of
+corroboration, or the operator's through `kannaka boost` or `kannaka pin` — never a side effect
+of the same sentence arriving again. A memory already above the line is unrestricted, because
+it got there the hard way. An explicit `--importance` on a repeat cannot buy it either.
+
+The threshold and the predicate now live in one place each, `ESTABLISHED_AMPLITUDE` and
+`is_established_protected`, because `stage_prune` and the write path both have to agree about
+them and a bare `0.5` in one of them is how they would drift apart.
+
+**Peer re-sends no longer earn reputation.** Both swarm absorb sites now use
+`remember_reporting`: a byte-identical re-send strengthens the memory but commits no
+promotion and increments no absorb counter, because those are "a new contribution landed"
+signals and paying them for repetition is a lever worth closing before it is used.
+
+`KANNAKA_REINFORCE_ON_REPEAT=0` restores insert-every-time for a whole process, and
+`KannakaMemorySystem::remember_forcing_new` is the per-call opt-out for a future caller
+that genuinely needs one row per call. Nothing in the tree needs either today.
+
 ### Fixed — serve: an anonymous ask can no longer choose what it costs (#932)
 
 `swarm serve` answers `KANNAKA.ask.broadcast`, and the anonymous NATS identity may

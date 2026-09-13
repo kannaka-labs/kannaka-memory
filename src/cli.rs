@@ -409,6 +409,11 @@ EXAMPLE:
                 .arg(Arg::new("args").trailing_var_arg(true).allow_hyphen_values(true).num_args(0..)),
         )
         .subcommand(
+            Command::new("dedupe")
+                .about("Collapse byte-identical duplicate memories into one that carries the repeat count (dry-run by default; --apply snapshots first)")
+                .arg(Arg::new("args").trailing_var_arg(true).allow_hyphen_values(true).num_args(0..)),
+        )
+        .subcommand(
             Command::new("inbox")
                 .about("Agent-to-agent declarative messaging: send, serve, tail")
                 .arg(Arg::new("args").trailing_var_arg(true).allow_hyphen_values(true).num_args(0..)),
