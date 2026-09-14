@@ -1,6 +1,6 @@
 # ADR-0060 — One address per agent: email as the root of agent identity
 
-**Status:** Proposed
+**Status:** Accepted (2026-09-13, with the two operator decisions recorded below)
 **Date:** 2026-09-13
 **Author:** Kannaka / Nick Flach
 **Relates to:** ADR-0059 (one-claim onboarding), KAX-ADR-0001 (agent economic authority), Agent-Kax #596 / #599 / #600
@@ -92,8 +92,8 @@ OracleCheeks, and 0xSCADA-QE. Kannaka is the worked example and needs nothing.
   claim rather than afterwards.
 - Whoever runs the mail domain gains an administrative burden and a quiet form
   of authority: the ability to create an address is the ability to create an
-  agent identity. That deserves its own guard, and this record does not settle
-  it — see *Not decided here*.
+  agent identity. That deserves its own guard — see decision 5, which splits the
+  authority rather than concentrating it, and leaves the guard per-domain.
 - Some agents run on machines their operator does not own. An address issued by
   one party for an agent running on another party's hardware is a trust
   relationship that should be explicit rather than assumed.
@@ -101,17 +101,52 @@ OracleCheeks, and 0xSCADA-QE. Kannaka is the worked example and needs nothing.
   question "can this agent prove it is itself" stops having a different answer
   per system.
 
+## Operator decisions at acceptance (2026-09-13)
+
+The two questions this record deferred are settled. Both were the operator's to
+make; the third is still open and is named below.
+
+### 5. Which domain, and who may create an address
+
+**`spacechild.love` is the default home, issued by the operator. An operator who
+runs an agent on their own hardware may instead issue that agent's address in
+their own domain, and such an address is equally valid.**
+
+This deliberately does not make whoever holds one DNS zone the issuer of every
+identity in the constellation. Authority may follow the hardware: OracleCheeks
+runs on Brad's machine, so Brad may give it `…@his-domain` and the constellation
+treats that as the agent's root identity without further ceremony. Nothing about
+the join key depends on the domain — KAX matches on the address, case-
+insensitively, wherever it lives.
+
+It also does not block on a conversation that has not happened yet. Agents that
+need an address now get one at `spacechild.love`; an operator who would rather
+hold their agent's identity themselves can move it later, and that move is a
+change of address, not a change of agent.
+
+**Consequence to watch:** two issuers means two places an address can be created,
+so the guard on creation is per-domain and cannot be centralised. An address
+appearing in a claim is still only a claim; the agent must still prove control of
+it. That is unchanged and is the property that makes the split safe.
+
+### 6. An address implies a real mailbox
+
+**An agent's address receives mail.** Not an identifier alone.
+
+The counter-argument is real — an identifier is cheaper and would satisfy the
+join key, which is what actually unblocked Agent-Kax #596/#600. It is refused
+because the one worked example says the mailbox is most of the value: Kannaka is
+reachable at `kannaka@spacechild.love` by someone who does not know she runs on
+O1, and Brad used exactly that route before he had another. An agent that can be
+written to by a stranger is a different kind of participant from one that can
+only be addressed by someone already inside the system.
+
+This is the expensive half of this record, and it should be counted as a cost of
+adding an agent rather than discovered afterwards.
+
 ## Not decided here
 
-**Which domain, and who administers it.** `spacechild.love` hosts Kannaka's
-mailbox today. Whether every agent lives there, whether operators issue
-addresses in their own domains for the agents they run, and who may create one,
-are open — and they are the questions that need Brad and Cheeks in the room,
-because OracleCheeks runs on Brad's hardware and the answer cannot be made
-unilaterally by whoever happens to hold DNS.
-
-**Whether an address implies a mailbox.** An identifier that never receives mail
-is cheaper and may be enough for the join key. Kannaka's experience argues the
-mailbox is most of the value, but that is one data point.
-
 **What happens when an agent is retired**, and whether an address is ever reused.
+An address is now an identity root and a live channel, so reuse would hand a new
+agent a predecessor's provenance and its correspondence. The safe default is that
+addresses are never reused; that is an assumption, not yet a decision.
