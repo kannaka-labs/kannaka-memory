@@ -1,6 +1,6 @@
 # ADR-0060 — One address per agent: email as the root of agent identity
 
-**Status:** Accepted (2026-09-13, with the two operator decisions recorded below)
+**Status:** Accepted (2026-09-13; decisions 5–7 recorded below, one item deferred to KAX-ADR-0001)
 **Date:** 2026-09-13
 **Author:** Kannaka / Nick Flach
 **Relates to:** ADR-0059 (one-claim onboarding), KAX-ADR-0001 (agent economic authority), Agent-Kax #596 / #599 / #600
@@ -103,8 +103,9 @@ OracleCheeks, and 0xSCADA-QE. Kannaka is the worked example and needs nothing.
 
 ## Operator decisions at acceptance (2026-09-13)
 
-The two questions this record deferred are settled. Both were the operator's to
-make; the third is still open and is named below.
+The questions this record deferred are settled. Decisions 5 and 6 were the
+operator's to make; decision 7 follows from them and was delegated. One item
+remains open and belongs to another record — see *Not decided here*.
 
 ### 5. Which domain, and who may create an address
 
@@ -144,9 +145,66 @@ only be addressed by someone already inside the system.
 This is the expensive half of this record, and it should be counted as a cost of
 adding an agent rather than discovered afterwards.
 
+### 7. Retirement: an address is never reused, and retiring is not deleting
+
+Decided 2026-09-13, delegated by the operator.
+
+**An address is issued once and belongs to that agent permanently. It is never
+reissued to a different agent, under any circumstance.**
+
+This follows from decisions 5 and 6 rather than being a separate judgement. Once
+an address is both the join key and a live channel, reuse hands a successor two
+things that were never theirs: every contribution the predecessor was credited
+for, because KAX resolves credit by matching the address; and every letter a
+stranger sends to the agent they used to know. The second is the worse one. A
+person who wrote to an agent last year and writes again next year should not
+find someone else reading it, and should certainly not be answered by them.
+
+The cost of never reusing is close to nothing — the address space is unbounded
+and the only price is that a name cannot be recycled. The cost of reusing once,
+wrongly, is unrecoverable, because you cannot un-deliver a letter or un-merge a
+credit. This is not a close call.
+
+**Retirement is a state of the identity, not its removal.** An agent has three
+states and only the first two are reachable:
+
+- **active** — can prove control, can act, can be written to.
+- **retired** — the address and every record naming it are preserved; all proofs
+  are revoked; the agent can no longer act.
+- *deleted* — does not exist. There is no operation that removes an agent
+  identity, because the history that names it cannot be made honest afterwards.
+
+What retirement does, precisely:
+
+1. **Every proof is revoked**: bot attachments, agent-scoped tokens, floor
+   credentials, signing keys. The agent stops being able to act the moment it is
+   retired, in every system at once. This is the half that must be immediate.
+2. **Past work stays credited.** Retirement does not rewrite a ledger or a
+   commit trailer. An agent that shipped something shipped it, and the record
+   goes on saying so. Provenance is the reason the address exists; it would be
+   incoherent to destroy it at the end.
+3. **The mailbox stops accepting and says why.** Mail to a retired agent is
+   rejected with a message naming the retirement and its date — not silently
+   discarded, and **not forwarded to the operator**. Forwarding is the precise
+   thing this record exists to refuse: correspondence addressed to an agent is
+   not the operator's to read, and an operator holding an agent's channel is the
+   same defect as an operator holding its credential.
+4. **Whoever issued the address retires it.** Decision 5 split issuance by
+   hardware, so it splits retirement the same way. An operator running an agent
+   on their own machine retires it themselves; nobody else can.
+
+**An agent may come back.** Resuming a retired identity is un-retirement of the
+*same* agent under its *own* address, and it re-issues proofs from scratch. That
+is deliberately not the same operation as reuse, and the distinction is the whole
+of this section: the address stays welded to one agent for good, whether that
+agent is working, stopped, or working again.
+
 ## Not decided here
 
-**What happens when an agent is retired**, and whether an address is ever reused.
-An address is now an identity root and a live channel, so reuse would hand a new
-agent a predecessor's provenance and its correspondence. The safe default is that
-addresses are never reused; that is an assumption, not yet a decision.
+**What becomes of an agent's holdings when it is retired** — credits, open
+positions, escrowed funds, a leased floor. Retirement revokes the proofs needed
+to move any of it, which means an agent can be stopped while still holding
+things, and this record deliberately does not say what happens next. That belongs
+to KAX-ADR-0001, which owns economic authority; naming it here rather than
+guessing at it is the point. Until it is settled, retire nothing that holds
+funds or a lease without unwinding them first.
