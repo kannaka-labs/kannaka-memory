@@ -339,6 +339,41 @@ pub fn make_pipeline() -> EncodingPipeline {
     EncodingPipeline::new(Box::new(cached), codebook)
 }
 
+/// A pipeline with **no hash fallback**, for bulk re-encoding.
+///
+/// [`make_pipeline`] composes `OllamaEncoder` over `SimpleHashEncoder`, so a
+/// failed embed does not fail — it silently returns a pseudo-embedding. That is
+/// tolerable for a single absorb; it is *corrupting* for a bulk re-encode, where
+/// an embedder that dies partway through would leave some vectors semantic and
+/// the rest hashed, in one store, under one `.encoder` stamp that cannot express
+/// the difference.
+///
+/// `re_encode_all` already propagates an encode error with `?`, and the caller
+/// only writes to disk after it returns `Ok` — so all-or-nothing is already the
+/// contract. This constructor is what lets that contract actually fire: with no
+/// fallback, an embedder outage becomes an error instead of a quiet hash.
+///
+/// `dim` must equal the codebook input dim; `EncodingPipeline::new` asserts it,
+/// and an assert inside a one-shot tool that is halfway through a corpus is a
+/// poor way to find out, so it is checked and returned here instead.
+pub fn make_strict_pipeline(
+    base_url: String,
+    model: String,
+    dim: usize,
+) -> Result<EncodingPipeline, String> {
+    if dim != CODEBOOK_INPUT_DIM {
+        return Err(format!(
+            "encoder dim {dim} does not match codebook input dim {CODEBOOK_INPUT_DIM}; \
+             a different embedding width needs a codebook change and a full re-encode of \
+             every store that shares it (all-minilm is 384 and is the drop-in)"
+        ));
+    }
+    let ollama = OllamaEncoder::new(base_url, model, dim);
+    let cached = CachedEncoder::new(ollama);
+    let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
+    Ok(EncodingPipeline::new(Box::new(cached), codebook))
+}
+
 pub struct KannakaMemorySystem {
     pub engine: ResonanceEngine,
     #[allow(dead_code)]
@@ -4534,5 +4569,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-}
 
+    /// The property that prevents a half-hashed corpus: with no fallback, an
+    /// unreachable embedder is an ERROR, not a quiet pseudo-embedding. If this
+    /// ever returns Ok, `recompute_encoding` can silently write hash vectors
+    /// over part of a store and nothing downstream can tell.
+    #[test]
+    fn strict_pipeline_errors_when_the_embedder_is_unreachable() {
+        // Port 1 is reserved and nothing listens on it.
+        let pipeline = make_strict_pipeline(
+            "http://127.0.0.1:1".to_string(),
+            "all-minilm".to_string(),
+            384,
+        )
+        .expect("384 matches the codebook input dim");
+
+        let out = pipeline.encode_text("a memory about resonance and standing waves");
+        assert!(
+            out.is_err(),
+            "a dead embedder must fail the encode; returning Ok here means the              re-encode path can hash-rewrite a corpus while reporting success"
+        );
+    }
+
+    /// `EncodingPipeline::new` asserts on a dim mismatch. A panic from inside a
+    /// one-shot tool partway through a corpus is a bad way to learn this, so the
+    /// strict constructor reports it instead.
+    #[test]
+    fn strict_pipeline_rejects_a_dim_the_codebook_cannot_take() {
+        // `EncodingPipeline` is not Debug, so unwrap_err/expect_err cannot format
+        // the Ok side; match rather than derive Debug just for a test.
+        let err = match make_strict_pipeline(
+            "http://127.0.0.1:1".to_string(),
+            "mxbai-embed-large".to_string(),
+            1024,
+        ) {
+            Ok(_) => panic!("1024 must not be accepted against a 384 codebook input dim"),
+            Err(e) => e,
+        };
+        assert!(err.contains("1024") && err.contains("384"), "error names both dims: {err}");
+    }
+}
