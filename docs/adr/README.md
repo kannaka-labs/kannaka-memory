@@ -87,3 +87,4 @@ unused.
 | [0057](ADR-0057-kannaka-llm-open-weight-brain.md) | Kannaka LLM — an open-weight brain, the HRM as its memory, qBraid as its compute | Accepted (P0–P2 shipped; open release decided) | 2026-09-05 |
 | [0058](ADR-0058-rogue-agent.md) | Rogue Agent — an autonomous OpenBotCity agent on debain2 that improves itself weekly | Proposed | 2026-09-05 |
 | [0059](ADR-0059-one-claim-onboarding-and-brain-routing.md) | One claim, one identity — onboarding a node in three commands, providers with kannaka-brain as the base, routing by kind of ask, and what the microVMs are for | Proposed | 2026-09-11 |
+| [0061](ADR-0061-declared-faculties.md) | Declared faculties — agents are a cast, not a fleet: named capabilities, operator-declared and defaulting off, so the roster can say what each agent alone can do | Proposed | 2026-09-14 |
