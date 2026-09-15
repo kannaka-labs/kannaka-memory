@@ -172,37 +172,55 @@ faculty be *attested* by the agent's own store — "`hears` is backed by N audio
 memories spanning M days" — so that wiping the store implicitly wipes the
 faculty, and longevity is rewarded.
 
-It does not survive. A four-lens adversarial review raised 38 findings, of which
-33 survived an adversarial verification pass, and **every blocker landed on this
-extension rather than on the declared half**. Recorded here so it is not
-re-proposed from intuition:
+It does not survive **on the wire**, for one reason: it cannot say whose history
+it is reporting. A four-lens adversarial review raised 38 findings, 33 survived
+an adversarial verification pass, and every blocker landed on this extension
+rather than on the declared half.
+
+**What is fatal is provenance, not the idea.**
 
 - **The evidence does not distinguish the faculty from talk about it.** "N audio
   memories" is a keyword classification over *text*, so `kannaka-prime` already
   attests `hears` without ever having heard anything.
-- **On a replica it launders another agent's corpus into the reader's name, with
-  numbers attached.** Today's roster showing prime's `memory_count` under
+- **On a replica it launders another agent's history into the reader's name,
+  with numbers attached.** Today's roster showing prime's `memory_count` under
   GossipGhost's name is a visible wrong number an operator can suspect.
-  Attestation promotes it to a credential that carries corroboration.
-- **The central claim is false for a node live in the swarm today.** That replica
-  is re-synced every :12/:42 and its divergence is discarded, so the faculty is
-  continuously re-attested from someone else's data and *can never decay*.
-  "Wiping the store wipes the faculty" cannot hold where the operator cannot
-  wipe the store.
-- **It is deleted hourly on the only node it would be true for.** The witness
-  caps `audio:` at 200 with a TTL, because that prune is what keeps it healthy.
-  The retention policy destroys the evidence.
-- **The longevity incentive points against the system's own health.** Φ on the
-  witness rose from 0.26 to 0.50 *by deleting 97% of the store*. Rewarding
-  accumulation fights the forgetting the substrate depends on.
-- Snapshots, `.bak` files and `export`/`import` make the implicit revocation a
-  30-second undo, and `import-json` sets both modality and `created_at` from an
-  operator-chosen file, so the span is fabricable outright.
+  Attestation promotes it to a credential carrying corroboration — and the
+  replica is re-synced every :12/:42 with its divergence discarded, so it is
+  continuously re-attested from someone else's data and can never decay.
+- **It is fabricable outright.** `import-json` sets both modality and
+  `created_at` from an operator-chosen file, and snapshots, `.bak` files and
+  `export`/`import` make any implicit revocation a thirty-second undo.
 
-**What is kept from the idea.** Reading one's own store history is a good thing
-to show *an operator who is deciding what to declare* — `kannaka init` and
-`config set` may print "this store holds 41 days of hearing" locally. It stays
-off the wire. Declaration is the switch; nothing is dressed as proof.
+None of those are fixed by choosing a better number. They are fixed, if ever, by
+an agent being able to prove which store is its own — which is ADR-0060's
+territory, not this one's.
+
+**What was a measurement error and not a design error.** The first draft of this
+rejection also said the longevity incentive points against the substrate's own
+health, citing Φ on the witness rising from 0.26 to 0.50 *by deleting 97% of the
+store*. That was the wrong conclusion drawn from a real observation. The fault is
+in the metric, not the goal: **count-and-span measures hoarding**, and the witness
+caps `audio:` at 200 with a TTL precisely because that prune is what keeps it
+well. A store that has forgotten well for forty-one days is more alive than one
+that has accumulated for one.
+
+The review named the better shape itself — *a monotone, prune-immune counter the
+dream does not touch*: "78,412 audio ingests since 2026-05-02, 41 currently
+live." That measures **continuity rather than volume**, is indifferent to
+pruning, and if stamped at the ingest path rather than derived from stored rows
+it also answers the first bullet above. The paradox that forgetting improves
+health is not a problem to design around; it is how a living store behaves, and
+a longevity measure should be indifferent to it.
+
+So this stays an open idea, not a closed one. When per-agent identity can answer
+*whose store this is*, an ingest-path lifetime tally is worth revisiting. It is
+the provenance that is missing today, not the merit.
+
+**What is kept right now.** Reading one's own store history is worth showing *an
+operator who is deciding what to declare* — `kannaka init` and `config set` may
+print "this store holds 41 days of hearing" locally. It stays off the wire.
+Declaration is the switch; nothing is dressed as proof.
 
 ## Alternatives considered
 
