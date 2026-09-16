@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [0.16.6] — 2026-09-16
+
+### Changed — recall ranks by similarity alone, and energy is capped at every write (#965, #966)
+
+Recall ranked by `similarity * energy^exp` with `exp` defaulting to 1.0. Measured
+on the live O1 store against its own vectors and probes: production r@10 0.514,
+plain cosine over the same vectors 0.960. In 80% of the misses the correct memory
+had the higher cosine and lost on energy alone (the winner carried 3.7x the
+target's). With the exponent at 0 the medium recalls at parity with cosine
+(~0.97 by content). Everything else in the path measured clean: the codebook is
+lossless for d_eff (x0.99), stored rows match their encodings at corr 0.994, and
+facet resolution returns children under their parent by design.
+
+`KANNAKA_RECALL_ENERGY_EXP` now defaults to **0.0** (ADR-0048's energy-neutral
+ranking; `1.0` reproduces the old order). `ENERGY_CAP` (2.0) is applied at every
+energy write — every boost path already clamped, but the four sites that copied
+a memory's caller-supplied amplitude into energy on insert and on load did not,
+so a memory remembered at amplitude 8.5 entered at energy 8.5 above a ceiling
+nothing could lower it to, and sat in a third of all top-10 lists whatever the
+query. Persisted over-cap energies are clamped on load: the live 7.74 / 8.51
+records come down to 2.0 on the first restart of this version.
+
+### Added — the re-encode tool builds a pipeline that can fail, and can reach a remote embedder (#961)
+
+`recompute_encoding` used `make_pipeline`'s composite encoder, whose hash
+fallback silently swallows an embedder outage — a bulk re-encode interrupted
+mid-run would have left one store part semantic and part hashed under one
+`.encoder` stamp. It now builds `make_strict_pipeline` (no fallback: an outage
+is an error, `re_encode_all` propagates it, nothing is written) and takes
+`KANNAKA_ENCODER_URL` / `_MODEL` / `_DIM`, probing the endpoint it will actually
+use rather than a hardcoded localhost.
+
+### Docs — ADR-0062: the mail membrane (#964)
+
 ## [0.16.5] — 2026-09-13
 
 ### Fixed — retention: "established" now means established, not merely recent (#950)
