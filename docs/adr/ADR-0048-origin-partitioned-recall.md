@@ -109,6 +109,29 @@ array left **byte-identical** (ranking-only change; no write-back).
 4. **Energy-neutral ranking** (ranking-only, flagged).
 5. **Compose upward toward G2** — awareness (intent + situate), then ADR-0047.
 
+## Decision record — 2026-09-16: energy-neutral ranking is now the default
+
+`KANNAKA_RECALL_ENERGY_EXP` shipped off-by-default (1.0 = the historical
+`similarity * energy`). On 2026-09-16 the default flipped to **0.0**, and the
+`amplitude → energy` copy on insert and on load gained the same `ENERGY_CAP`
+every boost path already had. Evidence (kannaka-memory#965), measured on the
+live O1 store against its own vectors and probes:
+
+| fragments, same store, same probes | r@10 by id | by content |
+|---|---|---|
+| plain cosine over the store's vectors | 0.960 | — |
+| the medium, energy exponent 0 | ~0.77 | **≈0.97** |
+| the medium, exponent 1.0 (was the default) | 0.514 | 0.717 |
+
+In 80% of the misses the correct memory had the *higher* cosine and lost on
+energy; the winner carried 3.7× the target's. The cap was real but applied
+only to boosts — the write path copied caller-supplied amplitude in unbounded,
+so records entered at 7.7 and 8.5 and sat in a third of all top-10 lists
+whatever was asked. The rest of the medium was measured clean along the way:
+the codebook projection is lossless for `d_eff` (×0.99), the stored rows match
+their encodings at corr 0.994, and facet resolution returns children under
+their parent by design. `1.0` remains available to reproduce the old ranking.
+
 ## Alternatives considered (and discarded by the review)
 
 - **Post-fetch provenance weight** / **situated longer query** — refuted (inert /

@@ -1170,7 +1170,7 @@ impl Medium {
 
         // 1. Boost energy of the observed wavefront
         let energy_boost = intensity * 0.1; // Scale factor
-        self.store.energy[idx] = (self.store.energy[idx] + energy_boost).min(2.0); // Cap at 2.0 to prevent runaway
+        self.store.energy[idx] = (self.store.energy[idx] + energy_boost).min(ENERGY_CAP); // cap to prevent runaway
 
         // 2. Determine modality weight based on content
         let observed_meta = &self.store.metadata[idx];

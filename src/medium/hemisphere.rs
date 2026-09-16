@@ -14,19 +14,26 @@ use crate::xi_operator::{compute_xi_signature, xi_diversity_boost};
 use super::types::*;
 use super::types::DreamReport;
 
-/// Recall energy exponent (`KANNAKA_RECALL_ENERGY_EXP`, **default 1.0 =
-/// historical `similarity * energy` ranking, byte-identical**). ADR-0046
-/// energy-neutral ranking: recall ranks by `similarity * energy^exp`, so
-/// `0.0` = pure similarity (fully neutralizes the rich-get-richer
-/// recall-frequency bias) and `0.5` = `similarity * sqrt(energy)` (softens
-/// it). Ranking-only — the energy array is never written by recall scoring.
+/// Recall energy exponent (`KANNAKA_RECALL_ENERGY_EXP`, **default 0.0 =
+/// pure similarity**). ADR-0048 energy-neutral ranking: recall ranks by
+/// `similarity * energy^exp`, so `0.0` neutralizes the rich-get-richer
+/// recall-frequency bias entirely, `0.5` = `similarity * sqrt(energy)`
+/// softens it, and `1.0` is the historical `similarity * energy`.
+///
+/// The default flipped from 1.0 to 0.0 on 2026-09-16 (kannaka-memory#965).
+/// Measured on the live O1 store, same probes, same vectors: production
+/// r@10 0.514 against 0.960 for plain cosine, and in 80% of the misses the
+/// correct memory had the *higher* cosine and lost on energy alone (winner
+/// 3.7x the target's). With this exponent at 0 the medium recalls at parity
+/// with cosine (~0.97 by content). Ranking-only — the energy array is never
+/// written by recall scoring; set `1.0` to reproduce the old ranking.
 pub fn recall_energy_exp() -> f32 {
     std::env::var("KANNAKA_RECALL_ENERGY_EXP")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|e: &f32| e.is_finite())
         .map(|e: f32| e.clamp(0.0, 1.0))
-        .unwrap_or(1.0)
+        .unwrap_or(0.0)
 }
 
 /// Recall temporal exponent (`KANNAKA_RECALL_TEMPORAL_EXP`, **default 0.0 =
@@ -340,9 +347,9 @@ impl Hemisphere {
         )
     }
 
-    /// `resonate` with an explicit energy exponent (ADR-0046 energy-neutral
+    /// `resonate` with an explicit energy exponent (ADR-0048 energy-neutral
     /// ranking). `resonance = similarity * energy^exp`. `exp = 1.0` is the
-    /// historical `similarity * energy` (byte-identical fast path); `exp = 0.0`
+    /// pre-#965 `similarity * energy` (byte-identical fast path); `exp = 0.0`
     /// ranks by pure similarity, neutralizing the rich-get-richer
     /// recall-frequency bias that buries never-surfaced memories (a
     /// frequently-recalled memory's energy climbs toward the 2.0 cap while a
@@ -795,7 +802,7 @@ impl Hemisphere {
 
             if alignment > 0.1 && dominant_eigenvalue > 0.1 {
                 let boost = consolidation_strength * alignment;
-                self.energy[i] = (self.energy[i] + boost).min(2.0);
+                self.energy[i] = (self.energy[i] + boost).min(ENERGY_CAP);
 
                 if eigenstructure.dominant_cluster.contains(&i) && eigenstructure.dominant_cluster.len() > 1 {
                     let mut cluster_phase = 0.0f32;
@@ -1012,20 +1019,26 @@ mod tests {
         let favorite_id = h.add_wavefront(&favorite, "recalled favorite".into(), 2.0).unwrap();
 
         // Historical ranking (exp=1.0): energy wins — favorite outranks target.
-        let default_rank = h.resonate_with_energy_exp(&target, 2, 1.0);
-        assert_eq!(default_rank[0].id, favorite_id,
+        // Still reachable by explicit exponent; no longer the default.
+        let historical = h.resonate_with_energy_exp(&target, 2, 1.0);
+        assert_eq!(historical[0].id, favorite_id,
             "with similarity*energy the high-energy favorite should win (bias under test)");
-
-        // resonate() with no env override must match exp=1.0 exactly.
-        let via_env_default = h.resonate(&target, 2);
-        let ids_a: Vec<_> = default_rank.iter().map(|r| r.id).collect();
-        let ids_b: Vec<_> = via_env_default.iter().map(|r| r.id).collect();
-        assert_eq!(ids_a, ids_b, "default resonate() must equal explicit exp=1.0");
 
         // Energy-neutral (exp=0.0): pure similarity — the cold target surfaces.
         let neutral = h.resonate_with_energy_exp(&target, 2, 0.0);
         assert_eq!(neutral[0].id, target_id,
             "with pure-similarity ranking the cold exact-match target must win");
+
+        // #965: resonate() with no env override is the NEUTRAL ranking now.
+        // This is the contract that changed — the default must surface the
+        // cold exact match, not the recalled favorite.
+        std::env::remove_var("KANNAKA_RECALL_ENERGY_EXP");
+        let via_env_default = h.resonate(&target, 2);
+        let ids_a: Vec<_> = neutral.iter().map(|r| r.id).collect();
+        let ids_b: Vec<_> = via_env_default.iter().map(|r| r.id).collect();
+        assert_eq!(ids_a, ids_b, "default resonate() must equal explicit exp=0.0 (#965)");
+        assert_eq!(via_env_default[0].id, target_id,
+            "by default the cold exact-match target must outrank the high-energy favorite");
     }
 
     /// L8 temporal ranking: a SUPERSEDED fact (past its `expires_at`) must not

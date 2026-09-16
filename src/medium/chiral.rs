@@ -284,7 +284,7 @@ impl ChiralMedium {
                 new_freq.slice_mut(ndarray::s![..n]).assign(&right.frequency);
                 new_phase.slice_mut(ndarray::s![..n]).assign(&right.phase);
             }
-            new_energy[index] = energy;
+            new_energy[index] = energy.min(ENERGY_CAP);
             new_freq[index] = medium.store.frequency[i];
             new_phase[index] = medium.store.phase[i];
 
@@ -1054,7 +1054,7 @@ impl ChiralMedium {
             // 1.0 at the attractor phase, 0.5 a quarter turn, 0.0 anti-phase.
             let align = 1.0 - dphi / std::f32::consts::PI;
             let g = (1.0 + gain * (align - 0.5)).max(0.0);
-            self.right.energy[idx] = (self.right.energy[idx] * g).clamp(0.0, 2.0);
+            self.right.energy[idx] = (self.right.energy[idx] * g).clamp(0.0, ENERGY_CAP);
             touched += 1;
         }
         touched

@@ -14,7 +14,7 @@ use crate::store::{MediumBackend, StoreError};
 use crate::encoding::EncodingPipeline;
 use crate::medium::{Medium, Resonance};
 use crate::medium::types::{Tier, ConsolidateOpts, ConsolidateMode, ConsolidateReport};
-use crate::medium::types::{DEFAULT_BELIEF_ABSORB_FRAC};
+use crate::medium::types::{DEFAULT_BELIEF_ABSORB_FRAC, ENERGY_CAP};
 use crate::medium::chiral::{ChiralMedium, ChiralConsciousness};
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -739,6 +739,17 @@ impl HrmStore {
     /// The `MediumBackend` trait returns `&mut HyperMemory`, so callers can mutate
     /// wave parameters (amplitude, phase, frequency) on the cached copy. This
     /// method writes those changes back to the authoritative tensor storage.
+    /// The ranking energy the medium currently holds for `id`, whichever
+    /// hemisphere it lives in. Read-only; used by tests that assert the
+    /// ENERGY_CAP invariant across insert and load (#965).
+    pub(crate) fn energy_of(&self, id: &Uuid) -> Option<f32> {
+        if let Some(ref chiral) = self.chiral {
+            chiral.right.id_to_index.get(id).map(|&i| chiral.right.energy[i])
+        } else {
+            self.medium.get_wavefront_index(id).map(|i| self.medium.store.energy[i])
+        }
+    }
+
     fn sync_cache_to_medium(&mut self) {
         // #496: in chiral mode the RIGHT hemisphere is authoritative — it is what
         // `save_medium` persists and what `rebuild_cache` reloads. The particle
@@ -761,13 +772,13 @@ impl HrmStore {
         if let Some(ref mut chiral) = self.chiral {
             for (id, mem) in &self.memory_cache {
                 if let Some(&index) = chiral.right.id_to_index.get(id) {
-                    chiral.right.energy[index] = mem.amplitude;
+                    chiral.right.energy[index] = mem.amplitude.min(ENERGY_CAP);
                 }
             }
         } else {
             for (id, mem) in &self.memory_cache {
                 if let Some(index) = self.medium.get_wavefront_index(id) {
-                    self.medium.store.energy[index] = mem.amplitude;
+                    self.medium.store.energy[index] = mem.amplitude.min(ENERGY_CAP);
                     self.medium.store.frequency[index] = mem.frequency;
                     self.medium.store.phase[index] = mem.phase;
                 }
@@ -1747,11 +1758,11 @@ impl HrmStore {
         for (id, energy, tier) in &carriers {
             if let Some(ref mut chiral) = self.chiral {
                 if let Some(&idx) = chiral.right.id_to_index.get(id) {
-                    chiral.right.energy[idx] = *energy;
+                    chiral.right.energy[idx] = energy.min(ENERGY_CAP);
                     chiral.right.metadata[idx].tier = *tier;
                 }
             } else if let Some(&idx) = self.medium.store.id_to_index.get(id) {
-                self.medium.store.energy[idx] = *energy;
+                self.medium.store.energy[idx] = energy.min(ENERGY_CAP);
                 self.medium.store.metadata[idx].tier = *tier;
             }
         }
@@ -2435,7 +2446,11 @@ impl MediumBackend for HrmStore {
                 .update_right_id(&minted, id)
                 .map_err(|e| StoreError::Other(format!("chiral id rewrite failed: {e}")))?;
             if let Some(&index) = chiral.right.id_to_index.get(&id) {
-                chiral.right.energy[index] = memory.amplitude;
+                // #965: amplitude is caller-supplied and unbounded; energy is
+                // ranking weight and every boost path caps it at ENERGY_CAP.
+                // Copying amplitude in uncapped let a memory remembered at 8.5
+                // sit above the cap forever and win a third of all recalls.
+                chiral.right.energy[index] = memory.amplitude.min(ENERGY_CAP);
                 chiral.right.frequency[index] = memory.frequency;
                 chiral.right.phase[index] = memory.phase;
                 chiral.right.timestamps[index] = memory.created_at.timestamp_millis();
@@ -2459,7 +2474,7 @@ impl MediumBackend for HrmStore {
                 .map_err(|e| StoreError::Other(format!("Failed to update wavefront ID: {e}")))?;
 
             if let Some(index) = self.medium.get_wavefront_index(&id) {
-                self.medium.store.energy[index] = memory.amplitude;
+                self.medium.store.energy[index] = memory.amplitude.min(ENERGY_CAP);
                 self.medium.store.frequency[index] = memory.frequency;
                 self.medium.store.phase[index] = memory.phase;
                 self.medium.store.timestamps[index] = memory.created_at.timestamp_millis();
@@ -3114,6 +3129,48 @@ mod tests {
             "#630: inserted memory must survive save+reload on a chiral store"
         );
         assert_eq!(got.unwrap().content, CONTENT);
+    }
+
+    /// #965: energy is ranking weight and is capped at ENERGY_CAP on every boost
+    /// path; the amplitude -> energy copy on insert and on load must respect the
+    /// same cap, or an over-amplitude memory enters above a ceiling nothing can
+    /// lower it to and wins recalls on weight alone. Covers the chiral and flat
+    /// insert sites and both load sites (via flush + reload).
+    #[test]
+    fn energy_is_capped_at_write_and_on_load() {
+        for chiral in [true, false] {
+            let temp_file = NamedTempFile::new().unwrap();
+            let path = temp_file.path().to_path_buf();
+            let hot_id = {
+                let mut store = HrmStore::new(make_test_pipeline(), path.clone());
+                if chiral { store.upgrade_to_chiral(); }
+                let mut hot = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "remembered at amplitude 8.5".to_string());
+                hot.amplitude = 8.5;
+                let id = store.insert(hot).unwrap();
+                let e = store.energy_of(&id).expect("inserted memory has an energy");
+                assert!(e <= ENERGY_CAP, "chiral={chiral}: insert wrote energy {e} above the cap {ENERGY_CAP}");
+
+                // Make the LOAD half non-vacuous. Insert already clamped the
+                // hemisphere energy, so a plain reload would pass even if the
+                // load path clamped nothing. Persist an OVER-cap energy directly
+                // — exactly the state the live store is in for records written
+                // before #965 — and require load to bring it down.
+                if let Some(ref mut c) = store.chiral {
+                    let i = c.right.id_to_index[&id];
+                    c.right.energy[i] = 8.5;
+                } else {
+                    let i = store.medium.get_wavefront_index(&id).unwrap();
+                    store.medium.store.energy[i] = 8.5;
+                }
+                store.mark_dirty();
+                store.flush().unwrap();
+                id
+            };
+            let store = HrmStore::load(make_test_pipeline(), path).unwrap();
+            let e = store.energy_of(&hot_id).expect("memory survives reload");
+            assert!(e <= ENERGY_CAP,
+                "chiral={chiral}: a persisted over-cap energy ({e}) survived load — the load-path clamp is not on the load path");
+        }
     }
 
     #[test]

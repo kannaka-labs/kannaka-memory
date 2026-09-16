@@ -136,6 +136,15 @@ pub enum ConsolidateMode {
 /// ~295→236 by this backstop alone.
 pub const DEFAULT_BELIEF_ABSORB_FRAC: f32 = 0.20;
 
+/// Ceiling on a wavefront's ranking energy. Every *boost* path already clamped
+/// to this value (observation, consolidation, dream reinforcement); the four
+/// places that copy a memory's caller-supplied `amplitude` into `energy` on
+/// insert and on load did not, so a memory remembered at amplitude 8.5 entered
+/// at energy 8.5 — above a cap nothing could ever lower it to — and, ranking
+/// being `similarity * energy`, sat in a third of all top-10 lists whatever
+/// the query (kannaka-memory#965). One constant, applied at every write.
+pub const ENERGY_CAP: f32 = 2.0;
+
 /// ADR-0036 belief-safe merge: cosine floor (on mean-CENTERED embeddings) for the
 /// semantic-redundancy gate while belief is active. Higher than the raw
 /// `merge_sim` because centering removes the shared anisotropic component that

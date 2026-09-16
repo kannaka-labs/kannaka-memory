@@ -622,7 +622,7 @@ impl Medium {
             // In high-D space, even 0.1 alignment is significant
             if alignment > 0.1 && dominant_eigenvalue > 0.1 {
                 let boost = consolidation_strength * alignment;
-                self.store.energy[i] = (self.store.energy[i] + boost).min(2.0);
+                self.store.energy[i] = (self.store.energy[i] + boost).min(ENERGY_CAP);
                 
                 // Phase alignment within cluster
                 if eigenstructure.dominant_cluster.contains(&i) && eigenstructure.dominant_cluster.len() > 1 {
