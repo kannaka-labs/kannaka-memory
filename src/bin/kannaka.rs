@@ -5552,6 +5552,37 @@ fn main() {
                         }
                     };
 
+                    // Presence, not only phase. The witness loop
+                    // (ops/witness) joins ONCE at startup and then ticks
+                    // `swarm sync` every 5 min, and its comment believed sync
+                    // refreshed presence — it only ever published
+                    // QUEEN.phase, so the KANNAKA_PRESENCE row went stale as
+                    // soon as the join's one record aged out, and the roster
+                    // showed the witness dead while it was hearing every
+                    // tick. Publish the heartbeat FIRST: it writes its own
+                    // uncoupled phase, and the coupled phase from the sync
+                    // step below must be the one that lands last on the KV.
+                    // `joined_at` is the true session start only when the
+                    // caller exports KANNAKA_SESSION_JOINED_AT once (the loop
+                    // does); a one-shot process has no other way to know it
+                    // (#587). A value that does not parse is treated as
+                    // unset rather than published as a timestamp.
+                    let session_joined_at = std::env::var("KANNAKA_SESSION_JOINED_AT")
+                        .ok()
+                        .filter(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).is_ok())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                    let identity = kannaka_memory::nats::AnnounceIdentity::from_store();
+                    swarm_publish_heartbeat(
+                        &mut sys,
+                        &agent_id,
+                        "",
+                        &transport,
+                        "sync",
+                        identity.as_ref(),
+                        &session_joined_at,
+                    );
+
                     let nats_phases = transport.get_all_phases().unwrap_or_default();
                     // SECURITY (increment-0): gate wire phases before they
                     // weight the Kuramoto sync/metric — only allowlisted

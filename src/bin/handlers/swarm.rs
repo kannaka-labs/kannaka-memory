@@ -373,7 +373,14 @@ pub(crate) fn handle_swarm_serve(
                             "[swarm serve] HRM changed on disk and settled — restarting to serve the fresh mind (#563)"
                         );
                         sd_notify("STOPPING=1");
-                        process::exit(1); // Restart=always brings us back on the new file
+                        // A deliberate reload, so it exits SUCCESS. Every fleet unit
+                        // is `Restart=always`, which restarts on any status — but
+                        // status 1 made systemd record each reload as
+                        // "Failed with result 'exit-code'", so a server reloading
+                        // on the writer's save cadence (~every 4 min on O1) read as
+                        // a crashloop: 44 "failures" in three hours that were all
+                        // this line. Real errors elsewhere in this handler keep 1.
+                        process::exit(0);
                     }
                 }
             }

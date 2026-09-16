@@ -23,6 +23,12 @@ trap 'echo "[witness] shutting down"; exit 0' SIGTERM SIGINT
 
 echo "[witness] starting — agent_id=${KANNAKA_AGENT_ID:-?} tick=${TICK_SLEEP}s"
 
+# The true session start, stamped ONCE. `swarm sync` publishes the presence
+# heartbeat and reads this so `joined_at` is the loop's start, not the tick
+# (#587) — a one-shot process cannot know it otherwise.
+export KANNAKA_SESSION_JOINED_AT
+KANNAKA_SESSION_JOINED_AT=$(date -u +%FT%TZ)
+
 # One real join announcement at startup.
 "$KANNAKA" swarm join --once >/dev/null 2>&1 || true
 
@@ -35,8 +41,10 @@ while :; do
   else
     echo "$TS hear failed; tail: $(echo "$HEAR_OUT" | tail -3 | tr "\n" " | ")"
   fi
-  # Phase-sync only (no re-announce). `swarm sync` participates in Kuramoto
-  # phase coupling and refreshes QUEEN.phase presence WITHOUT emitting a join.
+  # Phase-sync + presence heartbeat, no re-announce. `swarm sync` couples
+  # phases (Kuramoto) and republishes KANNAKA.presence. Until 0.16.7 it only
+  # wrote QUEEN.phase, and this comment claimed presence — so the witness's
+  # roster row went stale minutes after startup while the ticks kept going.
   "$KANNAKA" swarm sync >/dev/null 2>&1 || true
   sleep "$TICK_SLEEP"
 done
