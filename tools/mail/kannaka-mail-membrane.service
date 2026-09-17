@@ -1,0 +1,29 @@
+[Unit]
+Description=kannaka-mail-membrane — mail becomes a bus event (ADR-0062): KANNAKA.mail.<slug>.inbound
+After=network-online.target stalwart.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kannaka-mail
+Group=kannaka-mail
+EnvironmentFile=/etc/kannaka-secrets/mail-membrane.env
+Environment=AGENTS_DIR=/etc/kannaka-secrets/agents
+Environment=STATE_PATH=/var/lib/kannaka-mail/state.json
+Environment=POLL_S=15
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/kannaka-mail/venv/bin/python /opt/kannaka-mail/membrane.py
+Restart=always
+RestartSec=10
+# hardening: it reads two secret dirs and writes one state dir, nothing else
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/kannaka-mail
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
