@@ -426,6 +426,8 @@ pub struct FacetBackfillStats {
     pub errors: usize,
 }
 
+static BULK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct HrmStore {
     /// The underlying holographic resonance medium
     medium: Medium,
@@ -559,6 +561,21 @@ impl HrmStore {
 
     /// Rebuild the memory cache from the medium data.
     /// Preserves existing connections (skip links) from the previous cache state.
+    /// Bulk load: skip the per-insert cache rebuild until `end_bulk`. A
+    /// process-wide flag (one store per process on the CLI path) rather
+    /// than a struct field, so no constructor changes.
+    pub fn begin_bulk() {
+        BULK_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Leave bulk mode and rebuild the cache once for everything absorbed.
+    pub fn end_bulk(&mut self) -> Result<(), StoreError> {
+        BULK_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.rebuild_cache()?;
+        self.mark_dirty();
+        Ok(())
+    }
+
     fn rebuild_cache(&mut self) -> Result<(), StoreError> {
         // Snapshot existing connections before clearing
         let saved_connections: std::collections::HashMap<uuid::Uuid, Vec<crate::memory::LegacyLink>> =
@@ -2692,6 +2709,13 @@ impl MediumBackend for HrmStore {
     }
 
     fn absorb(&mut self, content: &str, importance: f32, category: Option<&str>) -> Result<Uuid, StoreError> {
+        // Every insert used to rebuild the WHOLE memory cache (every wavefront
+        // row copied into a HyperMemory): O(n) per insert, so a bulk load was
+        // quadratic — 13–42 ms/item up to ~100 memories, 4 s/item at 300
+        // (kannaka-bench, 2026-09-17). In bulk mode (`begin_bulk`) the cache
+        // stays stale until `end_bulk` rebuilds it once. The medium itself is
+        // complete throughout and recall reads the medium; only cache-backed
+        // views (get, stats, exact-repeat detection) lag until the end.
         if let Some(ref mut chiral) = self.chiral {
             // ADR-0049: mints atomic facets alongside the parent when
             // KANNAKA_FACET_DECOMPOSE is set. Flag unset (the default) makes this
@@ -2699,13 +2723,17 @@ impl MediumBackend for HrmStore {
             // id either way, so `remember`'s contract is unchanged.
             let id = chiral.store_with_facets(content, importance, &self.pipeline, category)
                 .map_err(|e| StoreError::Other(format!("chiral store failed: {e}")))?;
-            self.rebuild_cache().ok();
+            if !BULK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                self.rebuild_cache().ok();
+            }
             self.mark_dirty();
             Ok(id)
         } else {
             let id = self.medium.store(content, importance, &self.pipeline)
                 .map_err(|e| StoreError::Other(format!("store failed: {e}")))?;
-            self.rebuild_cache().ok();
+            if !BULK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                self.rebuild_cache().ok();
+            }
             self.mark_dirty();
             Ok(id)
         }

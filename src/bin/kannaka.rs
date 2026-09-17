@@ -1763,8 +1763,10 @@ fn main() {
                 };
                 let mut failed = 0usize;
                 let mut stored = 0usize;
-                // One save at the end, not two per item (see set_auto_save).
+                // One save at the end, not two per item (see set_auto_save),
+                // and one cache rebuild at the end, not one per item (bulk mode).
                 sys.set_auto_save(false);
+                kannaka_memory::hrm_store::HrmStore::begin_bulk();
                 for (lineno, line) in text.lines().enumerate() {
                     let line = line.trim();
                     if line.is_empty() {
@@ -1814,6 +1816,17 @@ fn main() {
                             println!("error: line {}: {e}", lineno + 1);
                             failed += 1;
                         }
+                    }
+                }
+                if let Some(hrm) = sys
+                    .engine
+                    .store
+                    .as_any_mut()
+                    .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                {
+                    if let Err(e) = hrm.end_bulk() {
+                        eprintln!("remember --batch: cache rebuild failed: {e}");
+                        process::exit(1);
                     }
                 }
                 if let Err(e) = sys.save() {
