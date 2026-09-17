@@ -27,6 +27,27 @@ use super::types::DreamReport;
 /// 3.7x the target's). With this exponent at 0 the medium recalls at parity
 /// with cosine (~0.97 by content). Ranking-only — the energy array is never
 /// written by recall scoring; set `1.0` to reproduce the old ranking.
+/// `KANNAKA_RECALL_XI_BOOST` — `off` / `0` / `false` skips the ξ-diversity
+/// reranker (`xi_diversity_boost`) so recall ranks by raw resonance. Default
+/// on (the shipped behaviour). Read once per process.
+///
+/// Why it exists: on LongMemEval-S (kannaka-bench, 2026-09-17) with the SAME
+/// MiniLM embeddings as an exact-cosine baseline, the medium found the
+/// evidence session less often (partial 0.78 vs 0.94 hit@5). Tracing a
+/// miss showed raw resonance ≈ cosine, then the reranker lifting candidates
+/// above 0.15 cosine with a repelling ξ-signature by up to ×1.8 while the
+/// gold turn, whose ξ did not repel, kept its raw score — a rank inversion.
+/// Whether the reranker helps or hurts is now a measurement, not a belief.
+pub fn recall_xi_boost_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("KANNAKA_RECALL_XI_BOOST").map(|v| v.to_ascii_lowercase()).as_deref(),
+            Ok("off") | Ok("0") | Ok("false") | Ok("no")
+        )
+    })
+}
+
 pub fn recall_energy_exp() -> f32 {
     std::env::var("KANNAKA_RECALL_ENERGY_EXP")
         .ok()
@@ -459,7 +480,11 @@ impl Hemisphere {
             .map(|(i, _resonance, sim)| {
                 let wf_vec: Vec<f32> = self.wavefronts.row(i).to_vec();
                 let wf_xi = compute_xi_signature(&wf_vec);
-                let boosted_sim = xi_diversity_boost(sim, &query_xi, &wf_xi);
+                let boosted_sim = if recall_xi_boost_enabled() {
+                    xi_diversity_boost(sim, &query_xi, &wf_xi)
+                } else {
+                    sim.clamp(0.0, 1.0)
+                };
                 let mut boosted_resonance = boosted_sim * eweight(self.energy[i]);
                 if temporal_on { boosted_resonance *= tweight(i); }
                 (i, boosted_resonance, boosted_sim)

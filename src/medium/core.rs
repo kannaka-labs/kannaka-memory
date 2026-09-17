@@ -446,7 +446,11 @@ impl Medium {
             .map(|(i, mut r)| {
                 let wf_vec: Vec<f32> = self.store.wavefronts.row(i).to_vec();
                 let wf_xi = compute_xi_signature(&wf_vec);
-                let boosted_sim = xi_diversity_boost(r.similarity, &query_xi, &wf_xi);
+                let boosted_sim = if super::hemisphere::recall_xi_boost_enabled() {
+                    xi_diversity_boost(r.similarity, &query_xi, &wf_xi)
+                } else {
+                    r.similarity.clamp(0.0, 1.0)
+                };
                 r.similarity = boosted_sim;
                 r.resonance_strength = boosted_sim * r.effective_strength
                     * (self.store.phase[i] - query_phase).cos();
