@@ -1740,6 +1740,87 @@ fn main() {
                 process::exit(1);
             }
             warn_if_readonly("remember");
+            // `remember --batch FILE`: NDJSON, one object per line —
+            // {"content": "...", "importance": 0.5, "category": "note",
+            //  "observed": "2023-05-10T09:00:00Z", "effective": "...", "expires": "..."}.
+            // One process, one encoder load, many memories: the single-item
+            // path costs ~600 ms per spawn on a 20-core host (2026-09-17),
+            // which makes a 250k-item benchmark ingest a two-day job. Prints
+            // one id per line in input order (or `error: ...` for a bad line,
+            // exit 1 at the end); saves once; never publishes to NATS — a bulk
+            // load is a local act, and the benchmark that motivated it must
+            // never write into the swarm.
+            if args.get(command_start + 1).map(String::as_str) == Some("--batch") {
+                let path = flag_value(&args, command_start + 1, "--batch", REMEMBER_USAGE).to_string();
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    eprintln!("remember --batch: cannot read {path}: {e}");
+                    process::exit(2);
+                });
+                let parse_ts = |v: Option<&serde_json::Value>| -> Option<chrono::DateTime<chrono::Utc>> {
+                    v.and_then(|x| x.as_str())
+                        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                };
+                let mut failed = 0usize;
+                let mut stored = 0usize;
+                for (lineno, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let obj: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            println!("error: line {}: not json: {e}", lineno + 1);
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if content.is_empty() {
+                        println!("error: line {}: empty content", lineno + 1);
+                        failed += 1;
+                        continue;
+                    }
+                    let importance = obj.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                    let result = match obj.get("category").and_then(|v| v.as_str()) {
+                        Some(cat) => sys.remember_with_category(content, cat, importance),
+                        None => sys.remember_with_importance(content, importance),
+                    };
+                    match result {
+                        Ok(id) => {
+                            let (detected, _conf) =
+                                kannaka_memory::medium::types::detect_modality_simple(content);
+                            let effective_at = parse_ts(obj.get("effective"));
+                            let observed_at = parse_ts(obj.get("observed"));
+                            let expires_at = parse_ts(obj.get("expires"));
+                            if let Some(hrm) = sys
+                                .engine
+                                .store
+                                .as_any_mut()
+                                .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                            {
+                                hrm.set_modality(&id, detected);
+                                if effective_at.is_some() || observed_at.is_some() || expires_at.is_some() {
+                                    hrm.set_temporal(&id, effective_at, observed_at, expires_at);
+                                }
+                            }
+                            println!("{id}");
+                            stored += 1;
+                        }
+                        Err(e) => {
+                            println!("error: line {}: {e}", lineno + 1);
+                            failed += 1;
+                        }
+                    }
+                }
+                if let Err(e) = sys.save() {
+                    eprintln!("remember --batch: stored {stored} but failed to persist: {e}");
+                    process::exit(1);
+                }
+                eprintln!("remember --batch: {stored} stored, {failed} failed");
+                process::exit(if failed > 0 { 1 } else { 0 });
+            }
             let mut importance: Option<f64> = None;
             let mut category: Option<String> = None;
             let mut modality_arg: Option<String> = None;
@@ -2032,6 +2113,53 @@ fn main() {
             // `--collective` / `--remote` (+ their `--agent-id`/`--timeout`) are
             // handled load-free in main() before the HRM init; this arm is the
             // LOCAL recall path only.
+            // `recall --batch FILE`: NDJSON {"query": "...", "top_k": 5} per line;
+            // prints one JSON array per line in input order (the same shape as
+            // a single recall), so a benchmark can ask hundreds of questions
+            // of one loaded store without paying the process start each time.
+            if args.get(command_start + 1).map(String::as_str) == Some("--batch") {
+                let path = flag_value(&args, command_start + 1, "--batch", RECALL_USAGE).to_string();
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    eprintln!("recall --batch: cannot read {path}: {e}");
+                    process::exit(2);
+                });
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let obj: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            println!("{{\"error\":\"not json: {e}\"}}");
+                            continue;
+                        }
+                    };
+                    let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let k = obj.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                    match sys.recall(query, k) {
+                        Ok(results) => {
+                            let rows: Vec<serde_json::Value> = results
+                                .iter()
+                                .map(|r| {
+                                    serde_json::json!({
+                                        "id": r.id.to_string(),
+                                        "content": r.content,
+                                        "similarity": r.similarity,
+                                        "strength": r.strength,
+                                        "age_hours": r.age_hours,
+                                        "layer": r.layer,
+                                        "times_seen": r.times_seen,
+                                    })
+                                })
+                                .collect();
+                            println!("{}", serde_json::Value::Array(rows));
+                        }
+                        Err(e) => println!("{{\"error\":\"{e}\"}}"),
+                    }
+                }
+                process::exit(0);
+            }
             let mut top_k = 5usize;
             let mut envelope = false;
             let mut query_parts = Vec::new();
