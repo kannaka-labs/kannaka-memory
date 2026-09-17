@@ -979,6 +979,15 @@ impl KannakaMemorySystem {
     /// which stay correct when the row is an existing one) — it exists so that
     /// a future caller with that requirement says so in its own code rather
     /// than having the write path guess.
+    /// Bulk loads turn persistence off for the duration: with it on, every
+    /// insert serialises the whole medium and its sidecars twice (the flush
+    /// inside absorb_new and the auto-save after it), which is why
+    /// `remember --batch` measured 18 ms/item at 50 memories and 4 s/item at
+    /// 300 on 2026-09-17. The caller saves once when it is done.
+    pub fn set_auto_save(&mut self, on: bool) {
+        self.auto_save = on;
+    }
+
     pub fn remember_forcing_new(
         &mut self,
         text: &str,
@@ -1238,7 +1247,9 @@ impl KannakaMemorySystem {
         let id = match self.engine.store.absorb(text, importance as f32, Some(category)) {
             Ok(id) => {
                 // HRM-native: encoding + classification + chiral routing all handled
-                self.engine.store.flush().ok(); // ensure medium is consistent
+                if self.auto_save {
+                    self.engine.store.flush().ok(); // ensure medium is consistent
+                }
                 id
             }
             Err(_) => {

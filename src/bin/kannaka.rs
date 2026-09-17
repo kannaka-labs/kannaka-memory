@@ -1763,6 +1763,8 @@ fn main() {
                 };
                 let mut failed = 0usize;
                 let mut stored = 0usize;
+                // One save at the end, not two per item (see set_auto_save).
+                sys.set_auto_save(false);
                 for (lineno, line) in text.lines().enumerate() {
                     let line = line.trim();
                     if line.is_empty() {
