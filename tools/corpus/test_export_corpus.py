@@ -57,6 +57,13 @@ def fixture() -> Path:
     other = root / "kax-mirror" / "debain1" / "agent001" / "home" / "outbox" / "sent"
     other.mkdir(parents=True)
     (other / "j3.json").write_text(json.dumps({"id": "j3", "agent": "agent001", "reply": "a different machine wrote this longer reply", "usage": {}}))
+    # an open-weight machine: one reply that names its model (kax-computer #29),
+    # one from before that only the mirror's brains.json can attribute
+    ow = root / "kax-mirror" / "debain2" / "fc-04" / "home" / "outbox" / "sent"
+    ow.mkdir(parents=True)
+    (ow / "j4.json").write_text(json.dumps({"id": "j4", "agent": "fc-04", "model": "kannaka-brain-v1", "reply": "I think with kannaka-brain-v1, from my building.", "usage": {}}))
+    (ow / "j5.json").write_text(json.dumps({"id": "j5", "agent": "fc-04", "reply": "an older reply, before replies said their model", "usage": {}}))
+    (root / "kax-mirror" / "brains.json").write_text(json.dumps({"brains": {"fc-04": "kannaka-brain-v1", "agent001": "agent-brain"}}))
     return root
 
 
@@ -130,7 +137,20 @@ def test_adr_gate_and_tiers():
 
 def test_all_machines_when_filter_empty():
     recs = run(fixture(), "all", ("--kax-machines", ""))
-    assert {r.speaker for r in recs if r.source == "kax"} == {"kannaka-01", "agent001"}
+    assert {r.speaker for r in recs if r.source == "kax"} == {"kannaka-01", "agent001", "fc-04"}
+
+
+def test_generated_by_is_the_reply_model_then_brains_json_then_agent_brain():
+    recs = {r.meta["job_id"]: r for r in run(fixture(), "all", ("--kax-machines", "")) if r.source == "kax"}
+    assert recs["j4"].generated_by == "kannaka-brain-v1", "the reply names its model"
+    assert recs["j5"].generated_by == "kannaka-brain-v1", "older reply: brains.json attributes it"
+    assert recs["j3"].generated_by == "agent-brain"
+    assert recs["j1"].generated_by == "agent-brain", "not in brains.json, no model: the old default"
+    # a mirror without brains.json still exports (the old behaviour)
+    root = fixture()
+    (root / "kax-mirror" / "brains.json").unlink()
+    recs = {r.meta["job_id"]: r for r in run(root, "all", ("--kax-machines", "")) if r.source == "kax"}
+    assert recs["j5"].generated_by == "agent-brain" and recs["j4"].generated_by == "kannaka-brain-v1"
 
 
 def test_refuses_to_write_inside_a_repo():

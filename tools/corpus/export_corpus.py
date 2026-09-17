@@ -231,11 +231,29 @@ def adr(adr_dir: Path) -> Iterator[Record]:
                 meta={"section": sec, "author_line": author_line})
 
 
+def kax_brains(mirror: Path) -> dict[str, str]:
+    """machine id -> the model it thinks with, from <mirror>/brains.json (written
+    by the mirror refresh from GET /api/compute/machines, whose `brain` field
+    is the host's announced KAX_MODEL since kax-computer #25). Replies carry
+    `model` themselves since kax-computer #29; this is for the ones before,
+    which would otherwise all read as agent-brain — including the open-weight
+    machines', the exchanges most worth keeping apart."""
+    try:
+        d = json.loads((mirror / "brains.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    b = d.get("brains") if isinstance(d, dict) else None
+    return {k: v for k, v in (b or {}).items() if isinstance(k, str) and isinstance(v, str) and v}
+
+
 def kax(mirror: Path, machines: set[str] | None) -> Iterator[Record]:
     """Prompt/reply pairs from the KAX machine mailboxes. The REPLY is the
-    record; the prompt (inbound, signed by someone else) is context only."""
+    record; the prompt (inbound, signed by someone else) is context only.
+    generated_by: the reply's own `model`, else the mirror's brains.json for
+    that machine, else agent-brain (the only brain there was before 2026-09)."""
     if not mirror.exists():
         return
+    brains = kax_brains(mirror)
     for sent in sorted(mirror.glob("*/*/home/outbox/sent/*.json")):
         host = sent.parts[-6]
         machine = sent.parts[-5]
@@ -262,7 +280,7 @@ def kax(mirror: Path, machines: set[str] | None) -> Iterator[Record]:
             id=rid("kax", host, machine, sent.stem), text=text, source="kax", kind="machine-reply",
             author=f"machine:{machine}", tier=3, provenance="machine-reply", path=str(sent),
             date=date, speaker=machine, context=prompt,
-            generated_by=reply.get("model") or "agent-brain",
+            generated_by=reply.get("model") or brains.get(machine) or "agent-brain",
             meta={"host": host, "job_id": reply.get("id"), "tokens": (reply.get("usage") or {}).get("total_tokens")})
 
 
