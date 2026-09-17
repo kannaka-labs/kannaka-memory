@@ -178,6 +178,9 @@ FLAGS:
   --observed  <ISO8601>  when it was observed
   --expires   <ISO8601>  when it stops being true
   --substrate            also publish a wave-signature absorb to the collective substrate
+  --batch <FILE>         NDJSON bulk load, one process: {"content","importance","category",
+                         "observed","effective","expires"} per line; one id per line out;
+                         never publishes to NATS
 
 EXAMPLES:
   kannaka remember "the dream consolidates beliefs" --category note
