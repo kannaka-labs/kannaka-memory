@@ -485,7 +485,34 @@ fn handle_belief_cores(args: &[String]) {
     );
 }
 
-/// Build the encoding pipeline from env > config > default, with the
+/// A `.encoder` stamp parsed back into a selection: `hash:<dim>:<seed>` or
+/// `ollama:<model>:<dim>`. Returns `(kind, model-or-seed, dim)`; `None` for a
+/// stamp this build does not recognise, so the caller keeps its own selection
+/// and the mismatch guard below still fires.
+fn parse_encoder_stamp(stamp: &str) -> Option<(String, String, usize)> {
+    let parts: Vec<&str> = stamp.trim().split(':').collect();
+    match parts.as_slice() {
+        ["hash", dim, seed] => {
+            let d: usize = dim.parse().ok()?;
+            seed.parse::<u64>().ok()?;
+            Some(("hash".to_string(), (*seed).to_string(), d))
+        }
+        ["ollama", model, dim] if !model.is_empty() => {
+            Some(("ollama".to_string(), (*model).to_string(), dim.parse().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Is an ollama-shaped embedder answering at `url`?
+fn embedder_reachable(url: &str) -> bool {
+    ureq::get(&format!("{}/api/tags", url.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+        .is_ok()
+}
+
+/// Build the encoding pipeline from env > stamp > config > default, with the
 /// `.encoder` sidecar guard.
 ///
 /// The sidecar exists because a store's vectors are encoder-specific: querying
@@ -494,23 +521,68 @@ fn handle_belief_cores(args: &[String]) {
 /// stamps `<data_dir>/.encoder`; later runs refuse a mismatch and point at the
 /// re-encode recipe. `KANNAKA_ENCODER_FORCE=1` overrides (eval arms rebuild
 /// stores in place and own the consequences).
+///
+/// #976: the shipped default is the semantic encoder. Two rules keep that from
+/// breaking anyone:
+///   - an existing store's stamp is ADOPTED unless the caller explicitly set
+///     `KANNAKA_ENCODER`, so stores written under the old hash default open
+///     exactly as before (reading vectors with the encoder that wrote them is
+///     always the safe direction — it is what the guard protects);
+///   - a NEW store refuses to be created when the selected embedder is
+///     unreachable, rather than silently minting a hash store whose recall is
+///     noise. `KANNAKA_ENCODER=hash` opts in deliberately.
+
 fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &KannakaConfig) -> EncodingPipeline {
-    let kind = std::env::var("KANNAKA_ENCODER").unwrap_or_else(|_| cfg.encoder.kind.clone());
+    let env_kind = std::env::var("KANNAKA_ENCODER").ok().filter(|v| !v.is_empty());
+    let sidecar = data_dir.join(".encoder");
+    let stamped = std::fs::read_to_string(&sidecar)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let mut kind = env_kind.clone().unwrap_or_else(|| cfg.encoder.kind.clone());
+    let mut model = std::env::var("KANNAKA_ENCODER_MODEL").unwrap_or_else(|_| cfg.encoder.model.clone());
+    let mut dim: usize = std::env::var("KANNAKA_ENCODER_DIM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cfg.encoder.dim as usize);
+    let mut seed: u64 = 42;
+    let mut adopted = false;
+    if env_kind.is_none() {
+        if let Some((k, a, d)) = stamped.as_deref().and_then(parse_encoder_stamp) {
+            if k == "hash" {
+                seed = a.parse().unwrap_or(42);
+            } else {
+                model = a;
+            }
+            adopted = kind != k || dim != d;
+            kind = k;
+            dim = d;
+        }
+    }
+
+    let url = std::env::var("KANNAKA_ENCODER_URL").unwrap_or_else(|_| cfg.encoder.base_url.clone());
     let (encoder, desc, in_dim): (Box<dyn kannaka_memory::TextEncoder>, String, usize) = match kind.as_str() {
         "hash" | "" => (
-            Box::new(SimpleHashEncoder::new(384, 42)),
-            "hash:384:42".to_string(),
-            384,
+            Box::new(SimpleHashEncoder::new(dim, seed)),
+            format!("hash:{dim}:{seed}"),
+            dim,
         ),
         "ollama" => {
-            let url = std::env::var("KANNAKA_ENCODER_URL").unwrap_or_else(|_| cfg.encoder.base_url.clone());
-            let model = std::env::var("KANNAKA_ENCODER_MODEL").unwrap_or_else(|_| cfg.encoder.model.clone());
-            let dim: usize = std::env::var("KANNAKA_ENCODER_DIM")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(cfg.encoder.dim as usize);
-            let desc = format!("ollama:{model}:{dim}");
-            (Box::new(kannaka_memory::encoding::OllamaEncoder::new(url, model, dim)), desc, dim)
+            if stamped.is_none() && !embedder_reachable(&url) {
+                eprintln!("[encoder] no embedder answering at {url} — refusing to create a new store.");
+                eprintln!("[encoder] a hash-encoded store has no semantics: recall returns near-noise");
+                eprintln!("[encoder] and nothing later reports it (measured: hit@k 0.53 vs 0.93).");
+                eprintln!("[encoder] start one (`ollama serve` + `ollama pull {}`), point", cfg.encoder.model);
+                eprintln!("[encoder] KANNAKA_ENCODER_URL at it, or choose the fallback on purpose");
+                eprintln!("[encoder] with KANNAKA_ENCODER=hash.");
+                process::exit(2);
+            }
+            (
+                Box::new(kannaka_memory::encoding::OllamaEncoder::new(url.clone(), model.clone(), dim)),
+                format!("ollama:{model}:{dim}"),
+                dim,
+            )
         }
         other => {
             eprintln!("[config] unknown encoder kind '{other}' (expected hash|ollama)");
@@ -518,21 +590,22 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
         }
     };
 
-    let sidecar = data_dir.join(".encoder");
     let force = std::env::var("KANNAKA_ENCODER_FORCE").map(|v| v == "1").unwrap_or(false);
-    match std::fs::read_to_string(&sidecar) {
-        Ok(stamped) => {
-            let stamped = stamped.trim();
-            if stamped != desc && !force {
-                eprintln!("[encoder] store was written with '{stamped}' but this run selects '{desc}'.");
+    match stamped {
+        Some(stamp) => {
+            if stamp != desc && !force {
+                eprintln!("[encoder] store was written with '{stamp}' but this run selects '{desc}'.");
                 eprintln!("[encoder] mixed-encoder recall is silent corruption — refusing.");
                 eprintln!("[encoder] either select the stamped encoder, re-encode the store");
                 eprintln!("[encoder] (id-preserving recipe: evals/semantic-encoder/semantic-eval.rs),");
                 eprintln!("[encoder] or set KANNAKA_ENCODER_FORCE=1 if you know what you are doing.");
                 process::exit(2);
             }
+            if adopted && !quiet {
+                eprintln!("[encoder] adopting this store's stamp: {desc}");
+            }
         }
-        Err(_) => {
+        None => {
             // First use (or unreadable sidecar): stamp best-effort. Read-only
             // mounts and races are fine to ignore — the guard is advisory
             // defense-in-depth, not a lock.
@@ -540,11 +613,60 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
         }
     }
     if !quiet && kind == "ollama" {
-        eprintln!("[encoder] {desc} via {}", std::env::var("KANNAKA_ENCODER_URL").unwrap_or_else(|_| cfg.encoder.base_url.clone()));
+        eprintln!("[encoder] {desc} via {url}");
     }
 
     let codebook = Codebook::new(in_dim, 10_000, 42);
     EncodingPipeline::new(encoder, codebook)
+}
+
+#[cfg(test)]
+mod encoder_stamp_tests {
+    use super::parse_encoder_stamp;
+
+    /// Both stamps this build writes must read back exactly, so that adopting a
+    /// store's stamp reproduces the encoder that wrote its vectors (#976).
+    #[test]
+    fn round_trips_both_stamps() {
+        assert_eq!(
+            parse_encoder_stamp("hash:384:42"),
+            Some(("hash".to_string(), "42".to_string(), 384))
+        );
+        assert_eq!(
+            parse_encoder_stamp("ollama:all-minilm:384"),
+            Some(("ollama".to_string(), "all-minilm".to_string(), 384))
+        );
+        // non-default dim/seed, and surrounding whitespace from a stamped file
+        assert_eq!(
+            parse_encoder_stamp(" ollama:mxbai-embed-large:1024
+"),
+            Some(("ollama".to_string(), "mxbai-embed-large".to_string(), 1024))
+        );
+        assert_eq!(
+            parse_encoder_stamp("hash:768:7"),
+            Some(("hash".to_string(), "7".to_string(), 768))
+        );
+    }
+
+    /// Anything this build does not understand must return None so the caller
+    /// keeps its own selection and the mismatch guard still refuses — an
+    /// unparsed stamp must never be silently treated as agreement.
+    #[test]
+    fn unknown_stamps_are_not_adopted() {
+        for bad in [
+            "",
+            "hash",
+            "hash:384",
+            "hash:abc:42",
+            "hash:384:notaseed",
+            "ollama::384",
+            "ollama:all-minilm:notadim",
+            "future-encoder:v2:512",
+            "ollama:all-minilm:384:extra",
+        ] {
+            assert_eq!(parse_encoder_stamp(bad), None, "stamp {bad:?} must not parse");
+        }
+    }
 }
 
 fn init_with_hrm(
