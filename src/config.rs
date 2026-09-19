@@ -78,7 +78,7 @@ pub struct EncoderConfig {
     pub dim: u32,
 }
 
-fn default_encoder_kind() -> String { "hash".to_string() }
+fn default_encoder_kind() -> String { "ollama".to_string() }
 fn default_encoder_url() -> String { "http://localhost:11434".to_string() }
 fn default_encoder_model() -> String { "all-minilm".to_string() }
 fn default_encoder_dim() -> u32 { 384 }
@@ -5834,11 +5834,16 @@ mod config_field_tests {
     }
 
     #[test]
-    fn encoder_section_defaults_to_hash() {
-        // A config with no [encoder] section must behave exactly as before the
-        // section existed — hash encoder, byte-identical (ship-dark contract).
+    fn encoder_section_defaults_to_ollama() {
+        // #976: a config with no [encoder] section selects the SEMANTIC encoder.
+        // The hash encoder is a non-semantic fallback: on LongMemEval-S it cost
+        // hit@k 0.53 against 0.93 for the same medium with all-minilm, and it
+        // was the shipped default, so every new store started useless for
+        // recall. Existing hash stores keep working through the `.encoder`
+        // stamp, which is adopted rather than refused (see
+        // build_encoding_pipeline in the kannaka binary).
         let cfg: KannakaConfig = toml::from_str("").expect("empty config parses");
-        assert_eq!(cfg.encoder.kind, "hash");
+        assert_eq!(cfg.encoder.kind, "ollama");
         assert_eq!(cfg.encoder.dim, 384);
         assert_eq!(cfg.encoder.model, "all-minilm");
         assert_eq!(cfg.encoder.base_url, "http://localhost:11434");
@@ -5850,6 +5855,9 @@ mod config_field_tests {
             "[encoder]\nkind = \"ollama\"\nmodel = \"mxbai-embed-large\"\ndim = 1024\n",
         )
         .expect("encoder section parses");
+        // an explicit hash selection is still honoured
+        let h: KannakaConfig = toml::from_str("[encoder]\nkind = \"hash\"\n").expect("hash parses");
+        assert_eq!(h.encoder.kind, "hash");
         assert_eq!(cfg.encoder.kind, "ollama");
         assert_eq!(cfg.encoder.model, "mxbai-embed-large");
         assert_eq!(cfg.encoder.dim, 1024);
