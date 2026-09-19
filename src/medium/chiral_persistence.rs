@@ -353,17 +353,29 @@ impl ChiralMedium {
         w.write_all(&(callosum_bytes.len() as u32).to_le_bytes())?;
         w.write_all(&callosum_bytes)?;
 
-        // Write chiral scales (bincode)
-        let scales_vec: Vec<(uuid::Uuid, ChiralScale)> =
+        // Write chiral scales (bincode), key-sorted.
+        //
+        // `scales` is a std HashMap, whose RandomState randomises iteration
+        // order per process. Emitting it unsorted made every save of unchanged
+        // content produce different bytes at the same length (#952), so a
+        // checksum could not answer "did this store change". Sorting by key
+        // costs one sort per save and makes this section a function of content
+        // alone. The loader collects straight back into a HashMap, so order
+        // carries no meaning and this is a pure serialization change.
+        let mut scales_vec: Vec<(uuid::Uuid, ChiralScale)> =
             self.scales.iter().map(|(&k, &v)| (k, v)).collect();
+        scales_vec.sort_unstable_by_key(|(k, _)| *k);
         let scales_bytes = bincode::serialize(&scales_vec)
             .map_err(MediumError::Serialization)?;
         w.write_all(&(scales_bytes.len() as u32).to_le_bytes())?;
         w.write_all(&scales_bytes)?;
 
-        // Write ID mappings (bincode)
-        let lr_vec: Vec<(uuid::Uuid, uuid::Uuid)> =
+        // Write ID mappings (bincode), key-sorted — same reason as `scales`
+        // above. `right_to_left` is not written at all; the loader derives it
+        // by flipping these pairs, so this one section fixes both maps.
+        let mut lr_vec: Vec<(uuid::Uuid, uuid::Uuid)> =
             self.left_to_right.iter().map(|(&k, &v)| (k, v)).collect();
+        lr_vec.sort_unstable_by_key(|(k, _)| *k);
         let lr_bytes = bincode::serialize(&lr_vec)
             .map_err(MediumError::Serialization)?;
         w.write_all(&(lr_bytes.len() as u32).to_le_bytes())?;
@@ -1094,6 +1106,73 @@ mod tests {
         assert!(meta.observed_at.is_none(), "unset observed_at stays None");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #952: a save of unchanged content must produce the same bytes ──────
+    //
+    // `scales` and `left_to_right` are std HashMaps, and RandomState gives each
+    // *instance* a different iteration order. So a store that is saved, loaded
+    // and saved again used to emit the same pairs in a different order: same
+    // byte length, different blake3, identical semantics. That made a checksum
+    // useless for answering "did this store change".
+    //
+    // Save → load → save is the exact shape of the reported failure (two copies
+    // of one store, one read on each, two different checksums) and it does not
+    // depend on hash randomness to *fail*: the reloaded medium's maps are fresh
+    // instances, so an unsorted writer has no reason to reproduce the order.
+    //
+    // Two regions are expected to differ and are excluded: the wall-clock
+    // header timestamp at bytes 8..16, and the trailing 32-byte blake3 that is
+    // computed over it. Everything else is content and must match exactly.
+    #[test]
+    fn saving_unchanged_content_twice_produces_identical_bytes() {
+        const TS: std::ops::Range<usize> = 8..16;
+        const CHECKSUM_LEN: usize = 32;
+
+        fn content_of(path: &PathBuf) -> Vec<u8> {
+            let raw = std::fs::read(path).unwrap();
+            assert!(raw.len() > TS.end + CHECKSUM_LEN, "file too short to be a .hrm");
+            let mut body = raw[..raw.len() - CHECKSUM_LEN].to_vec();
+            for b in &mut body[TS] {
+                *b = 0;
+            }
+            body
+        }
+
+        let pipeline = test_pipeline();
+        let mut cm = ChiralMedium::new();
+        // Enough pairs that a coincidental order match is not worth considering.
+        for i in 0..32 {
+            cm.store(&format!("determinism subject number {i}"), 0.5, &pipeline)
+                .unwrap();
+        }
+
+        let dir = std::env::temp_dir();
+        let first = dir.join("test_chiral_determinism_a.hrm");
+        let second = dir.join("test_chiral_determinism_b.hrm");
+
+        cm.save(&first).unwrap();
+        // Reload, change nothing, save again — fresh HashMap instances.
+        let reloaded = ChiralMedium::load(&first).unwrap();
+        reloaded.save(&second).unwrap();
+
+        let a = content_of(&first);
+        let b = content_of(&second);
+
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "unchanged content changed length — this is a real content diff, not ordering"
+        );
+        let first_diff = a.iter().zip(b.iter()).position(|(x, y)| x != y);
+        assert!(
+            first_diff.is_none(),
+            "a save of unchanged content produced different bytes at offset {:?} (#952)",
+            first_diff
+        );
+
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
     }
 
     fn test_pipeline() -> EncodingPipeline {
