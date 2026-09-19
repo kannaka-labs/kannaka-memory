@@ -2186,6 +2186,21 @@ impl HrmStore {
             }
         }
         if mutated {
+            // #947: rebuild the cache, as `recompute_encoding` and
+            // `chiral_dream` both do after mutating. Without it the facet rows
+            // this sweep just minted are absent from `memory_cache`, so
+            // `all_memories()` and everything built on it cannot see them until
+            // the store is next loaded — a silent gap, since an invisible row is
+            // also not processed by anything downstream.
+            //
+            // Unlike the siblings this function returns stats rather than a
+            // Result, so a rebuild failure is reported through the same
+            // `stats.errors` channel the per-row errors above already use,
+            // instead of being swallowed.
+            if let Err(e) = self.rebuild_cache() {
+                stats.errors += 1;
+                eprintln!("[facets] cache rebuild after backfill failed: {e}");
+            }
             self.mark_dirty();
         }
         stats
@@ -2910,6 +2925,30 @@ mod tests {
             .filter(|m| m.is_facet)
             .count();
         assert_eq!(facet_rows, applied.facets_minted, "facet flags on the minted rows");
+
+        // #947: those rows must be reachable WITHOUT a reload. The sweep used
+        // to mint them into the medium and leave `memory_cache` holding only
+        // the pre-sweep rows, so `all_memories()` / `all_ids()` returned none
+        // of the facets just created — silent, because an invisible row is also
+        // not processed by anything downstream. Assert on the ids rather than a
+        // total, so this says exactly which rows went missing.
+        let minted_ids: Vec<Uuid> = store
+            .chiral_medium()
+            .unwrap()
+            .right
+            .metadata
+            .iter()
+            .filter(|m| m.is_facet)
+            .map(|m| m.id)
+            .collect();
+        let cached: std::collections::HashSet<Uuid> =
+            store.all_ids().unwrap().into_iter().collect();
+        let missing = minted_ids.iter().filter(|id| !cached.contains(id)).count();
+        assert_eq!(
+            missing, 0,
+            "{missing} of {} minted facet rows are absent from the memory cache without a reload (#947)",
+            minted_ids.len()
+        );
 
         // (c) idempotent: a second apply mints nothing.
         let again = store.backfill_all_facets(true);

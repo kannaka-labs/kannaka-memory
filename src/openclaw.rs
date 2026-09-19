@@ -4189,9 +4189,10 @@ mod tests {
         // Reload: the store is now chiral, so the facet flags have somewhere to
         // live. Decompose, flush, drop — mirroring `kannaka facets backfill
         // --apply`, a separate process from the `kannaka dedupe` that follows.
-        // (`backfill_all_facets` does not rebuild the memory cache, unlike
-        // `recompute_encoding` and `chiral_dream`, so the minted rows reach the
-        // cache only on the next load.)
+        // (The reload here is not a workaround: it mirrors the two separate
+        // processes an operator actually runs. #947 made `backfill_all_facets`
+        // rebuild the cache like its siblings, so the minted rows are reachable
+        // in-process too.)
         let minted = {
             let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
             let hrm = sys
