@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::config::KannakaConfig;
+use crate::config::{default_llm_timeout_secs, KannakaConfig};
 use crate::openclaw::{KannakaMemorySystem, RecallResult};
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
@@ -445,11 +445,18 @@ pub fn system_prompt(
 pub struct AnthropicClient {
     api_key: String,
     model: String,
+    timeout: Duration,
 }
 
 impl AnthropicClient {
     pub fn new(api_key: String, model: String) -> Self {
-        Self { api_key, model }
+        Self { api_key, model, timeout: Duration::from_secs(default_llm_timeout_secs()) }
+    }
+
+    /// Override the per-request HTTP timeout (#904). Chainable off `new`.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
     }
 
     pub fn send(
@@ -485,7 +492,7 @@ impl AnthropicClient {
             .set("x-api-key", &self.api_key)
             .set("anthropic-version", ANTHROPIC_VERSION)
             .set("content-type", "application/json")
-            .timeout(Duration::from_secs(300))
+            .timeout(self.timeout)
             .send_json(body);
 
         match resp {
@@ -531,7 +538,7 @@ impl AnthropicClient {
             .set("anthropic-version", ANTHROPIC_VERSION)
             .set("content-type", "application/json")
             .set("accept", "text/event-stream")
-            .timeout(Duration::from_secs(300))
+            .timeout(self.timeout)
             .send_json(body);
         let r = match resp {
             Ok(r) => r,
@@ -603,13 +610,20 @@ impl AnthropicClient {
 pub struct OllamaClient {
     base_url: String,
     model: String,
+    timeout: Duration,
 }
 
 impl OllamaClient {
     pub fn new(base_url: String, model: String) -> Self {
         // Trim trailing slash so we can join with `/api/chat` cleanly.
         let base_url = base_url.trim_end_matches('/').to_string();
-        Self { base_url, model }
+        Self { base_url, model, timeout: Duration::from_secs(default_llm_timeout_secs()) }
+    }
+
+    /// Override the per-request HTTP timeout (#904). Chainable off `new`.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
     }
 
     pub fn send(
@@ -663,7 +677,7 @@ impl OllamaClient {
         let url = format!("{}/api/chat", self.base_url);
         let resp = ureq::post(&url)
             .set("content-type", "application/json")
-            .timeout(Duration::from_secs(300))
+            .timeout(self.timeout)
             .send_json(body);
 
         let v: Value = match resp {
@@ -703,12 +717,19 @@ pub struct OpenAIClient {
     base_url: String,
     api_key: String,
     model: String,
+    timeout: Duration,
 }
 
 impl OpenAIClient {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
-        Self { base_url, api_key, model }
+        Self { base_url, api_key, model, timeout: Duration::from_secs(default_llm_timeout_secs()) }
+    }
+
+    /// Override the per-request HTTP timeout (#904). Chainable off `new`.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
     }
 
     pub fn send(
@@ -752,7 +773,7 @@ impl OpenAIClient {
         let resp = ureq::post(&url)
             .set("authorization", &format!("Bearer {}", self.api_key))
             .set("content-type", "application/json")
-            .timeout(Duration::from_secs(300))
+            .timeout(self.timeout)
             .send_json(body);
 
         let v: Value = match resp {
@@ -880,7 +901,9 @@ pub fn client_from_config(cfg: &KannakaConfig) -> Result<LlmClient, AgentError> 
             } else {
                 cfg.llm.model.clone()
             };
-            Ok(LlmClient::Anthropic(AnthropicClient::new(api_key, model)))
+            Ok(LlmClient::Anthropic(
+                AnthropicClient::new(api_key, model).with_timeout_secs(cfg.llm.timeout_secs),
+            ))
         }
         "ollama" => {
             // Ollama is the local-model path. base_url defaults to the
@@ -895,7 +918,9 @@ pub fn client_from_config(cfg: &KannakaConfig) -> Result<LlmClient, AgentError> 
             } else {
                 cfg.llm.model.clone()
             };
-            Ok(LlmClient::Ollama(OllamaClient::new(base_url, model)))
+            Ok(LlmClient::Ollama(
+                OllamaClient::new(base_url, model).with_timeout_secs(cfg.llm.timeout_secs),
+            ))
         }
         "openai" => {
             let api_key = if !cfg.llm.api_key.is_empty() {
@@ -915,7 +940,9 @@ pub fn client_from_config(cfg: &KannakaConfig) -> Result<LlmClient, AgentError> 
             } else {
                 cfg.llm.model.clone()
             };
-            Ok(LlmClient::OpenAI(OpenAIClient::new(base_url, api_key, model)))
+            Ok(LlmClient::OpenAI(
+                OpenAIClient::new(base_url, api_key, model).with_timeout_secs(cfg.llm.timeout_secs),
+            ))
         }
         "none" | "" => Err(AgentError::NotConfigured),
         other => Err(AgentError::UnsupportedProvider(other.to_string())),
@@ -1803,5 +1830,30 @@ mod tests {
             "the dream tool must route lite to dream_lite, not report it and run deep (#669)"
         );
         assert!(arm.contains("sys.dream()"), "deep must still be reachable");
+    }
+}
+
+#[cfg(test)]
+mod llm_timeout_tests {
+    use super::{AnthropicClient, OllamaClient, OpenAIClient};
+    use std::time::Duration;
+
+    // #904: every client defaults to the old 300 s constant, and with_timeout_secs
+    // threads an operator's [llm] timeout_secs through to the actual HTTP call.
+    // Reading the private `timeout` field is the point — it is what the four
+    // `.timeout(self.timeout)` sites use, so this pins the plumbing end to end.
+    #[test]
+    fn clients_default_to_300s_and_honour_override() {
+        let a = AnthropicClient::new("k".into(), "m".into());
+        assert_eq!(a.timeout, Duration::from_secs(300));
+        assert_eq!(a.with_timeout_secs(600).timeout, Duration::from_secs(600));
+
+        let o = OllamaClient::new("http://x".into(), "m".into());
+        assert_eq!(o.timeout, Duration::from_secs(300));
+        assert_eq!(o.with_timeout_secs(45).timeout, Duration::from_secs(45));
+
+        let p = OpenAIClient::new("http://x".into(), "k".into(), "m".into());
+        assert_eq!(p.timeout, Duration::from_secs(300));
+        assert_eq!(p.with_timeout_secs(120).timeout, Duration::from_secs(120));
     }
 }

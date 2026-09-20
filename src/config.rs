@@ -140,6 +140,21 @@ pub struct LlmConfig {
     /// startup; claims nothing this binary can verify.
     #[serde(default)]
     pub externally_capped: bool,
+    /// Per-request HTTP timeout for LLM calls, in seconds (#904). Default 300.
+    ///
+    /// A CPU-served model on a large prompt legitimately needs minutes: the
+    /// relay's ~2.6k-token Odin ask measured 233 s on an idle box and 314 s
+    /// under load against `kannaka-brain` on debain2. The timeout was hard-coded
+    /// at 300 s in four places with no key to raise it, so those asks failed
+    /// with no recourse. This is that key; the default is the old constant, so
+    /// nothing changes unless an operator sets it.
+    #[serde(default = "default_llm_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// The previous hard-coded LLM timeout, now the default for [`LlmConfig::timeout_secs`].
+pub fn default_llm_timeout_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +506,7 @@ impl Default for LlmConfig {
             base_url: String::new(),
             max_usd_per_day: None,
             externally_capped: false,
+            timeout_secs: default_llm_timeout_secs(),
         }
     }
 }
@@ -4900,6 +4916,20 @@ mod config_field_tests {
         let cfg: KannakaConfig = toml::from_str(minimal).expect("deserialize minimal config");
         assert!(!cfg.belief.enabled);
         assert_eq!(cfg.belief.max_n, 6000);
+    }
+
+    #[test]
+    fn llm_timeout_secs_defaults_to_300_and_is_overridable() {
+        // #904: an unset key keeps the old hard-coded 300 s, so no config change.
+        let dflt: KannakaConfig =
+            toml::from_str("[llm]\nprovider = \"ollama\"\n").expect("deserialize");
+        assert_eq!(dflt.llm.timeout_secs, 300, "absent key must keep the old constant");
+        assert_eq!(LlmConfig::default().timeout_secs, 300, "Default must match serde default");
+
+        // A CPU model that needs minutes can now be given them.
+        let raised: KannakaConfig =
+            toml::from_str("[llm]\nprovider = \"ollama\"\ntimeout_secs = 600\n").expect("deserialize");
+        assert_eq!(raised.llm.timeout_secs, 600);
     }
 
     // The self-update binary swap is Windows-specific; its cleanup of stale

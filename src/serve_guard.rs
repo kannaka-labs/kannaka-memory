@@ -706,6 +706,7 @@ mod tests {
             base_url: base_url.to_string(),
             max_usd_per_day: None,
             externally_capped: false,
+            timeout_secs: crate::config::default_llm_timeout_secs(),
         }
     }
 
