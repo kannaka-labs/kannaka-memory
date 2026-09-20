@@ -93,14 +93,58 @@ pub fn decompose_enabled() -> bool {
 #[cfg(test)]
 static FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take the flag lock, ignoring poisoning.
+/// A held flag lock that also RESTORES `KANNAKA_FACET_DECOMPOSE` on drop (#942).
 ///
-/// A panicking test poisons the mutex; without this every later flag test would
-/// report a lock error instead of its own assertion, hiding the real failure
-/// behind the first one.
+/// Holding the mutex serializes the mutating tests against each other, but on
+/// its own it does not survive a panic: a test that does `set_var("…","1")` and
+/// then panics before its own cleanup leaves the flag ON process-wide, and the
+/// next test to *read* it through `decompose_enabled` — which does not take this
+/// lock — sees a stale ON it never set. That turns one test's failure into a
+/// cascade blamed on innocent tests, the worst shape of flake.
+///
+/// This guard snapshots the flag's value at lock time and, on drop, puts it
+/// back exactly — restoring a prior value or removing it if it was unset — and
+/// does so BEFORE the mutex is released, so the next locker always observes the
+/// restored state. Drop runs on the panic path too, so a panicking mutator can
+/// no longer poison the flag for everyone else; the mutex poisoning is still
+/// swallowed so the real assertion, not a lock error, is what surfaces.
+///
+/// This does NOT close the reader race in general: a non-flag test that reads
+/// `decompose_enabled` while a flag test legitimately holds the flag ON for the
+/// duration of its body can still observe ON. Closing that means making the
+/// setting injectable rather than ambient (issue #942 option 2), a refactor of
+/// the `decompose_enabled` call site that is out of scope here. What this fixes
+/// is the durable, cross-test leak — the flag is now ON only for the span of a
+/// single locked body, never left dangling past it.
 #[cfg(test)]
-pub(crate) fn lock_decompose_flag() -> std::sync::MutexGuard<'static, ()> {
-    FLAG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+pub(crate) struct FlagGuard {
+    // Field order matters: Rust drops fields top-to-bottom, but a type's own
+    // Drop::drop runs before any field drops, so `restore()` below executes
+    // while `_lock` is still held, then `_lock` releases. Restore-then-unlock.
+    prior: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(v) => std::env::set_var("KANNAKA_FACET_DECOMPOSE", v),
+            None => std::env::remove_var("KANNAKA_FACET_DECOMPOSE"),
+        }
+    }
+}
+
+/// Take the flag lock (ignoring poisoning) and snapshot the flag for restore.
+///
+/// A panicking test poisons the mutex; `into_inner` recovers it so every later
+/// flag test reports its own assertion rather than a lock error inherited from
+/// the first failure.
+#[cfg(test)]
+pub(crate) fn lock_decompose_flag() -> FlagGuard {
+    let lock = FLAG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prior = std::env::var("KANNAKA_FACET_DECOMPOSE").ok();
+    FlagGuard { prior, _lock: lock }
 }
 
 /// Decompose `content` into atomic facet texts.
@@ -716,4 +760,25 @@ mod resolve_tests {
         assert_eq!(overfetch_pool(10), 10 * MAX_FACETS_PER_PARENT);
         assert_eq!(overfetch_pool(0), 0);
     }
+
+    /// #942: the flag guard must leave the flag exactly as it found it, so a
+    /// mutating test cannot leak an ON value to a later reader. This test holds
+    /// the guard itself, so it is serialized with the other flag tests.
+    #[test]
+    fn flag_guard_restores_unset_on_drop() {
+        {
+            let _flag = lock_decompose_flag();
+            std::env::set_var("KANNAKA_FACET_DECOMPOSE", "1");
+            assert!(decompose_enabled(), "flag is ON inside the guarded body");
+        } // guard drops here
+        assert!(
+            !decompose_enabled(),
+            "guard must clear a flag it found unset, even though the body set it ON",
+        );
+        assert!(
+            std::env::var("KANNAKA_FACET_DECOMPOSE").is_err(),
+            "the variable must be removed, not merely read as off",
+        );
+    }
+
 }
