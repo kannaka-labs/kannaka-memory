@@ -2096,6 +2096,19 @@ impl HrmStore {
         Ok((scanned, updated))
     }
 
+    /// Encode text with this store's OWN pipeline.
+    ///
+    /// Exists so a caller that must preserve an identity (`import`, #949) can
+    /// produce a store-dimensioned vector and go through `insert`, instead of
+    /// calling `absorb` — which mints a fresh id and throws the caller's away.
+    /// Using the store's pipeline rather than a caller-built one also means the
+    /// result cannot hit `insert`'s dimension-mismatch path.
+    pub fn encode_text(&self, text: &str) -> Result<Vec<f32>, StoreError> {
+        self.pipeline
+            .encode_text(text)
+            .map_err(|e| StoreError::Other(format!("encode failed: {e}")))
+    }
+
     /// Get chiral consciousness summary (bilateral metrics).
     pub fn chiral_consciousness(&self) -> Option<ChiralConsciousness> {
         self.chiral.as_ref().map(|c| c.consciousness_summary())

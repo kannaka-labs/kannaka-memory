@@ -508,45 +508,73 @@ pub(crate) fn import_memories_from_file(
                 .collect()
         });
 
+        // #949: a record with no vector used to go through `absorb`, which
+        // mints a FRESH id and discarded the `id` parsed above — the very id
+        // the duplicate check a few lines up tests against. So the skip could
+        // never fire on this path, a `--slim` export (which deliberately omits
+        // vectors) could not be round-tripped without rewriting every id, and
+        // importing the same slim file twice produced two full copies while
+        // reporting `Skipped: 0`.
+        //
+        // Encoding with the store's OWN pipeline instead gives a
+        // store-dimensioned vector, so the record can take the same
+        // identity-preserving `insert` path as a record that carried one.
+        //
+        // ⚠ Behaviour change: `absorb` also ran ADR-0049 facet decomposition,
+        // and `insert` does not. A slim import therefore no longer mints facets
+        // inline — run `kannaka facets backfill --apply` afterwards, which is
+        // the supported migration for exactly this shape of corpus. That is the
+        // same treatment a full (vectored) export already got, so the two
+        // import paths now agree rather than differing silently.
         let vector = match vector {
             Some(v) if !v.is_empty() => v,
             _ => {
-                // No vector in JSON — use absorb which encodes internally
-                match sys.engine.store.absorb(&content, amplitude, None) {
-                    Ok(new_id) => {
-                        // This is the path a `--slim` export takes — no vector,
-                        // so it is re-encoded here. Modality has to be applied
-                        // after absorb or it is lost on exactly the exports the
-                        // observatory consumes, which is the modality-aware
-                        // reader this fix exists for. (#553)
-                        //
-                        // `set_modality` and not `get_mut(..).modality = ..`:
-                        // modality is owned by the wavefront METADATA (flat
-                        // medium + both chiral hemispheres), and the cached
-                        // HyperMemory is rebuilt from that metadata. Mutating
-                        // the cache alone reads as working and is discarded by
-                        // the next rebuild — the round-trip still came back
-                        // `Unknown`.
-                        if want_modality != kannaka_memory::medium::types::Modality::default() {
-                            if let Some(hrm) = sys
-                                .engine
-                                .store
-                                .as_any_mut()
-                                .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
-                            {
-                                hrm.set_modality(&new_id, want_modality);
-                            }
-                        }
-                        imported += 1;
-                        continue;
-                    }
-                    Err(e) => {
+                let encoded = sys
+                    .engine
+                    .store
+                    .as_any_mut()
+                    .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                    .map(|hrm| hrm.encode_text(&content));
+                match encoded {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => {
                         if errors < 5 {
-                            eprintln!("  Error absorbing {id_str}: {e}");
+                            eprintln!("  Error encoding {id_str}: {e}");
                         }
                         errors += 1;
                         continue;
                     }
+                    // Not an HrmStore (legacy flat backend): fall back to
+                    // absorb. The id is NOT preserved on that path — it is
+                    // reported rather than hidden.
+                    None => match sys.engine.store.absorb(&content, amplitude, None) {
+                        Ok(new_id) => {
+                            if want_modality
+                                != kannaka_memory::medium::types::Modality::default()
+                            {
+                                if let Some(hrm) = sys
+                                    .engine
+                                    .store
+                                    .as_any_mut()
+                                    .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                                {
+                                    hrm.set_modality(&new_id, want_modality);
+                                }
+                            }
+                            eprintln!(
+                                "  Note: {id_str} re-absorbed on a non-HRM store; its id was not preserved"
+                            );
+                            imported += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            if errors < 5 {
+                                eprintln!("  Error absorbing {id_str}: {e}");
+                            }
+                            errors += 1;
+                            continue;
+                        }
+                    },
                 }
             }
         };
@@ -585,6 +613,11 @@ pub(crate) fn import_memories_from_file(
             .unwrap_or_default();
         mem.xi_signature = xi_sig;
 
+        // #949: the dimension-mismatch retry below must keep this record's
+        // identity too, so hold a populated copy rather than rebuilding a bare
+        // one from content alone.
+        let retry = mem.clone();
+
         match sys.engine.store.insert(mem) {
             Ok(new_id) => {
                 if want_modality != kannaka_memory::medium::types::Modality::default() {
@@ -600,20 +633,49 @@ pub(crate) fn import_memories_from_file(
                 imported += 1
             }
             Err(e) => {
-                // Dimension mismatch — fall back to absorb (re-encodes the text)
+                // A vector in the JSON that does not match this store's
+                // dimensions. Re-encode the content with the store's own
+                // pipeline and insert the SAME record — #949: the old code
+                // called `absorb` here, which minted a fresh id and dropped the
+                // one being imported, so a cross-dimension restore silently
+                // rewrote every id it touched.
                 let err_str = format!("{e}");
                 if err_str.contains("dimension mismatch") {
-                    match sys.engine.store.absorb(&content_clone, amplitude, None) {
+                    let re_encoded = sys
+                        .engine
+                        .store
+                        .as_any_mut()
+                        .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                        .map(|hrm| hrm.encode_text(&content_clone));
+                    let outcome = match re_encoded {
+                        Some(Ok(v)) => {
+                            let mut again = retry;
+                            again.vector = v;
+                            sys.engine.store.insert(again)
+                        }
+                        Some(Err(e2)) => Err(e2),
+                        // Legacy flat backend: absorb is all there is, and it
+                        // does not preserve the id. Say so rather than hide it.
+                        None => {
+                            eprintln!(
+                                "  Note: {id_str} re-absorbed on a non-HRM store; its id was not preserved"
+                            );
+                            sys.engine.store.absorb(&content_clone, amplitude, None)
+                        }
+                    };
+                    match outcome {
                         Ok(new_id) => {
-                            if want_modality != kannaka_memory::medium::types::Modality::default() {
-                                if let Some(hrm) = sys
-                                .engine
-                                .store
-                                .as_any_mut()
-                                .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                            if want_modality
+                                != kannaka_memory::medium::types::Modality::default()
                             {
-                                hrm.set_modality(&new_id, want_modality);
-                            }
+                                if let Some(hrm) = sys
+                                    .engine
+                                    .store
+                                    .as_any_mut()
+                                    .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                                {
+                                    hrm.set_modality(&new_id, want_modality);
+                                }
                             }
                             imported += 1;
                         }
@@ -666,4 +728,66 @@ pub(crate) fn handle_import(sys: &mut kannaka_memory::openclaw::KannakaMemorySys
     println!("    Skipped:  {} (duplicates)", s.skipped);
     println!("    Errors:   {}", s.errors);
     println!("    Total:    {} in file", s.total);
+}
+
+#[cfg(test)]
+mod import_id_tests {
+    use super::*;
+
+    /// #949: a record with no `vector` — the shape `export-json --slim` writes —
+    /// must keep the id it carries. The old path called `absorb`, which minted a
+    /// fresh id and threw away the one the duplicate check tests against, so
+    /// the skip could never fire: importing the same slim file twice produced
+    /// two full copies while reporting `Skipped: 0`.
+    #[test]
+    fn slim_import_preserves_ids_and_is_idempotent() {
+        let dir = std::env::temp_dir()
+            .join(format!("kannaka_import949_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let id = uuid::Uuid::parse_str("3f2b1c40-9a55-4d21-8e73-6c0af1d2b8e9").unwrap();
+        // Deliberately NO "vector" key — this is what --slim omits.
+        let slim = serde_json::json!([{
+            "id": id.to_string(),
+            "content": "the harbor beacon channel moved to twentyseven last spring",
+            "amplitude": 0.7,
+        }]);
+        let json_path = dir.join("slim.json");
+        std::fs::write(&json_path, serde_json::to_string(&slim).unwrap()).unwrap();
+        let json_path = json_path.to_str().unwrap().to_string();
+
+        let mut sys =
+            kannaka_memory::openclaw::KannakaMemorySystem::init(dir.clone()).unwrap();
+
+        let first = import_memories_from_file(&mut sys, &json_path);
+        assert_eq!(first.imported, 1, "first import must take the record");
+        assert_eq!(first.errors, 0, "no errors expected");
+
+        let ids: Vec<uuid::Uuid> = sys
+            .engine
+            .store
+            .all_memories()
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            ids.contains(&id),
+            "the imported id must be the one from the file, got {ids:?} (#949)"
+        );
+        let count_after_first = sys.engine.store.count();
+
+        // Second import of the same file: the duplicate check can only fire if
+        // the first import actually wrote that id.
+        let second = import_memories_from_file(&mut sys, &json_path);
+        assert_eq!(second.skipped, 1, "re-import must skip the duplicate (#949)");
+        assert_eq!(second.imported, 0, "re-import must add nothing (#949)");
+        assert_eq!(
+            sys.engine.store.count(),
+            count_after_first,
+            "re-import must not grow the store (#949)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
