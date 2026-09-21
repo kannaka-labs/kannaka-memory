@@ -2319,7 +2319,14 @@ fn probe_chiral_store_cost_vs_size() {
     for b in 0..6 {
         let t = Instant::now();
         for i in 0..BATCH {
-            cm.store_with_facets(&format!("probe memory {b}-{i}. it has two sentences."), 0.8, &pipeline, None).unwrap();
+            // Text that actually DECOMPOSES: `qualify` needs MIN_FACET_WORDS real
+            // alphabetic words per clause, so "probe memory 0-0." is rejected as a
+            // handle and the parent is stored alone — which is how the first run of
+            // this probe measured a facets-on path with no facets in it.
+            let text = format!(
+                "The encoder writes a stamp into the sidecar on first use {b} {i}. \n                 A later run adopts that stamp instead of refusing to open the store."
+            );
+            cm.store_with_facets(&text, 0.8, &pipeline, None).unwrap();
         }
         let per_us = t.elapsed().as_micros() / BATCH as u128;
         n += BATCH;
