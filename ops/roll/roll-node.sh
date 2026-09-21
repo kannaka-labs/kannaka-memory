@@ -32,6 +32,20 @@ UNITS=(); for u in $(systemctl list-units --type=service --state=running --no-le
 done
 say "binaries: ${BINS[*]}"; say "units on them: ${UNITS[*]:-none}"
 
+# An EMPTY unit set is not success. The filter above only sees RUNNING units, so
+# a node whose services are stopped looks identical to one that has none — and
+# the verdict at the end is `FAIL=0`, trivially true over zero units. On the
+# v0.16.9 roll O3 printed "ROLLED" having restarted nothing, because its units
+# had been stopped minutes earlier for store maintenance. Say which case it is.
+INACTIVE=()
+if [ ${#UNITS[@]} -eq 0 ]; then
+  ALL=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -iE "kannaka|grid-mind|gossipghost")
+  for u in $ALL; do
+    st=$(systemctl is-active "$u" 2>/dev/null)
+    [ "$st" != "active" ] && INACTIVE+=("$u:$st")
+  done
+fi
+
 SUDO=""; if sudo -n true 2>/dev/null; then SUDO="sudo"; fi
 if [ -z "$SUDO" ] && [ ${#UNITS[@]} -gt 0 ] && [ "$STAGE_ONLY" != "--stage-only" ]; then
   say "sudo needs a password and ${#UNITS[@]} unit(s) are active — refusing to roll blind (exit 2)."
@@ -78,4 +92,18 @@ for u in "${UNITS[@]}"; do
 done
 say "== on disk: =="; for b in "${BINS[@]}"; do V=$("$b" --version 2>/dev/null); say "  $b $(printf '%s
 ' "$V" | sed -n '1p')"; done
-[ "$FAIL" = "0" ] && say "== ROLLED $VER ==" || die "$FAIL unit(s) not on the new binary"
+if [ "$FAIL" != "0" ]; then
+  die "$FAIL unit(s) not on the new binary"
+fi
+if [ ${#UNITS[@]} -eq 0 ]; then
+  if [ ${#INACTIVE[@]} -gt 0 ]; then
+    say "!! binary replaced, but NOTHING WAS RESTARTED: no kannaka unit is running here."
+    say "!! these exist and are not active: ${INACTIVE[*]}"
+    say "!! they will come up on $VER when started — but this node is NOT serving now."
+    say "== STAGED ONLY (no running units) $VER =="
+    exit 3
+  fi
+  say "== binary replaced; this node runs no kannaka units =="
+  exit 0
+fi
+say "== ROLLED $VER =="
