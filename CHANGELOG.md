@@ -2,6 +2,91 @@
 
 ## [Unreleased]
 
+### Fixed — a stream create the broker already refused is not re-issued (#969, #996)
+
+A permissions refusal for `$JS.API.STREAM.CREATE` arrives as an async `-ERR` with
+no JetStream reply, so `ensure_js_stream` could not fail fast: it waited out
+`JS_API_TIMEOUT` (3 s) and only then errored. A connect ensures two streams, so
+every non-writer identity paid **~6 s of dead stall on every connect**, plus a
+"server error" log line per attempt that reads like a fault and is not one. On a
+node whose `swarm serve` reloads at the writer's save cadence (#563) that
+repeated every few minutes all day, and those lines were misread as the *cause*
+of the restarts during the v0.16.7 roll.
+
+The mechanism already existed and was wired to one caller: #933 records the
+broker's verdict in `Conn::stream_create_denied` and `ensure_presence_stream`
+consults it, but `ensure_js_stream` — which all seven stream helpers go through —
+did not. The flag is cleared when `reconnect()` replaces the Conn, so a genuine
+writer that reconnects still creates.
+
+### Fixed — three energy writes that did not respect `ENERGY_CAP` (#997, #999)
+
+0.16.6 capped energy "at every write", but capped the amplitude→energy
+conversions and the boost sites. Both `medium/sync.rs` coupling paths clamped to
+**10.0**, a ceiling predating `ENERGY_CAP` — and the multiplier there is a
+*peer's* energy, a value the local node did not compute. `medium/chiral.rs`
+callosal reinforcement had no ceiling at all, the only energy write in the medium
+without one.
+
+Found by measuring a live store: of 1671 memories, exactly one sat at 2.2125
+against a cap of 2.0. ⚠ That specific record is **not** attributed to these
+sites — a test for the callosal path passed with its ceiling removed, because the
+branch is gated by the callosal budget and did not fire. The remaining suspects
+are the growth and interference sites, which bound only the floor; those are the
+medium's physics and remain an open design question in #997.
+
+### Added — `content_digest`: a `.hrm` digest that ignores when the file was saved (#952, #1000)
+
+Every save stamps `Utc::now()` into the header and the trailing blake3 covers it,
+so two saves of an unchanged store a millisecond apart differ — same length,
+different checksum, identical meaning. A file hash therefore could not answer
+"did this store change", which is the cheapest integrity check there is and the
+one the encoder-flip runbook leans on ("assert the store sha changed").
+
+`content_digest` hashes the file except the 8-byte timestamp window and the
+trailing checksum. v1 and v2 share the header layout, so one window covers both.
+Deliberately does **not** make files byte-identical: #952's other option was to
+derive the timestamp from content, which answers the question by destroying the
+data.
+
+### Tests — assertions that were written down and never made
+
+A sweep driven by `unused variable` warnings in test code, which turn out to be a
+reliable marker for an assertion that went missing (#1001, #1002, #1003):
+
+- `queen.rs` `order_parameter_trust_weighted` stated "r = 1/2" in its own comment,
+  asserted only `psi`, and dropped `r` — so the zero-trust case it is named for
+  was the one it could not catch.
+- `medium/tests.rs` asserted `energy != initial || wavefront_count() == 2`. The
+  second disjunct is true by construction, so the test **could never fail**.
+- `chiral.rs` `deep_dream_only_affects_right` never checked that the right
+  hemisphere *was* affected; it passed if `dream` did nothing.
+- `chiral.rs` `callosal_kuramoto_modifies_phases` returned early on an empty left
+  hemisphere — a silent pass on the test whose subject is coupling between them.
+- `hrm_store.rs` `hrm_store_persistence` checked that content survived a reload
+  but never that the **id** did (the defect #949 fixed on the import path).
+- `consolidation.rs` `destructive_interference_weakens_memories` — plural —
+  checked one half of the pair.
+
+Two tests named for skip-link wiring, a feature that was **removed**, asserted
+only that consolidation ran; renamed to what they verify. Two git-backed tests
+were `#[ignore]`d as "requires git repo" when each builds its own repo in a
+TempDir and is hermetic — enabled, taking ignored tests 18 → 16 (#1004).
+
+### Docs — the intuition flag's documentation described a refactor that never landed (#1005, #1006)
+
+`RecallResult::intuition` documented itself as flowing through to the CLI while
+the code thirty lines below hardcodes `false` with a TODO saying it is not
+plumbed. Corrected to state what is true; the plumbing is tracked in #1005 rather
+than left as a comment.
+
+### Ops — a real scheduled task for the Windows ask responder (#995)
+
+`ops/windows/` gains `kannaka-swarm-serve.cmd` and `KannakaSwarmServe.xml`. The
+workstation's responder had no service manager — it was kept alive by a bash loop
+started from a terminal session, which would have died with it, leaving a node
+whose presence advertises `ask` with nothing answering.
+
 ## [0.16.8] — 2026-09-21
 
 ### Fixed — `swarm sync`'s presence keeps the agent's display name (#991)
