@@ -2326,10 +2326,18 @@ mod tests {
         cm.dream(true, 5);
 
         let left_energy_after = cm.left.total_energy();
+        let right_energy_after = cm.right.total_energy();
 
         // Left hemisphere energy should be UNCHANGED
         assert!((left_energy_after - left_energy_before).abs() < 0.001,
             "Deep dream should not affect left hemisphere: before={left_energy_before}, after={left_energy_after}");
+
+        // ...and the RIGHT one should be. The name promises "only affects
+        // right", but this half was captured into `right_energy_before` and
+        // never compared, so the test passed just as happily if `dream` did
+        // nothing at all. Measured on the default fixture: 1.400 -> 2.478.
+        assert!((right_energy_after - right_energy_before).abs() > 0.001,
+            "deep dream must actually change the right hemisphere: before={right_energy_before}, after={right_energy_after}");
     }
 
     #[test]
@@ -2374,9 +2382,13 @@ mod tests {
 
         cm.store("kuramoto test", 0.9, &pipeline).unwrap();
 
-        // Record phases before
-        let left_phase_before = if cm.left.count() > 0 { cm.left.phase[0] } else { return };
-        let right_phase_before = cm.right.phase[0];
+        // `store` must have populated the left hemisphere. This was an early
+        // `return` on an empty left, which made the test PASS silently on the
+        // day that stopped being true — the thing it exists to exercise.
+        assert!(
+            cm.left.count() > 0,
+            "left hemisphere is empty, so callosal coupling has nothing to couple"
+        );
 
         // Set phases apart to create coupling
         cm.left.phase[0] = 0.0;

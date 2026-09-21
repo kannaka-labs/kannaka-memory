@@ -1383,6 +1383,14 @@ mod tests {
         ];
         let (r, psi) = QueenSync::compute_order_parameter(&swarm);
         // Only agent a contributes, so r = 1/2 and psi ~ 0
+        // The comment above stated r = 1/2 and the test never checked it: `r`
+        // was computed, named in the expectation, and dropped. A regression
+        // that let the zero-trust agent contribute again would move r and
+        // leave psi near 0, so psi alone cannot see it. Measured: exactly 0.5.
+        assert!(
+            (r - 0.5).abs() < 1e-6,
+            "zero-trust agent must not contribute to magnitude: expected r = 0.5, got {r}"
+        );
         assert!(psi.abs() < 0.1, "mean phase should follow trusted agent, got {psi}");
     }
 

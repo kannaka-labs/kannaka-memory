@@ -885,8 +885,7 @@ mod tests {
         
         // Create a simple consensus case (high efficiency)
         let memory_id = Uuid::new_v4();
-        let snapshot_mem = make_test_memory(memory_id, 1.0, 0.0);
-        let snapshot = make_snapshot(vec![snapshot_mem]);
+        // (no snapshot: `resolve_single_paradox` takes only the paradox)
         
         let paradox = Paradox {
             memory_id,
