@@ -486,8 +486,42 @@ fn names_denied_stream_create(msg: &str) -> bool {
 /// this connection once, so every later create is doomed — and doomed
 /// expensively, because a permissions refusal arrives as an async `-ERR` with
 /// no JetStream reply, leaving the request to wait out `JS_API_TIMEOUT`.
+/// Has THIS PROCESS been refused `$JS.API.STREAM.CREATE` by the broker?
+///
+/// The per-connection flag was not enough, and the reason is worth recording.
+/// `swarm serve` opens FOUR independent transports (main, recall, neighbors,
+/// and the reply path), each with its own `Conn` and its own fresh flag — so
+/// there were never repeats within one connection to suppress. Each connection
+/// paid its own doomed create: on O1 that was four refusals and four
+/// JS_API_TIMEOUT stalls per serve start, measured unchanged after the
+/// per-connection guard shipped in #996.
+///
+/// The broker's verdict is about the IDENTITY, not the socket. One process
+/// connects with one set of credentials, so a refusal on any connection
+/// answers the question for all of them.
+///
+/// Deliberately not reset on reconnect: a process that was refused stays
+/// refused. If a future caller ever connects with different credentials in one
+/// process, this must become per-identity rather than per-process.
+static PROCESS_STREAM_CREATE_DENIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record the broker's refusal for the whole process (#969).
+fn note_stream_create_denied() {
+    PROCESS_STREAM_CREATE_DENIED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only: clear the process refusal. The flag is global to the test binary,
+/// so a test that sets it must put it back or it silently disables stream
+/// creation for every test that runs afterwards.
+#[cfg(test)]
+fn reset_stream_create_denied_for_test() {
+    PROCESS_STREAM_CREATE_DENIED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn should_issue_stream_create(create_denied_here: bool) -> bool {
     !create_denied_here
+        && !PROCESS_STREAM_CREATE_DENIED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether to attempt `$JS.API.STREAM.CREATE` for the PRESENCE stream (#933).
@@ -1649,6 +1683,8 @@ impl SwarmTransport {
                     // the only honest basis for not trying again.
                     if names_denied_stream_create(&m) {
                         conn.stream_create_denied = true;
+                        // ...and for every OTHER connection this process opens.
+                        note_stream_create_denied();
                     }
                     if is_auth_error(&m) {
                         fatal = true;
@@ -3775,6 +3811,36 @@ mod tests {
         assert!(!names_denied_stream_create("Unknown Protocol Operation"));
     }
 
+    /// #969 follow-up: the refusal must outlive the CONNECTION, not just the
+    /// call. `swarm serve` opens four independent transports, each with its own
+    /// `Conn` and its own fresh per-connection flag — so the guard shipped in
+    /// #996 had no repeats to suppress and O1 still paid four doomed creates and
+    /// four JS_API_TIMEOUT stalls per start, measured unchanged after the roll.
+    ///
+    /// The broker judges the identity, not the socket, so one refusal answers
+    /// for every connection this process opens.
+    #[test]
+    fn a_refusal_on_one_connection_silences_creates_on_the_next() {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_stream_create_denied_for_test();
+
+        // A fresh connection, never refused, must still try.
+        assert!(
+            should_issue_stream_create(false),
+            "control failed: an unrefused connection must attempt the create, or the assertion below proves nothing"
+        );
+
+        // The broker refuses once, on some other connection.
+        note_stream_create_denied();
+        assert!(
+            !should_issue_stream_create(false),
+            "a connection with a clean per-conn flag still issued a create after this process was refused"
+        );
+
+        reset_stream_create_denied_for_test();
+        assert!(should_issue_stream_create(false), "the test-only reset must restore the default");
+    }
     /// #969: once refused, the create never goes back on the wire.
     ///
     /// Asserted over a real socket rather than on the predicate alone, because

@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed — the stream-create refusal is remembered per PROCESS, not per connection (#969)
+
+0.16.9 claimed #996 removed "~6 s of dead stall on every connect". Verified on
+O1 after the roll, it did not: still four `Permissions Violation` lines and four
+`JS_API_TIMEOUT` stalls per `swarm serve` start, unchanged from before.
+
+The guard was not unreachable — it was scoped wrong. `swarm serve` opens **four
+independent transports** (main, recall, neighbors, reply), each with its own
+`Conn` and its own fresh `stream_create_denied` flag, so there were never
+repeats *within* a connection to suppress. Every connection paid its own first
+refusal and its own 3 s timeout.
+
+The broker judges the identity, not the socket: one process connects with one
+set of credentials, so a refusal on any connection answers for all of them. The
+refusal is now recorded process-wide. Deliberately not reset on reconnect — if a
+caller ever connects with different credentials in one process, this has to
+become per-identity instead.
+
 ## [0.16.9] — 2026-09-21
 
 ### Fixed — over-cap energy really is clamped on load now (#1008, #1009)
