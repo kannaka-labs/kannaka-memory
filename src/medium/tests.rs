@@ -2311,14 +2311,19 @@ fn probe_medium_store_cost_vs_size() {
 #[ignore = "probe: cargo test --lib probe_chiral_store_cost_vs_size -- --ignored --nocapture"]
 fn probe_chiral_store_cost_vs_size() {
     use std::time::Instant;
-    const BATCH: usize = 25;
+    // Parametrised so the range can be extended without editing this file:
+    // PROBE_BATCH x PROBE_BATCHES. The committed defaults stay small enough
+    // for an ordinary run; #978 needs the range pushed toward its own (500+),
+    // which is what the env vars are for.
+    let batch: usize = std::env::var("PROBE_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+    let batches: usize = std::env::var("PROBE_BATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
     let pipeline = make_test_pipeline();
     let mut cm = crate::medium::chiral::ChiralMedium::new();
     let mut n = 0usize;
     let mut first: Option<u128> = None;
-    for b in 0..6 {
+    for b in 0..batches {
         let t = Instant::now();
-        for i in 0..BATCH {
+        for i in 0..batch {
             // Text that actually DECOMPOSES: `qualify` needs MIN_FACET_WORDS real
             // alphabetic words per clause, so "probe memory 0-0." is rejected as a
             // handle and the parent is stored alone — which is how the first run of
@@ -2328,8 +2333,8 @@ fn probe_chiral_store_cost_vs_size() {
             );
             cm.store_with_facets(&text, 0.8, &pipeline, None).unwrap();
         }
-        let per_us = t.elapsed().as_micros() / BATCH as u128;
-        n += BATCH;
+        let per_us = t.elapsed().as_micros() / batch as u128;
+        n += batch;
         let ratio = first.map(|f| per_us as f64 / f as f64).unwrap_or(1.0);
         if first.is_none() { first = Some(per_us.max(1)); }
         println!("PROBE chiral.store_with_facets items={n} rows={} {per_us} us/item  x{ratio:.2}", cm.right.count());
