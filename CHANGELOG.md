@@ -2,7 +2,39 @@
 
 ## [Unreleased]
 
-### Fixed — the stream-create refusal is remembered per PROCESS, not per connection (#969)
+### Fixed — a reply may only go to the inbox that asked (#943, #1020)
+
+`swarm serve` emits on a stranger's behalf under an identity far more
+privileged than the caller's: `anon` may publish `KANNAKA.ask.broadcast` but is
+denied `KANNAKA.work.>`, `KANNAKA.inbox.>` and the JetStream admin subjects,
+while the daemon authenticates as `kannaka_internal`, which publishes `>`. The
+reply SUBJECT is caller-controlled input reaching that publisher.
+
+#941 closed this for the `ask` handler. #943 predicted the guard would not be
+inherited — and it had not been: `is_valid_reply_inbox` had exactly **one**
+production caller, while the `recall` and `neighbors` handlers replied to the
+same caller-supplied field with no check at all.
+
+The check now lives in `SwarmTransport::reply`, the chokepoint all twelve reply
+sites pass through, so the next handler inherits it by construction. Nothing
+legitimate is refused: every reply answers an inbound request and this client
+mints `_INBOX.<tag>.<pid>.<uuid>.<nonce>`.
+
+⚠ Defence in depth, not the fix #943 asks for — the guarantee is the code's,
+not the broker's. A second connection under an identity scoped to `_INBOX.>`
+is what makes it structural, and needs broker config rather than a commit.
+#943 stays open.
+
+### Ops — an empty unit set is not a successful roll (#1019)
+
+On the v0.16.9 roll, O3 printed `== ROLLED ==` having restarted **nothing**: its
+units had been stopped minutes earlier for store maintenance, the discovery
+filter only lists `--state=running` units, and `FAIL=0` is trivially true over
+zero of them. `roll-node.sh` now distinguishes "units exist but are down" (names
+them, exit 3) from "this host runs no kannaka units" (exit 0). Only a genuine
+roll still prints ROLLED.
+
+### Fixed — the stream-create refusal is remembered per PROCESS, not per connection (#969, #1018)
 
 0.16.9 claimed #996 removed "~6 s of dead stall on every connect". Verified on
 O1 after the roll, it did not: still four `Permissions Violation` lines and four
