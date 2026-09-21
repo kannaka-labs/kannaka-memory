@@ -618,12 +618,31 @@ impl KannakaConfig {
     /// After loading, environment variable overrides are applied.
     pub fn load() -> Self {
         let path = Self::config_path();
+        // Did config.toml literally carry `[agent] id`? A serde default cannot
+        // say — it fills in a FRESH random id and looks identical to a
+        // configured one. Without this the precedence documented below is not
+        // what the code does: the persisted file was consulted only when
+        // config.toml was ABSENT, so a config that merely omitted the key
+        // skipped "persisted file" and went straight to "generate new" (#946).
+        let mut id_came_from_config = false;
         let mut cfg = if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(text) => toml::from_str::<KannakaConfig>(&text).unwrap_or_else(|e| {
-                    eprintln!("[config] Warning: failed to parse {}: {}", path.display(), e);
-                    KannakaConfig::default()
-                }),
+                Ok(text) => {
+                    id_came_from_config = text
+                        .parse::<toml::Value>()
+                        .ok()
+                        .and_then(|v| {
+                            v.get("agent")
+                                .and_then(|a| a.get("id"))
+                                .and_then(|i| i.as_str())
+                                .map(|i| !i.trim().is_empty())
+                        })
+                        .unwrap_or(false);
+                    toml::from_str::<KannakaConfig>(&text).unwrap_or_else(|e| {
+                        eprintln!("[config] Warning: failed to parse {}: {}", path.display(), e);
+                        KannakaConfig::default()
+                    })
+                }
                 Err(e) => {
                     eprintln!("[config] Warning: failed to read {}: {}", path.display(), e);
                     KannakaConfig::default()
@@ -637,12 +656,31 @@ impl KannakaConfig {
             // on every process. Presence continuity broke, and because the
             // trusted-agents allowlist is keyed by id, such a node could never
             // match its own roster entry. (#595)
-            let mut c = KannakaConfig::default();
-            if let Some(id) = Self::legacy_agent_id() {
-                c.agent.id = id;
-            }
-            c
+            KannakaConfig::default()
         };
+        // The persisted file now applies whenever the CONFIG did not supply an
+        // id — not only when config.toml is missing. That is what makes the
+        // precedence below true rather than aspirational.
+        if !id_came_from_config {
+            match Self::legacy_agent_id() {
+                Some(id) => cfg.agent.id = id,
+                None => {
+                    // Nothing on disk names this node, so the id in hand was
+                    // just minted at random. Persist it once, so the NEXT
+                    // invocation is the same agent. Otherwise every run
+                    // publishes under a new identity and one source can
+                    // corroborate itself — the Sybil shape ADR-0039 exists to
+                    // prevent (#946). Best-effort: a read-only or unwritable
+                    // data dir keeps working, it just keeps minting.
+                    let readonly = std::env::var("KANNAKA_READONLY")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if !readonly {
+                        let _ = cfg.persist_agent_id_compat();
+                    }
+                }
+            }
+        }
         // After the file fallback, so the documented precedence holds:
         // env var > config.toml > persisted file > generate new.
         cfg.apply_env_overrides();
@@ -5040,6 +5078,73 @@ mod config_field_tests {
         }
     }
 
+    /// #946: two `remember` invocations against ONE data directory published
+    /// under two different agent ids twenty seconds apart. ADR-0039 rests on
+    /// distinct-lineage agreement, so a process that mints a new identity per
+    /// run can manufacture its own corroborating peers for free.
+    ///
+    /// Two holes, both here. A config.toml that merely OMITS `[agent] id`
+    /// skipped the persisted file entirely — the precedence comment in
+    /// `load()` says "config.toml > persisted file > generate new", and the
+    /// code only consulted the file when config.toml was absent. And a minted
+    /// id was never written down, so the next run minted another.
+    #[test]
+    fn an_unconfigured_node_keeps_one_identity_across_loads() {
+        let _lock = ID_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = IdEnvGuard::take();
+        std::env::remove_var("KANNAKA_AGENT_ID");
+
+        // (a) Nothing on disk at all: the first load must write the id down.
+        let dir = temp_data_dir("946-mint");
+        std::env::set_var("KANNAKA_DATA_DIR", &dir);
+        let first = KannakaConfig::load().agent.id;
+        let second = KannakaConfig::load().agent.id;
+        assert_eq!(
+            first, second,
+            "two loads against one data dir minted two identities — one source can corroborate itself"
+        );
+        assert!(
+            dir.join("agent_id").exists(),
+            "the minted id was never persisted, so the next process will mint another"
+        );
+
+        // (b) A config.toml that omits `[agent] id` must still honour the
+        //     persisted file rather than minting over it.
+        let dir2 = temp_data_dir("946-omitted");
+        std::env::set_var("KANNAKA_DATA_DIR", &dir2);
+        std::fs::write(dir2.join("agent_id"), "kannaka-prime").unwrap();
+        std::fs::write(
+            dir2.join("config.toml"),
+            "[agent]
+kind = \"agent\"
+
+[swarm]
+role = \"worker\"
+",
+        )
+        .unwrap();
+        assert_eq!(
+            KannakaConfig::load().agent.id,
+            "kannaka-prime",
+            "config.toml without an id skipped the persisted file and minted a new identity"
+        );
+
+        // (c) An id IN config.toml still wins over the file.
+        std::fs::write(
+            dir2.join("config.toml"),
+            "[agent]
+id = \"from-config\"
+",
+        )
+        .unwrap();
+        assert_eq!(
+            KannakaConfig::load().agent.id, "from-config",
+            "config.toml must outrank the persisted file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
     fn temp_data_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
             "kannaka-id-test-{}-{}",
