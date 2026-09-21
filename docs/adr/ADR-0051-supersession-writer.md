@@ -317,3 +317,71 @@ list before two ADRs edit that struct.
 6. **ADR-0049 amendments:** constellation-as-unit, S/A/V slots or the lexical
    restatement, retain short assertions.
 7. **L9 pre-registration, frozen**, then Stage 1, then Stage 2 gated on its numbers.
+
+---
+
+## Addendum 2026-09-21 — the gate was satisfied, and the flag measured negative
+
+Step 4 above — *"Before `KANNAKA_RECALL_TEMPORAL_EXP` is enabled anywhere"* — is now met. The
+dedup fix and the eviction exemptions landed in #992 as M9/M8/M3. This records what happened when
+the flag was then actually turned on, because the answer is **do not enable it**, and that is worth
+more in the ADR than in a benchmark file alone.
+
+### The flag could not have been measured before today
+
+`temporal_weight` decays `0.5^(age / half_life)` from `observed_at` to *now*, then clamps the
+result **up** to `TEMPORAL_SUPERSEDED_FLOOR`. That clamp binds at exactly two half-lives — 360 days
+at the default 180. On any store whose contents are older than that, **every candidate returns the
+floor**: the temporal factor becomes a constant multiplier, which cannot reorder anything. It does
+not error, and nothing reports it.
+
+That is a property of the design, not of the benchmark. Any deployment ingesting historical data —
+or simply one that sits a year without writes — silently loses temporal ranking. Lowering
+`KANNAKA_RECALL_TEMPORAL_FLOOR` does not help: it only moves the constant.
+
+`recall --at` (#994) makes recency scoreable as of a chosen instant, which is also the question an
+agent actually asks ("what did we use last March?"). It exposed a second defect in the same code:
+`age_days = (now - confirmed).max(0)` clamped a negative age to zero, so a memory observed *after*
+the scoring instant read as maximally fresh — asked about February, the system ranked a value
+adopted in May first. Now floored, matching what `effective_at` already does for facts not yet in
+force.
+
+### Measurement (kannaka-bench `temporal2-*`, longmemeval_s, k=15, n=30, MiniLM)
+
+Three arms, identical questions and stores, scored as of each question's own date:
+
+| arm | hit@15 | recall@15 | evid@15 | MRR |
+|---|---|---|---|---|
+| flag off | 1.000 | 0.950 | 0.848 | **0.9183** |
+| `exp=1.0`, half-life 180d (**shipped default**) | 1.000 | 0.950 | 0.848 | **0.9028** |
+| `exp=1.0`, half-life 3000d | 1.000 | 0.950 | 0.848 | **0.9186** |
+
+Retrieval quality is identical across all three. The flag finds nothing new and loses nothing; it
+only reorders, and only **2 of 30 questions changed at all**:
+
+```
+knowledge-update    1.000 -> 0.500   WORSE
+multi-session       0.091 -> 0.125   better
+```
+
+**The one category the feature exists for is the one it hurt.** Knowledge-update *is* the
+superseded-fact case; enabling the flag pushed the gold answer from rank 1 to rank 2 on one of the
+five. That is a single question — not evidence the flag harms the category, but not evidence it
+helps, and the opposite of the intended effect.
+
+The 3000-day arm is a consistency check rather than a candidate: once ages are days instead of
+years, that half-life makes every weight ≈1.0, so it should be indistinguishable from "off" — and
+is. Together with the 180-day arm differing under deterministic scoring on identical stores, that
+is what establishes the measurement actually exercised the factor.
+
+### Decision
+
+**The Phase 3 gate stays closed.** `KANNAKA_RECALL_TEMPORAL_EXP` remains 0.0 by default and is not
+enabled anywhere. M9/M8/M3 stay in regardless — each was written to be correct whether the flag is
+on or off, so none of them depended on the flip to be worth having.
+
+What this does **not** settle: `longmemeval_s` has five knowledge-update questions and nothing
+stamped `--supersedes`, so only a handful of rankings can move at all. A corpus built to exercise
+supersession directly — pairs where the stamped-current fact and its retired predecessor are both
+retrievable — would test the mechanism rather than test whether it perturbs an unrelated benchmark.
+That corpus is the precondition for reopening this, not another run of this one.
