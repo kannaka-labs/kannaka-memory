@@ -1169,6 +1169,24 @@ impl HrmStore {
     /// There is no "read without observation" path. If you query the medium,
     /// you change it. This is the holographic equivalent of quantum measurement.
     pub fn recall_resonance(&mut self, query: &str, top_k: usize) -> Result<Vec<Resonance>, StoreError> {
+        // ── Attention beam on the default path (#977) ─────────────────────
+        // `Medium::recall_against` has always accepted a candidate set, but
+        // only `recall_resonance_with_beam` ever passed one, so every ordinary
+        // recall scored the whole field. Dream consolidation has meanwhile been
+        // writing skip links for months — a live 1671-memory store carries
+        // 57,161 of them, every memory linked, median 22 — and nothing read
+        // one. This path seeds from the moment and walks those links, so recall
+        // scores a neighbourhood instead of the entire store.
+        //
+        // OFF by default. A beam that omits the answer is strictly worse than a
+        // full scan, and the medium already ties exact cosine on retrieval
+        // while costing 190x the latency; the flag flips when the benchmark
+        // says it should, not before.
+        if let Some(results) = self.try_beam_recall(query, top_k) {
+            self.apply_observation(&results);
+            return Ok(results);
+        }
+
         let results = self.medium.recall(query, top_k, &self.pipeline)
             .map_err(|e| StoreError::Other(format!("Resonance recall failed: {e}")))?;
 
@@ -1176,6 +1194,54 @@ impl HrmStore {
         self.apply_observation(&results);
 
         Ok(results)
+    }
+
+    /// Whether recall assembles an attention beam.
+    ///
+    /// `KANNAKA_RECALL_BEAM=1|true|on` enables it. Read per call rather than
+    /// cached so a benchmark can flip arms in-process.
+    fn beam_recall_enabled() -> bool {
+        matches!(
+            std::env::var("KANNAKA_RECALL_BEAM").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    }
+
+    /// Assemble an attention beam and score only it.
+    ///
+    /// `None` means "fall back to the dense scan" — the flag is off, the skip
+    /// graph contributed nothing, or the beam produced no hits. A beam that
+    /// silently became "no memories" would be far worse than a slow scan, so
+    /// every failure here returns to the caller's dense path rather than an
+    /// empty result.
+    ///
+    /// NOTE ON THE CHIRAL PATH: sparse recall runs against the flat medium
+    /// (which mirrors the right hemisphere), exactly as
+    /// `recall_resonance_with_beam` documents. A chiral store therefore trades
+    /// bilateral observation for sparsity — which is a real difference the
+    /// benchmark has to attribute, not a free win.
+    fn try_beam_recall(&mut self, query: &str, top_k: usize) -> Option<Vec<Resonance>> {
+        if !Self::beam_recall_enabled() {
+            return None;
+        }
+        let cfg = crate::beam::BeamConfig::from_env();
+        let beam = crate::beam::assemble(&self.memory_cache, &cfg)?;
+        let results = self.medium
+            .recall_against_ids(&beam, query, top_k, &self.pipeline)
+            .ok()?;
+        if results.is_empty() {
+            return None;
+        }
+        if std::env::var("KANNAKA_BEAM_TRACE").is_ok() {
+            eprintln!(
+                "[beam] scored {} of {} memories ({:.1}%) -> {} results",
+                beam.len(),
+                self.memory_cache.len(),
+                100.0 * beam.len() as f32 / self.memory_cache.len().max(1) as f32,
+                results.len()
+            );
+        }
+        Some(results)
     }
 
     /// Read-only resonance recall — same scoring as [`recall_resonance`] but
@@ -2775,6 +2841,18 @@ impl MediumBackend for HrmStore {
         // recall_against seam against just those indices. Falls through
         // to the full medium scan if no clusters are loaded (fresh HRM)
         // or if no cluster's theme is close enough to the query.
+        // Attention beam first (#977). This is the path the CLI, swarm, chat
+        // and attention handlers all take, so it is where "default recall"
+        // actually means something. It sits ahead of the cluster prefilter
+        // because the beam is seeded by what is present now and expanded along
+        // dream-built skip links, where the prefilter reads a static sidecar —
+        // and unlike the prefilter it also covers chiral stores, which had no
+        // sparse path at all.
+        if let Some(results) = self.try_beam_recall(query, top_k) {
+            self.apply_observation(&results);
+            return Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect());
+        }
+
         let prefilter_on = std::env::var("KANNAKA_RECALL_PREFILTER")
             .map(|v| !matches!(v.as_str(), "off" | "0" | "false"))
             .unwrap_or(true);

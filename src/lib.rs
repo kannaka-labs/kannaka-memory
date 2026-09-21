@@ -25,6 +25,8 @@ pub mod wave;
 pub mod geometry;
 #[path = "working_memory.rs"]
 pub mod attention_field;
+/// Attention beam: recency seeds expanded along dream-built skip links (#977).
+pub mod beam;
 /// Backward-compatible alias for the renamed module.
 pub use attention_field as working_memory;
 pub mod xi_operator;
