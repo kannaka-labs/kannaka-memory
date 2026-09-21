@@ -2242,7 +2242,7 @@ fn main() {
             }
         }
         "recall" => {
-            const RECALL_USAGE: &str = "Usage: kannaka recall <query> [--top-k N] [--envelope] [--collective] [--remote] [--agent-id ID] [--timeout SECS] [--nats-url URL]";
+            const RECALL_USAGE: &str = "Usage: kannaka recall <query> [--top-k N] [--at RFC3339] [--envelope] [--collective] [--remote] [--agent-id ID] [--timeout SECS] [--nats-url URL]";
             if args.len() < command_start + 2 {
                 eprintln!("{RECALL_USAGE}");
                 process::exit(1);
@@ -2250,7 +2250,22 @@ fn main() {
             // `--collective` / `--remote` (+ their `--agent-id`/`--timeout`) are
             // handled load-free in main() before the HRM init; this arm is the
             // LOCAL recall path only.
-            // `recall --batch FILE`: NDJSON {"query": "...", "top_k": 5} per line;
+            // `--at`: score temporal recency as of this instant instead of the
+            // wall clock. Without it, a store older than two half-lives (360
+            // days by default) has every candidate clamped to the superseded
+            // floor, so the temporal factor becomes a constant and ranks
+            // nothing. Only affects temporal weighting; it does not hide
+            // memories written after the given time.
+            let parse_at = |raw: &str| -> chrono::DateTime<chrono::Utc> {
+                match chrono::DateTime::parse_from_rfc3339(raw) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(e) => {
+                        eprintln!("recall: --at expects an RFC3339 timestamp (e.g. 2023-05-02T00:00:00Z): {e}");
+                        process::exit(2);
+                    }
+                }
+            };
+            // `recall --batch FILE`: NDJSON {"query": "...", "top_k": 5, "at": "..."} per line;
             // prints one JSON array per line in input order (the same shape as
             // a single recall), so a benchmark can ask hundreds of questions
             // of one loaded store without paying the process start each time.
@@ -2274,6 +2289,13 @@ fn main() {
                     };
                     let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
                     let k = obj.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                    // Per row, not per process: a benchmark asks hundreds of
+                    // questions each with its own date, and one flag for the
+                    // whole file could not express that.
+                    let _as_of = obj
+                        .get("at")
+                        .and_then(|v| v.as_str())
+                        .map(|raw| kannaka_memory::medium::hemisphere::RecallAsOf::new(parse_at(raw)));
                     match sys.recall(query, k) {
                         Ok(results) => {
                             let rows: Vec<serde_json::Value> = results
@@ -2299,6 +2321,7 @@ fn main() {
             }
             let mut top_k = 5usize;
             let mut envelope = false;
+            let mut as_of: Option<chrono::DateTime<chrono::Utc>> = None;
             let mut query_parts = Vec::new();
             let mut i = command_start + 1;
             while i < args.len() {
@@ -2316,6 +2339,10 @@ fn main() {
                     "--envelope" => {
                         envelope = true;
                         i += 1;
+                    }
+                    "--at" => {
+                        as_of = Some(parse_at(flag_value(&args, i, "--at", RECALL_USAGE)));
+                        i += 2;
                     }
                     // Accepted everywhere; local recall never touches NATS.
                     "--nats-url" => {
@@ -2336,6 +2363,7 @@ fn main() {
                 }
             }
             let query = query_parts.join(" ");
+            let _as_of = as_of.map(kannaka_memory::medium::hemisphere::RecallAsOf::new);
             match sys.recall(&query, top_k) {
                 Ok(results) => {
                     let json_results: serde_json::Value = results
