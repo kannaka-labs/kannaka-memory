@@ -1341,6 +1341,95 @@ impl HrmStore {
             .unwrap_or(true)
     }
 
+    /// Whether recall may return dream rows (#979). Default: yes, unchanged.
+    ///
+    /// A dream is a cross-cluster synthesis, not a turn, so it can never BE the
+    /// evidence a question asks for — yet it competes for the same top-k slots
+    /// and wins: rank 1 in 24 of 30 questions after ONE deep dream, taking MRR
+    /// from 0.950 to 0.529 while hit@15 held. At k=15 accuracy survived; at k=5
+    /// the same displacement is a straight accuracy loss.
+    ///
+    /// Today a caller cannot tell a dream from a memory without inspecting
+    /// metadata. `KANNAKA_RECALL_INCLUDE_DREAMS=0` lets one ask for evidence only.
+    fn recall_include_dreams() -> bool {
+        std::env::var("KANNAKA_RECALL_INCLUDE_DREAMS")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
+            .unwrap_or(true)
+    }
+
+    fn resonate_query_inner(&mut self, query: &str, top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {
+        // Try cluster prefilter first (refactor #4) — only on the flat
+        // (non-chiral) path for now. Loads the .clusters.json sidecar
+        // written by bridge::assess, picks members of clusters whose
+        // theme_vector resonates with the query, and runs the existing
+        // recall_against seam against just those indices. Falls through
+        // to the full medium scan if no clusters are loaded (fresh HRM)
+        // or if no cluster's theme is close enough to the query.
+        // Attention beam first (#977). This is the path the CLI, swarm, chat
+        // and attention handlers all take, so it is where "default recall"
+        // actually means something. It sits ahead of the cluster prefilter
+        // because the beam is seeded by what is present now and expanded along
+        // dream-built skip links, where the prefilter reads a static sidecar —
+        // and unlike the prefilter it also covers chiral stores, which had no
+        // sparse path at all.
+        if let Some(results) = self.try_beam_recall(query, top_k) {
+            self.apply_observation(&results);
+            return Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect());
+        }
+
+        let prefilter_on = std::env::var("KANNAKA_RECALL_PREFILTER")
+            .map(|v| !matches!(v.as_str(), "off" | "0" | "false"))
+            .unwrap_or(true);
+        if self.chiral.is_none() && prefilter_on {
+            if let Some(candidates) = self.cluster_prefilter_candidates(query) {
+                if !candidates.is_empty() {
+                    let resonances = self.medium.recall_against(
+                        Some(&candidates), query, top_k, &self.pipeline,
+                    ).map_err(|e| StoreError::Other(format!("prefiltered recall failed: {e}")))?;
+                    self.apply_observation(&resonances);
+                    return Ok(resonances.iter().map(|r| (r.id, r.resonance_strength)).collect());
+                }
+            }
+        }
+
+        if std::env::var("KANNAKA_RECALL_TRACE").is_ok() {
+            eprintln!("[recall-trace] resonate_query top_k={} path={}",
+                top_k, if self.chiral.is_some() { "chiral" } else { "flat" });
+        }
+        if let Some(ref chiral) = self.chiral {
+            // Chiral bilateral resonance — TODO: fold cluster prefilter
+            // into the chiral path; for v1 chiral users skip the prefilter
+            // and get the existing bilateral observation flow.
+            let results = chiral.recall(query, top_k, &self.pipeline)
+                .map_err(|e| StoreError::Other(format!("chiral recall failed: {e}")))?;
+
+            // Observation: recall reshapes the field — attention IS computation.
+            // Batched: one field-settle pass per recall, not per result.
+            let observations: Vec<(usize, f32)> = results.iter().enumerate()
+                .filter_map(|(i, r)| {
+                    self.medium.get_wavefront_index(&r.id).map(|index| {
+                        let ranking_factor = 1.0 - (i as f32 / results.len().max(1) as f32);
+                        let intensity = r.resonance_strength.abs().min(1.0).max(0.1) * ranking_factor;
+                        (index, intensity)
+                    })
+                })
+                .collect();
+            // #977: the chiral branch observes inline rather than through
+            // `apply_observation`, so it needs the same gate — otherwise the knob
+            // would silently do nothing on exactly the stores the fleet runs.
+            if Self::recall_observation_enabled() {
+                self.medium.observe_wavefronts(&observations);
+                self.mark_dirty();
+            }
+
+            Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
+        } else {
+            // Flat medium: resonance recall (always with observation)
+            let results = self.recall_resonance(query, top_k)?;
+            Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
+        }
+    }
+
     fn apply_observation(&mut self, results: &[Resonance]) {
         if results.is_empty() { return; }
         if !Self::recall_observation_enabled() { return; }
@@ -2894,76 +2983,22 @@ impl MediumBackend for HrmStore {
     }
 
     fn resonate_query(&mut self, query: &str, top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {
-        // Try cluster prefilter first (refactor #4) — only on the flat
-        // (non-chiral) path for now. Loads the .clusters.json sidecar
-        // written by bridge::assess, picks members of clusters whose
-        // theme_vector resonates with the query, and runs the existing
-        // recall_against seam against just those indices. Falls through
-        // to the full medium scan if no clusters are loaded (fresh HRM)
-        // or if no cluster's theme is close enough to the query.
-        // Attention beam first (#977). This is the path the CLI, swarm, chat
-        // and attention handlers all take, so it is where "default recall"
-        // actually means something. It sits ahead of the cluster prefilter
-        // because the beam is seeded by what is present now and expanded along
-        // dream-built skip links, where the prefilter reads a static sidecar —
-        // and unlike the prefilter it also covers chiral stores, which had no
-        // sparse path at all.
-        if let Some(results) = self.try_beam_recall(query, top_k) {
-            self.apply_observation(&results);
-            return Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect());
+        if Self::recall_include_dreams() {
+            return self.resonate_query_inner(query, top_k);
         }
-
-        let prefilter_on = std::env::var("KANNAKA_RECALL_PREFILTER")
-            .map(|v| !matches!(v.as_str(), "off" | "0" | "false"))
-            .unwrap_or(true);
-        if self.chiral.is_none() && prefilter_on {
-            if let Some(candidates) = self.cluster_prefilter_candidates(query) {
-                if !candidates.is_empty() {
-                    let resonances = self.medium.recall_against(
-                        Some(&candidates), query, top_k, &self.pipeline,
-                    ).map_err(|e| StoreError::Other(format!("prefiltered recall failed: {e}")))?;
-                    self.apply_observation(&resonances);
-                    return Ok(resonances.iter().map(|r| (r.id, r.resonance_strength)).collect());
-                }
-            }
-        }
-
-        if std::env::var("KANNAKA_RECALL_TRACE").is_ok() {
-            eprintln!("[recall-trace] resonate_query top_k={} path={}",
-                top_k, if self.chiral.is_some() { "chiral" } else { "flat" });
-        }
-        if let Some(ref chiral) = self.chiral {
-            // Chiral bilateral resonance — TODO: fold cluster prefilter
-            // into the chiral path; for v1 chiral users skip the prefilter
-            // and get the existing bilateral observation flow.
-            let results = chiral.recall(query, top_k, &self.pipeline)
-                .map_err(|e| StoreError::Other(format!("chiral recall failed: {e}")))?;
-
-            // Observation: recall reshapes the field — attention IS computation.
-            // Batched: one field-settle pass per recall, not per result.
-            let observations: Vec<(usize, f32)> = results.iter().enumerate()
-                .filter_map(|(i, r)| {
-                    self.medium.get_wavefront_index(&r.id).map(|index| {
-                        let ranking_factor = 1.0 - (i as f32 / results.len().max(1) as f32);
-                        let intensity = r.resonance_strength.abs().min(1.0).max(0.1) * ranking_factor;
-                        (index, intensity)
-                    })
-                })
-                .collect();
-            // #977: the chiral branch observes inline rather than through
-            // `apply_observation`, so it needs the same gate — otherwise the knob
-            // would silently do nothing on exactly the stores the fleet runs.
-            if Self::recall_observation_enabled() {
-                self.medium.observe_wavefronts(&observations);
-                self.mark_dirty();
-            }
-
-            Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
-        } else {
-            // Flat medium: resonance recall (always with observation)
-            let results = self.recall_resonance(query, top_k)?;
-            Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
-        }
+        // #979: a dream row can never be the evidence a question needs, and it
+        // takes a top-k slot anyway — measured at rank 1 in 24 of 30 questions,
+        // MRR 0.950 -> 0.529 after a SINGLE deep dream. Over-fetch and drop them
+        // rather than returning short: the point is to reclaim the slot, not
+        // merely to hide the row.
+        let expanded = top_k.saturating_mul(3).max(top_k.saturating_add(10));
+        let raw = self.resonate_query_inner(query, expanded)?;
+        let kept: Vec<(Uuid, f32)> = raw
+            .into_iter()
+            .filter(|(id, _)| !self.memory_cache.get(id).map(|m| m.hallucinated).unwrap_or(false))
+            .take(top_k)
+            .collect();
+        Ok(kept)
     }
 
     fn resonate_query_with_beam(
@@ -3394,6 +3429,47 @@ mod tests {
                 "chiral={chiral}: KANNAKA_RECALL_OBSERVE=0 still dirtied the store — a read is still paying for a write"
             );
         }
+    }
+    /// #979: dream rows take rank 1 in 24 of 30 bench questions and can never
+    /// be the evidence a question needs, so a caller must be able to ask for
+    /// evidence only. Default is unchanged — dreams still returned.
+    ///
+    /// The control arm is the whole test: asserting "the dream is absent" proves
+    /// nothing unless the dream DOES come back by default, on this same fixture.
+    #[test]
+    fn dreams_can_be_excluded_from_recall() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+
+        let real = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a turn that actually happened".to_string());
+        let real_id = store.insert(real).unwrap();
+        let mut dream = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a synthesis across clusters".to_string());
+        dream.hallucinated = true;
+        let dream_id = store.insert(dream).unwrap();
+        assert!(
+            store.get(&dream_id).unwrap().unwrap().hallucinated,
+            "insert did not preserve the hallucinated flag, so this test cannot mean anything"
+        );
+
+        // Control: by default the dream is returned.
+        std::env::remove_var("KANNAKA_RECALL_INCLUDE_DREAMS");
+        let with: Vec<uuid::Uuid> = store.resonate_query("a synthesis across clusters", 5)
+            .unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(
+            with.contains(&dream_id),
+            "control failed: the dream was not returned by default, so excluding it below proves nothing"
+        );
+
+        // Opt out: evidence only.
+        std::env::set_var("KANNAKA_RECALL_INCLUDE_DREAMS", "0");
+        let without: Vec<uuid::Uuid> = store.resonate_query("a synthesis across clusters", 5)
+            .unwrap().into_iter().map(|(id, _)| id).collect();
+        std::env::remove_var("KANNAKA_RECALL_INCLUDE_DREAMS");
+        assert!(!without.contains(&dream_id), "the dream row survived KANNAKA_RECALL_INCLUDE_DREAMS=0");
+        assert!(
+            without.contains(&real_id),
+            "the real memory was dropped too — the filter is removing more than dreams"
+        );
     }
     #[test]
     fn energy_is_capped_at_write_and_on_load() {
