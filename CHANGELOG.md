@@ -2,6 +2,134 @@
 
 ## [Unreleased]
 
+## [0.16.7] — 2026-09-20
+
+### Changed — a new store defaults to the semantic encoder, and refuses to be created without one (#976)
+
+The shipped default was `SimpleHashEncoder`: no semantics, no warning. On
+LongMemEval-S the same medium scored hit@k 0.53 with it and 0.93 with all-minilm
+(kannaka-bench), so every store a new user created started useless for recall and
+nothing ever said so. `[encoder] kind` now defaults to `ollama` (all-minilm, 384d).
+
+**An existing store needs nothing.** The `.encoder` stamp a store was written with
+is now *adopted* when the caller has not explicitly set `KANNAKA_ENCODER`: reading
+vectors with the encoder that wrote them is always the safe direction, and it is
+what the guard exists to protect. An explicit selection that disagrees with the
+stamp still refuses, as before. Every node of this fleet was checked before the
+release — all six stamped, so all six adopt and only the one already running an
+embedder needs one.
+
+**A store with no stamp, on a host with no embedder, will now refuse to start
+(exit 2).** An unstamped directory is indistinguishable from a new one, and a new
+store quietly falling back to hash is the exact failure this change exists to
+prevent — but the message says "refusing to create a new store" even where the
+store is old and simply predates the sidecar. If that is you: stamp it with what
+wrote it (`printf 'hash:384:42' > <data_dir>/.encoder`), or pass
+`KANNAKA_ENCODER=hash` to choose the fallback deliberately.
+
+### Added — `remember --batch` and `recall --batch`: NDJSON in, NDJSON out, one process (#973, #974)
+
+Loading thousands of memories through the single-item CLI cost ~600 ms per spawn
+(the encoder loads every time), which turns a 250k ingest into a two-day job;
+`import` takes full wavefront records only. Both subcommands now read NDJSON and
+emit one line per line in, in order.
+
+Two quadratic costs were found and removed while measuring it. Every insert
+flushed the whole medium and its sidecars twice, and `HrmStore::absorb` rebuilt
+the entire memory cache after each one — 300 items took 447 s, at 4.2 s per item
+by the end. `set_auto_save(false)` plus `begin_bulk()`/`end_bulk()` make a bulk
+load linear; the medium stays complete throughout and recall reads the medium, so
+only cache-backed views (`get`, `stats`, exact-repeat detection) lag until the
+batch ends. Single-item `remember` is unchanged, and a batch never publishes to
+NATS — a bulk load is a local act.
+
+### Added — `KANNAKA_RECALL_XI_BOOST=off` makes the xi reranker measurable (#975)
+
+On LongMemEval-S with the same MiniLM embeddings as an exact-cosine baseline, the
+medium found the evidence session less often (0.78 vs 0.94 hit@5). Tracing a miss:
+raw right-hemisphere resonance ranked like cosine, then the xi-diversity reranker
+lifted candidates above 0.15 cosine with a repelling xi-signature by up to 1.8x
+while the gold turn, whose xi did not repel, kept its raw score — a rank inversion.
+There was no way to measure the medium without that reranker; now there is.
+Default on, shipped behaviour unchanged.
+
+### Added — the mail membrane, first slice (ADR-0062) (#972)
+
+`membrane.py` polls every agent mailbox over loopback IMAP and publishes each new
+message once to `KANNAKA.mail.<slug>.inbound` with the ADR-0062 §4 payload (auth
+verdict first, untrusted text last). The UID watermark advances only after the
+PubAck, and a content-derived `Nats-Msg-Id` makes retries idempotent. Proven
+2026-09-17: Zoho to bus in 10 s. Not included: the ADR's 451 receiver, consumers,
+outbound.
+
+### Fixed — `swarm sync` publishes presence, and a deliberate `swarm serve` reload exits 0 (#970)
+
+`swarm sync` only ever published `QUEEN.phase`, while the witness loop joins once
+at startup and then ticks `sync` every 5 min believing it refreshed presence — so
+`kannaka-witness-01`'s presence row aged out minutes after every restart while the
+loop went on hearing every tick, and the roster showed it dead. `sync` now
+publishes the presence heartbeat as well, before the Kuramoto step so the coupled
+phase still lands last. `joined_at` is the true session start when the caller
+exports `KANNAKA_SESSION_JOINED_AT` once; a value that does not parse as RFC 3339
+is treated as unset rather than published.
+
+`swarm serve` reloads by exiting whenever the HRM changes on disk (#563) and exited
+with status 1, so on a node whose writer saves every few minutes systemd recorded
+`Failed with result 'exit-code'` on every reload — 44 "failures" in three hours,
+all this one line. Every fleet unit is `Restart=always`, so the status carried no
+information except the wrong one. Real errors in that handler still exit 1.
+
+### Fixed — `import` preserves the id on both paths that used to discard it (#949)
+
+`import` skips a record whose id is already in the store, but for a record with no
+`vector` that skip could never fire: the branch called `absorb`, which mints a
+fresh id. So a `--slim` export could not be round-tripped without rewriting every
+id, and importing the same slim file twice produced two full copies while
+reporting `Skipped: 0`. The dimension-mismatch retry did the same thing. Both now
+encode through the store's own pipeline and take the identity-preserving `insert`.
+
+Behaviour change, stated rather than buried: `absorb` also ran ADR-0049 facet
+decomposition and `insert` does not, so a slim import no longer mints facets
+inline — run `kannaka facets backfill --apply` afterwards. A full export already
+behaved this way, so the two paths now agree instead of differing silently. On a
+legacy flat backend there is no id-preserving path at all; that case still absorbs
+and now says so.
+
+### Fixed — `backfill_all_facets` rebuilds the memory cache (#947)
+
+It minted facet rows into the medium but left `memory_cache` holding only the
+pre-sweep rows, so `all_memories()` and `all_ids()` returned none of the facets it
+had just created until the store was next loaded. Nothing was lost or corrupted —
+an invisible row is also not processed by anything downstream — which is why it
+went unnoticed. Its two siblings both rebuild after mutating; this one now does
+too, reporting a rebuild failure through the `stats.errors` channel it already has.
+
+### Fixed — `ChiralMedium::save` writes its two maps in key order (#952)
+
+`scales` and `left_to_right` are `HashMap`s, and `RandomState` randomises iteration
+order per instance, so a store saved, loaded and saved again emitted the same pairs
+in a different order: same length, different blake3, identical semantics. A
+checksum could not answer "did this store change". Both are now sorted by key
+before bincode; the loader collects back into `HashMap`s, so this is a pure
+serialization change and existing files load unchanged. Note that sorting alone
+does **not** make saves byte-identical — the v2 header carries a wall-clock
+timestamp that the trailing checksum covers — so #952 stays open for that decision.
+
+### Changed — the KAX corpus attributes replies to the brain that wrote them (#971)
+
+The reader took `generated_by` from `reply["model"]` and fell back to
+`agent-brain`, but replies never carried a model until kax-computer #29, so every
+KAX exchange — including the open-weight machines' — read as Claude. It now prefers
+the reply's own model, then the mirror's `brains.json`. On today's mirror: 135
+replies, 99 Claude / 36 open-weight.
+
+### Ops — the fleet roll scripts live in the repo (#968)
+
+`roll-node.sh` and `roll-o1.sh` lived in session scratchpads for v0.16.3 and
+v0.16.4 and were gone by v0.16.6, which had to reconstruct one from notes. Both are
+now committed under `ops/roll/` with a README stating the order that has worked and
+the trap each script encodes.
+
 ## [0.16.6] — 2026-09-16
 
 ### Changed — recall ranks by similarity alone, and energy is capped at every write (#965, #966)
