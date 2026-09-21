@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+## [0.16.8] — 2026-09-21
+
+### Fixed — `swarm sync`'s presence keeps the agent's display name (#991)
+
+0.16.7 taught `swarm sync` to publish presence (#970) and passed `""` as the
+display name. `swarm_publish_heartbeat` maps an empty string to `None` for the
+*phase* payload, which is why it read as safe — but the *presence* record embeds
+the string as given, so every tick overwrote the label `swarm join` had published
+at startup and consumers rendered the agent nameless. It now publishes
+`config.agent.display_name`, with `join`'s own fallback to the agent id.
+
+Found by verifying the 0.16.7 roll rather than by review: the witness's roster row
+came back alive — 21 s since last seen, down from 60,987 — and unnamed.
+
+### Fixed — ADR-0051 Phase 3 preconditions: dedup, supersession retention, `swarm brief` (#992)
+
+Three fixes the Phase 3 review gates `KANNAKA_RECALL_TEMPORAL_EXP` on, each
+written to be correct whether that flag is on or off.
+
+**A dedup recall must not score temporally (M9).** The autoabsorb dedup recall is
+an admission gate, not a ranking. With the temporal factor live, stamping a local
+memory as superseded lowered its own resonance *there*, dropped it under the
+threshold, and re-admitted the peer's copy of the stale text with a fresh
+`created_at` that reads as maximally recent — resurrecting the value the stamp had
+just retired. `SuppressTemporalScoring` is an RAII guard around that recall which
+restores the previous value on drop, so nesting, an early return or a panic cannot
+leave scoring suppressed process-wide.
+
+**A supersession record survives reclamation (M8).** An expired memory is not
+stale garbage; it is the record that a fact changed, and the only thing that can
+answer "what did we use before". The size cap now exempts it the way it exempts
+Pinned, bounded by `KANNAKA_EXPIRED_RETENTION_DAYS`, so the past becomes
+reclaimable by policy rather than by accident. Triage also no longer collapses a
+supersession pair as a duplicate — it kept whichever carried more amplitude,
+usually the older, more-accessed fact, the one that is no longer true.
+
+**`swarm brief` demotes instead of dropping (M3).** The filter removed a
+superseded memory from the brief entirely, unconditionally, while the ranking-side
+temporal factor was off — so `--supersedes X` produced no visible demotion
+anywhere and total invisibility on the one surface an operator reads, making a
+false supersession both silent and unrecoverable. It is now multiplied by the same
+floor the ranking path uses, via `temporal::brief_confidence`.
+
+Ten tests, each asserting the hazard rather than the happy path, verified by
+mutation: neutralizing all four behaviours fails 7 of 10, and the 3 survivors are
+the 3 that should. That pass caught two of its own tests being vacuous — the M9
+pair asserted the flag was 0.0 with the env unset, where the default is already
+0.0, and an `assert_eq!` inside a `catch_unwind` closure made a test pass
+precisely when suppression was broken.
+
 ### Added — `[llm] timeout_secs`: the LLM request timeout is configurable (#904, #987)
 
 `src/agent.rs` hard-coded `.timeout(Duration::from_secs(300))` at four call sites
