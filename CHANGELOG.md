@@ -2,7 +2,50 @@
 
 ## [Unreleased]
 
+### Added — `[llm] timeout_secs`: the LLM request timeout is configurable (#904, #987)
+
+`src/agent.rs` hard-coded `.timeout(Duration::from_secs(300))` at four call sites
+with no key to change it. A ~2.6k-token ask through `swarm serve` against
+`kannaka-brain` measures 233 s idle and 314 s under load, so legitimate asks were
+timing out and the only workaround lived on the caller's side — the server had no
+say in its own timeout.
+
+`AnthropicClient`, `OllamaClient` and `OpenAIClient` each carry a `timeout` now,
+overridable with a chainable `with_timeout_secs`, and `client_from_config` threads
+`cfg.llm.timeout_secs` through at build time. **The default is the old constant,
+so an unset key changes nothing.**
+
+### Fixed — the facet flag guard restores `KANNAKA_FACET_DECOMPOSE` on drop (#942, #986)
+
+`lock_decompose_flag()` serialized the mutating tests against each other and did
+nothing more, and a `MutexGuard` does not survive a panic. A test that set the
+flag and panicked before its own `remove_var` left it **on process-wide**, and the
+next test to read it through `decompose_enabled()` — which does not take the lock
+— saw a stale value it never set. One failure became a cascade blamed on innocent
+tests.
+
+The guard now snapshots the flag at lock time and restores it on drop, so a green
+run is the property rather than a scheduling outcome.
+
 ## [0.16.7] — 2026-09-20
+
+### Added — an attention beam over the skip-link graph: measured, and shipped off (#988)
+
+Dream consolidation had been writing skip links for months and nothing ever read
+one. On a live 1,671-memory store that is **57,161 links, every memory carrying at
+least one, median 22 each** — a graph rebuilt every night and driven on never.
+`Medium::recall_against` always accepted a candidate set, but only
+`recall_resonance_with_beam` ever passed one, so an ordinary recall scored the
+whole field.
+
+This adds the missing half: seed from the moment, walk the links outward, score
+the neighbourhood. It is wired into `resonate_query` — the path the CLI, swarm,
+chat and attention handlers actually take — behind `KANNAKA_RECALL_BEAM`, with a
+dense fallback so a thin beam can never degrade into "no memories".
+
+**It defaults off because it did not win.** The measurement is the deliverable
+here rather than the feature; the traced run is recorded in the kannaka-bench
+manifest.
 
 ### Changed — a new store defaults to the semantic encoder, and refuses to be created without one (#976)
 
