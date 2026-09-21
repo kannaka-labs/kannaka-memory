@@ -3136,7 +3136,36 @@ impl SwarmTransport {
 
     /// Publish a reply to the given reply-to subject. Used by `swarm serve`
     /// after handling an ask.
+    /// Answer an inbound request on ITS OWN inbox, and nowhere else (#943).
+    ///
+    /// A serving daemon emits on a stranger's behalf under an identity far more
+    /// privileged than the caller's: `anon` may publish `KANNAKA.ask.broadcast`
+    /// but is denied `KANNAKA.work.>`, `KANNAKA.inbox.>` and the JetStream admin
+    /// subjects, while the daemon authenticates as `kannaka_internal`, which
+    /// publishes `>`. So the reply SUBJECT is caller-controlled input reaching a
+    /// privileged publisher, and a reply to an arbitrary subject is a reflection
+    /// primitive.
+    ///
+    /// #941 closed that for the `ask` handler by checking `reply_to` there.
+    /// #943 predicted the shape would not be inherited, and it was not: the
+    /// `recall` and `neighbors` handlers reply to a caller-supplied subject with
+    /// no check, and `is_valid_reply_inbox` had exactly ONE production caller.
+    ///
+    /// The check lives here now so it cannot be forgotten by the next handler.
+    /// Every reply in the tree answers an inbound request, and this client mints
+    /// `_INBOX.<tag>.<pid>.<uuid>.<nonce>`, so nothing legitimate is refused.
+    ///
+    /// This is defence in depth, NOT the fix #943 asks for: the guarantee is
+    /// still the code's, not the broker's. A second connection under an identity
+    /// scoped to `_INBOX.>` is what makes it structural, and that needs broker
+    /// config rather than a commit.
     pub fn reply(&self, reply_to: &str, payload: &[u8]) -> Result<(), NatsError> {
+        if !crate::serve_guard::is_valid_reply_inbox(reply_to) {
+            return Err(NatsError::Protocol(format!(
+                "refusing to reply to a non-inbox subject: {}",
+                crate::sanitize_display(reply_to)
+            )));
+        }
         self.publish_raw(reply_to, payload)
     }
 
@@ -3811,6 +3840,68 @@ mod tests {
         assert!(!names_denied_stream_create("Unknown Protocol Operation"));
     }
 
+    /// #943: the reply subject is caller-controlled input reaching a privileged
+    /// publisher. #941 checked it in the `ask` handler; `recall` and `neighbors`
+    /// reply to the same caller-supplied field and never did — `is_valid_reply_inbox`
+    /// had ONE production caller. The check belongs at the chokepoint.
+    ///
+    /// Driven through `reply()` against a fake broker, so it proves the transport
+    /// refuses, not that a predicate returns false.
+    #[test]
+    fn reply_refuses_a_subject_that_is_not_an_inbox() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let broker = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let _ = sock.write_all(b"INFO {\"server_id\":\"fake\",\"proto\":1,\"max_payload\":1048576}
+");
+            let _ = sock.flush();
+            let mut reader = BufReader::new(sock.try_clone().expect("clone"));
+            let mut line = String::new();
+            for _ in 0..4 {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+                if line.starts_with("PING") {
+                    let _ = sock.write_all(b"PONG
+");
+                    let _ = sock.flush();
+                    break;
+                }
+            }
+            // Keep draining: a broker that stops reading desyncs the client on
+            // its next write, and the control arm below would then fail for a
+            // reason that has nothing to do with the guard under test.
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+            }
+        });
+        let transport = SwarmTransport::connect(&format!("nats://{addr}")).expect("handshake");
+
+        // Control: a real inbox is accepted, or the refusals below prove nothing.
+        // Control: a real inbox must be ACCEPTED, or the refusals below would
+        // pass even if reply() refused everything.
+        assert!(
+            transport.reply("_INBOX.t.1.abc.99", b"ok").is_ok(),
+            "control failed: a legitimate _INBOX reply was refused"
+        );
+
+        for bad in [
+            "KANNAKA.work.steal",      // a subject anon is explicitly denied
+            "$JS.API.STREAM.DELETE.X", // JetStream admin
+            "_INBOX.",                 // prefix with no inbox
+            "_INBOX.a b",              // whitespace
+            "_INBOX.>",                // wildcard: every inbox at once
+        ] {
+            let err = transport.reply(bad, b"x").expect_err("must refuse");
+            assert!(
+                err.to_string().contains("non-inbox subject"),
+                "refused for the wrong reason on {bad}: {err}"
+            );
+        }
+        drop(transport);
+        drop(broker);
+    }
     /// #969 follow-up: the refusal must outlive the CONNECTION, not just the
     /// call. `swarm serve` opens four independent transports, each with its own
     /// `Conn` and its own fresh per-connection flag — so the guard shipped in
