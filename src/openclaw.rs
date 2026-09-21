@@ -185,12 +185,23 @@ pub struct RecallResult {
     /// doesn't require a breaking API change.
     pub similarity: f32,
     pub strength: f32,
-    /// True when the chiral right-hemisphere surfaced this memory
+    /// Intended: true when the chiral right hemisphere surfaced this memory
     /// without a left-hemisphere match — the "intuition" channel from
-    /// `medium::chiral::recall`. Pre-refactor this flag was computed
-    /// at the chiral seam, then dropped at the trait boundary; now it
-    /// flows through to the CLI so callers can distinguish analytical
-    /// recall (left) from associative recall (right).
+    /// `medium::chiral::recall`.
+    ///
+    /// ⚠ ALWAYS FALSE TODAY. This doc used to claim the flag "flows through
+    /// to the CLI so callers can distinguish analytical recall (left) from
+    /// associative recall (right)", while the code thirty lines below
+    /// hardcodes `intuition: false` with a TODO saying it is NOT plumbed —
+    /// the documentation described a refactor that never landed. The value
+    /// really is computed (`hemisphere.rs`: `is_intuition: hand == Hand::Right`)
+    /// and really is dropped, at `resonate_query`, whose return type is
+    /// `Vec<(Uuid, f32)>` and has nowhere to carry it.
+    ///
+    /// Inert rather than wrong-in-the-output: `RecallResult` derives only
+    /// Debug + Clone, so this never reaches JSON or a user. Tracked as an
+    /// issue rather than left as a comment — a deferred intention that lives
+    /// only in source is one nobody finds.
     pub intuition: bool,
     pub age_hours: f64,
     pub layer: u8,
