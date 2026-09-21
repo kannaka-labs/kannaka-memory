@@ -94,6 +94,26 @@ pub fn effective_confidence(spec: &TemporalSpec, now: DateTime<Utc>) -> f32 {
     }
 }
 
+/// Confidence for a brief item, demoting rather than hiding a superseded one.
+///
+/// ADR-0051 M3. `swarm brief` used to DROP a memory that was not true now,
+/// unconditionally and on the default config — while the ranking-side temporal
+/// factor was off. So `--supersedes X` produced no visible demotion anywhere
+/// and total invisibility on the one surface an operator reads, which made a
+/// false supersession both silent and unrecoverable.
+///
+/// A superseded fact must stay answerable ("what did we use before?") while
+/// ranking below anything still true, so this multiplies by the same floor the
+/// ranking path uses rather than zeroing.
+pub fn brief_confidence(base: f32, current: bool, floor: f32) -> f32 {
+    let b = base.clamp(0.0, 1.0);
+    if current {
+        b
+    } else {
+        (b * floor.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +171,37 @@ mod tests {
         let mut s = spec(0.7, now - Duration::days(2));
         s.expires_at = Some(now);
         assert_eq!(temporal_status(&s, now), TemporalStatus::Expired);
+    }
+}
+
+#[cfg(test)]
+mod brief_confidence_tests {
+    use super::brief_confidence;
+
+    #[test]
+    fn a_current_item_is_untouched() {
+        assert_eq!(brief_confidence(0.8, true, 0.25), 0.8);
+    }
+
+    #[test]
+    fn a_superseded_item_is_demoted_but_never_erased() {
+        let c = brief_confidence(0.8, false, 0.25);
+        assert!(c < 0.8, "must rank below anything still true");
+        assert!(
+            c > 0.0,
+            "must stay answerable — dropping it is what made a false supersession \
+             invisible and unrecoverable"
+        );
+        assert!((c - 0.2).abs() < 1e-6, "0.8 * 0.25");
+    }
+
+    #[test]
+    fn a_superseded_item_always_ranks_below_an_equal_current_one() {
+        for base in [0.1f32, 0.5, 0.9, 1.0] {
+            assert!(
+                brief_confidence(base, false, 0.25) < brief_confidence(base, true, 0.25),
+                "ordering must hold across the range, base={base}"
+            );
+        }
     }
 }

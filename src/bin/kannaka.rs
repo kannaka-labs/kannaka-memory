@@ -4412,20 +4412,40 @@ fn main() {
                             // Memories with no temporal bounds read as Current
                             // (unchanged behavior).
                             let now = chrono::Utc::now();
+                            // ADR-0051 M3: DEMOTE, do not drop.
+                            //
+                            // This filter used to remove a superseded memory from
+                            // the brief entirely, unconditionally, on the default
+                            // config — while the ranking-side temporal factor was
+                            // off. So `--supersedes X` produced zero demotion
+                            // anywhere an operator could see, and total INVISIBILITY
+                            // on the one surface they actually read. A false
+                            // supersession was therefore unrecoverable and silent.
+                            //
+                            // Multiplying by the same floor the ranking path uses
+                            // keeps the item answerable ("what did we use before?")
+                            // while ranking it below anything still true.
+                            let floor =
+                                kannaka_memory::medium::hemisphere::recall_temporal_floor();
                             let known: Vec<kannaka_memory::sensemaking::ConsensusItem> = results
                                 .iter()
-                                .filter(|r| match sys.engine.store.get(&r.id) {
-                                    Ok(Some(m)) => kannaka_memory::temporal::is_current(
-                                        &kannaka_memory::temporal::TemporalSpec::from_memory(&m),
-                                        now,
-                                    ),
-                                    _ => true,
-                                })
-                                .map(|r| kannaka_memory::sensemaking::ConsensusItem {
-                                    content: r.content.clone(),
-                                    support: 1,
-                                    confidence: (r.similarity * r.strength).clamp(0.0, 1.0),
-                                    mean_similarity: r.similarity,
+                                .map(|r| {
+                                    let current = match sys.engine.store.get(&r.id) {
+                                        Ok(Some(m)) => kannaka_memory::temporal::is_current(
+                                            &kannaka_memory::temporal::TemporalSpec::from_memory(&m),
+                                            now,
+                                        ),
+                                        _ => true,
+                                    };
+                                    let base = (r.similarity * r.strength).clamp(0.0, 1.0);
+                                    kannaka_memory::sensemaking::ConsensusItem {
+                                        content: r.content.clone(),
+                                        support: 1,
+                                        confidence: kannaka_memory::temporal::brief_confidence(
+                                            base, current, floor,
+                                        ),
+                                        mean_similarity: r.similarity,
+                                    }
                                 })
                                 .collect();
                             let brief = kannaka_memory::sensemaking::compose_brief(

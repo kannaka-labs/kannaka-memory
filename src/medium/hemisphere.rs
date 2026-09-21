@@ -74,12 +74,59 @@ pub fn recall_energy_exp() -> f32 {
 /// entirely (the multiply is skipped, not computed as `^0`), `t = 1.0` applies
 /// it at full strength.
 pub fn recall_temporal_exp() -> f32 {
+    // ADR-0051 M9: a caller doing DEDUPLICATION must score with the temporal
+    // factor OFF. Stamping a local memory as superseded lowers its own
+    // resonance, which would lower its dedup score, which would WIDEN the
+    // admission window that dedup exists to close — letting a peer's copy of
+    // the stale text back in with a fresh `created_at` that reads as maximally
+    // recent, out-ranking the truth it was supposed to have replaced.
+    //
+    // A process flag rather than a threaded parameter, matching the existing
+    // BULK_MODE pattern in hrm_store: the alternative is four layers of
+    // plumbing through a trait boundary for a scope that is always short and
+    // synchronous.
+    if TEMPORAL_SCORING_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0.0;
+    }
     std::env::var("KANNAKA_RECALL_TEMPORAL_EXP")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|e: &f32| e.is_finite())
         .map(|e: f32| e.clamp(0.0, 1.0))
         .unwrap_or(0.0)
+}
+
+/// Set while a dedup-style recall is in flight; see [`SuppressTemporalScoring`].
+static TEMPORAL_SCORING_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII guard forcing [`recall_temporal_exp`] to 0.0 for its lifetime.
+///
+/// Hold this around any recall whose result gates an ADMISSION decision —
+/// deduplication, novelty, "do we already have this". Ranking recalls must NOT
+/// use it: discounting a superseded fact is the entire point there.
+///
+/// Restores the previous value on drop, so nesting is safe and an early return
+/// or a panic cannot leave scoring suppressed for the rest of the process.
+pub struct SuppressTemporalScoring(bool);
+
+impl SuppressTemporalScoring {
+    pub fn new() -> Self {
+        let prev = TEMPORAL_SCORING_SUPPRESSED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        Self(prev)
+    }
+}
+
+impl Default for SuppressTemporalScoring {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SuppressTemporalScoring {
+    fn drop(&mut self) {
+        TEMPORAL_SCORING_SUPPRESSED.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Half-life in days for confirmation-recency decay
@@ -1031,6 +1078,8 @@ mod tests {
     /// (1.0) must preserve today's similarity*energy ordering exactly.
     #[test]
     fn energy_neutral_ranking_surfaces_cold_target() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let mut h = Hemisphere::new(Hand::Left, 64);
 
         // Cold target: the query IS this vector (similarity ~1.0), baseline energy.
@@ -1075,6 +1124,8 @@ mod tests {
     /// superseded fact stays RETRIEVABLE (demoted, never evicted).
     #[test]
     fn temporal_ranking_prefers_the_confirmed_fact_without_losing_the_past() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         use chrono::{Duration, Utc};
 
         let mut h = Hemisphere::new(Hand::Left, 64);
@@ -1121,6 +1172,114 @@ mod tests {
         assert!(
             temporal.iter().any(|r| r.id == old_id),
             "superseded fact must remain retrievable, not be evicted (L8 P3)"
+        );
+    }
+
+    /// `SuppressTemporalScoring` flips a PROCESS-GLOBAL atomic, and the two
+    /// ranking tests above read the same global through `resonate()`. Without
+    /// this lock a guard held in one test silently zeroes the temporal factor
+    /// in another running beside it — a failure that would look like a ranking
+    /// bug and reproduce only under `--test-threads` > 1.
+    static TEMPORAL_SCORING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ── ADR-0051 M9: the dedup guard ─────────────────────────────────────
+    //
+    // The hazard is not "the number is wrong" — it is that a suppression
+    // leaking past its scope would silently turn off temporal ranking for the
+    // rest of the process, with nothing failing to announce it.
+
+    /// The flag's DEFAULT is 0.0, so a guard test run with the env var unset
+    /// would assert `0.0 == 0.0` and hold whether or not the guard did
+    /// anything. Every test below turns the flag ON first: suppression is only
+    /// observable against a non-zero baseline.
+    const LIVE_EXP: &str = "0.6";
+
+    /// Sets the flag for one test and removes it after, so a suppression test
+    /// cannot leak an ENABLED flag into the rest of the suite.
+    struct LiveTemporalFlag;
+
+    impl LiveTemporalFlag {
+        fn new() -> Self {
+            std::env::set_var("KANNAKA_RECALL_TEMPORAL_EXP", LIVE_EXP);
+            Self
+        }
+    }
+
+    impl Drop for LiveTemporalFlag {
+        fn drop(&mut self) {
+            std::env::remove_var("KANNAKA_RECALL_TEMPORAL_EXP");
+        }
+    }
+
+    #[test]
+    fn suppress_guard_forces_zero_and_restores_on_drop() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _flag = LiveTemporalFlag::new();
+
+        let before = recall_temporal_exp();
+        assert_eq!(before, 0.6, "baseline must be non-zero or the test proves nothing");
+        {
+            let _g = SuppressTemporalScoring::new();
+            assert_eq!(recall_temporal_exp(), 0.0, "suppressed inside the scope");
+        }
+        assert_eq!(
+            recall_temporal_exp(),
+            before,
+            "the previous value must come back — a leak silently disables temporal \
+             ranking for every later recall in the process"
+        );
+    }
+
+    #[test]
+    fn suppress_guard_nests_without_the_inner_scope_re_enabling() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _flag = LiveTemporalFlag::new();
+        assert_eq!(recall_temporal_exp(), 0.6, "baseline must be non-zero");
+
+        let _outer = SuppressTemporalScoring::new();
+        {
+            let _inner = SuppressTemporalScoring::new();
+            assert_eq!(recall_temporal_exp(), 0.0);
+        }
+        // The inner guard restores what it FOUND (suppressed), not the default.
+        assert_eq!(
+            recall_temporal_exp(),
+            0.0,
+            "an inner scope ending must not re-enable scoring the outer one suppressed"
+        );
+    }
+
+    #[test]
+    fn suppress_guard_restores_even_when_the_scope_unwinds() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _flag = LiveTemporalFlag::new();
+
+        let before = recall_temporal_exp();
+        assert_eq!(before, 0.6, "baseline must be non-zero");
+
+        // Record what the guard was doing, THEN panic. Asserting inside the
+        // closure instead would make the test self-satisfying: a failed
+        // assertion is itself a panic, so `r.is_err()` would hold precisely
+        // when suppression was broken. (Caught by mutating the guard away —
+        // this test passed while the other two failed.)
+        let inside = std::sync::atomic::AtomicU32::new(u32::MAX);
+        let r = std::panic::catch_unwind(|| {
+            let _g = SuppressTemporalScoring::new();
+            inside.store(recall_temporal_exp().to_bits(), std::sync::atomic::Ordering::Relaxed);
+            panic!("dedup blew up mid-recall");
+        });
+        assert!(r.is_err(), "the panic is the point of the test");
+        assert_eq!(
+            f32::from_bits(inside.load(std::sync::atomic::Ordering::Relaxed)),
+            0.0,
+            "the guard must have been suppressing when the panic happened, or the \
+             restore below proves nothing"
+        );
+        assert_eq!(
+            recall_temporal_exp(),
+            before,
+            "Drop must run on unwind — otherwise one failed dedup disables temporal \
+             ranking permanently"
         );
     }
 

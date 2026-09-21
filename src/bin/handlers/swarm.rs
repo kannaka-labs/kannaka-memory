@@ -1912,7 +1912,18 @@ pub(crate) fn handle_swarm_autoabsorb(
 
         // Local resonance — only absorb if the medium DOESN'T already have
         // strong resonance (i.e. it's novel material).
-        let res = sys.recall(content, 1).ok().unwrap_or_default();
+        //
+        // ADR-0051 M9: scored with the temporal factor SUPPRESSED. This recall
+        // is an admission gate, not a ranking. With the factor live, stamping a
+        // local memory as superseded would lower its own resonance here, drop
+        // it under `threshold`, and re-admit the peer's copy of the stale text
+        // with a fresh `created_at` — resurrecting exactly the value the stamp
+        // retired. Guard dropped immediately after the call.
+        let res = {
+            let _no_temporal =
+                kannaka_memory::medium::hemisphere::SuppressTemporalScoring::new();
+            sys.recall(content, 1).ok().unwrap_or_default()
+        };
         let top_strength = res.first().map(|r| r.strength).unwrap_or(0.0);
         if top_strength >= threshold {
             skipped_resonant += 1;

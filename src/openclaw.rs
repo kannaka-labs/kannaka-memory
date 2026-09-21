@@ -1567,8 +1567,15 @@ impl KannakaMemorySystem {
                 let age_hours = now.signed_duration_since(m.created_at).num_hours();
                 let old_enough = age_hours >= p.min_age_hours;
                 let low_value = m.amplitude < p.min_amplitude;
+                // ADR-0051 M8: two near-identical memories where exactly one is
+                // expired are a SUPERSESSION RECORD, not a duplicate — the pair
+                // is the whole point. Collapsing them keeps whichever happens to
+                // carry more amplitude, which is usually the older, more-accessed
+                // fact: the one that is no longer true.
                 let redundant = tier_evictable && old_enough && low_value && retained.iter().any(|r| {
-                    crate::wave::cosine_similarity(&m.vector, &r.vector) >= p.redundancy
+                    let supersession_pair = m.expires_at.is_some() != r.expires_at.is_some();
+                    !supersession_pair
+                        && crate::wave::cosine_similarity(&m.vector, &r.vector) >= p.redundancy
                 });
                 if redundant {
                     to_forget.push(m.id);
@@ -1628,8 +1635,33 @@ impl KannakaMemorySystem {
         }
         let overflow = all.len() - max_total;
         let now = Utc::now();
-        let mut evictable: Vec<&crate::memory::HyperMemory> =
-            all.iter().filter(|m| m.tier != Tier::Pinned).copied().collect();
+        // ADR-0051 M8: a stamped memory is exempt, like Pinned.
+        //
+        // An expired memory is not stale garbage — it is the RECORD that a fact
+        // changed, and the only thing that can answer "what did we use before".
+        // The size cap evicting it destroys that evidence silently, and there is
+        // no way to notice afterwards. `KANNAKA_EXPIRED_RETENTION_DAYS` is the
+        // bounded escape hatch: past that age an expired memory becomes
+        // evictable again by explicit policy rather than by accident.
+        let expired_retention_days: Option<f32> = std::env::var("KANNAKA_EXPIRED_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|d| d.is_finite() && *d >= 0.0);
+        let reclaimable = |m: &crate::memory::HyperMemory| -> bool {
+            match (m.expires_at, expired_retention_days) {
+                (None, _) => true,
+                (Some(exp), Some(days)) => {
+                    let age = (now - exp).num_seconds().max(0) as f32 / 86_400.0;
+                    age >= days
+                }
+                (Some(_), None) => false,
+            }
+        };
+        let mut evictable: Vec<&crate::memory::HyperMemory> = all
+            .iter()
+            .filter(|m| m.tier != Tier::Pinned && reclaimable(m))
+            .copied()
+            .collect();
         // Lowest effective strength first — the weakest / least-salient
         // memories, exactly what annealing would dissolve. NaN-safe ordering.
         evictable.sort_by(|a, b| {
@@ -3534,6 +3566,159 @@ mod tests {
         sys.remember("memory two").unwrap();
         let report = sys.dream().unwrap();
         assert!(report.cycles > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ADR-0051 M8: a supersession record survives reclamation ──────────
+    //
+    // An expired memory is not stale garbage. It is the RECORD that a fact
+    // changed, and the only thing that can answer "what did we use before?".
+    // Both reclamation paths — the size cap and redundancy triage — could
+    // destroy it silently, with nothing afterwards able to notice.
+
+    /// Serializes the tests that set `KANNAKA_EXPIRED_RETENTION_DAYS`, which is
+    /// process-global and would otherwise leak into a concurrent test.
+    static RETENTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Stamp `expires_at` through the production path, the same one
+    /// `kannaka remember --expires` uses.
+    fn expire(sys: &mut KannakaMemorySystem, id: &Uuid, when: chrono::DateTime<Utc>) {
+        let hrm = sys
+            .engine
+            .store
+            .as_any_mut()
+            .downcast_mut::<crate::hrm_store::HrmStore>()
+            .unwrap();
+        assert!(hrm.set_temporal(id, None, None, Some(when)), "set_temporal must find the memory");
+    }
+
+    /// The whole M8 fix reads `expires_at` off the CACHED memory that
+    /// `all_memories()` returns. If the stamp did not reach that copy, both
+    /// reclamation fixes would be vacuous while still passing a test that only
+    /// checked the store. So assert the field actually travels, first.
+    #[test]
+    fn an_expiry_stamp_reaches_the_cached_memory_the_reclaimers_read() {
+        let dir = temp_dir("expiretravels");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let id = sys.remember("the api key rotates monthly").unwrap();
+        let when = Utc::now() - chrono::Duration::days(3);
+        expire(&mut sys, &id, when);
+
+        let mems = sys.engine.store.all_memories().unwrap();
+        let m = mems.iter().find(|m| m.id == id).unwrap();
+        assert!(
+            m.expires_at.is_some(),
+            "expires_at must survive into the cached HyperMemory — the eviction \
+             and triage fixes both filter on this field and would silently do \
+             nothing without it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_size_cap_will_not_evict_a_supersession_record() {
+        let _lock = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::remove_var("KANNAKA_EXPIRED_RETENTION_DAYS");
+
+        let dir = temp_dir("capexpired");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(sys.remember(&format!("deployment note number {i}")).unwrap());
+        }
+        let superseded = ids[2];
+        expire(&mut sys, &superseded, Utc::now() - chrono::Duration::days(3));
+
+        // Cap 0 asks for EVERYTHING evictable, so the result is exactly the
+        // reclaimable set — no dependence on which memory ranks lowest.
+        let over = sys.lowest_value_overflow_ids(0);
+        assert_eq!(over.len(), 4, "the expired memory is exempt, like Pinned");
+        assert!(
+            !over.contains(&superseded),
+            "evicting the expired memory destroys the evidence that the fact ever \
+             changed, and nothing downstream could detect the loss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_memory_is_reclaimable_again_past_the_retention_window() {
+        let _lock = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = temp_dir("capretention");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(sys.remember(&format!("deployment note number {i}")).unwrap());
+        }
+        let superseded = ids[2];
+        expire(&mut sys, &superseded, Utc::now() - chrono::Duration::days(10));
+
+        // The exemption is indefinite by default — deliberately, because the
+        // operator has not said how long the past is worth keeping.
+        env::remove_var("KANNAKA_EXPIRED_RETENTION_DAYS");
+        assert!(!sys.lowest_value_overflow_ids(0).contains(&superseded));
+
+        // Still inside a 30-day window: protected.
+        env::set_var("KANNAKA_EXPIRED_RETENTION_DAYS", "30");
+        assert!(
+            !sys.lowest_value_overflow_ids(0).contains(&superseded),
+            "expired 10 days ago is inside a 30-day retention window"
+        );
+
+        // Past a 7-day window: reclaimable by explicit policy, not by accident.
+        env::set_var("KANNAKA_EXPIRED_RETENTION_DAYS", "7");
+        let over = sys.lowest_value_overflow_ids(0);
+        assert!(
+            over.contains(&superseded),
+            "past the operator's stated window the record becomes evictable again"
+        );
+        assert_eq!(over.len(), 5);
+
+        env::remove_var("KANNAKA_EXPIRED_RETENTION_DAYS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn triage_does_not_collapse_a_supersession_pair_into_one_memory() {
+        let _lock = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::remove_var("KANNAKA_EXPIRED_RETENTION_DAYS");
+
+        let dir = temp_dir("triagepair");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let old = sys.remember("the deploy target is oracle-one").unwrap();
+        let new = sys.remember("the deploy target is oracle-one").unwrap();
+        assert_ne!(old, new, "reinforce-on-repeat ships dark, so this is two memories");
+
+        let p = TriageParams {
+            redundancy: 0.9,
+            min_amplitude: f32::MAX, // every memory counts as low-value
+            min_age_hours: 0,        // freshly written memories are eligible
+            include_long_term: true, // remember() defaults to LongTerm in-lib
+            ..Default::default()
+        };
+
+        // CONTROL. Without the stamp these are simply duplicates, and triage is
+        // supposed to collapse them. If this ever stops firing, the assertion
+        // below would pass for the wrong reason.
+        let dup = sys.triage_select(&p);
+        assert_eq!(
+            dup.to_forget.len(),
+            1,
+            "two identical memories ARE redundant — the machinery must fire here, \
+             otherwise the supersession assertion below proves nothing"
+        );
+
+        // Now the same two memories are a supersession record: same claim, one
+        // retired. The pair is the point, so nothing may be collapsed.
+        expire(&mut sys, &old, Utc::now() - chrono::Duration::days(1));
+        let pair = sys.triage_select(&p);
+        assert!(
+            pair.to_forget.is_empty(),
+            "a superseded fact and the fact that replaced it are near-identical by \
+             construction; collapsing them keeps whichever carries more amplitude — \
+             usually the older, more-accessed one, which is the one no longer true"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
