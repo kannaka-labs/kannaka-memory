@@ -489,6 +489,38 @@ impl HrmStore {
 
     /// Load an existing HRM store from a .hrm file.
     /// Auto-detects v1 vs v2 format. v2 loads as ChiralMedium.
+    /// Bring every persisted energy down to [`ENERGY_CAP`] (#966, #1008).
+    ///
+    /// The cap was applied at insert and in `sync_cache_to_medium`, and the
+    /// 0.16.6 notes promised that "persisted over-cap energies are clamped on
+    /// load". They were not: nothing on the load path touched them, and the
+    /// test that claimed to prove it was vacuous — it doctored the medium while
+    /// the writer was still alive, and `Drop` auto-saved over the change before
+    /// it reached disk. A live store was found holding 2.2125 after a fresh
+    /// load, which is the same fact seen from outside.
+    ///
+    /// Runs once per load, over rows already in memory, so it costs a pass and
+    /// no I/O. A store written by an older build heals on its next save.
+    fn clamp_persisted_energy(&mut self) {
+        if let Some(ref mut c) = self.chiral {
+            for i in 0..c.right.energy.len() {
+                if c.right.energy[i] > ENERGY_CAP {
+                    c.right.energy[i] = ENERGY_CAP;
+                }
+            }
+            for i in 0..c.left.energy.len() {
+                if c.left.energy[i] > ENERGY_CAP {
+                    c.left.energy[i] = ENERGY_CAP;
+                }
+            }
+        }
+        for i in 0..self.medium.store.energy.len() {
+            if self.medium.store.energy[i] > ENERGY_CAP {
+                self.medium.store.energy[i] = ENERGY_CAP;
+            }
+        }
+    }
+
     pub fn load(pipeline: EncodingPipeline, hrm_path: PathBuf) -> Result<Self, StoreError> {
         // Detect format version from magic bytes before loading
         let is_v2 = if let Ok(mut f) = std::fs::File::open(&hrm_path) {
@@ -522,6 +554,9 @@ impl HrmStore {
                 };
                 // Populate flat medium view for backward compat (observe, coherence matrix, etc.)
                 store.sync_medium_from_chiral();
+                // #1008: before the cache is built, so `all_memories()` and
+                // anything reading amplitude sees the clamped value too.
+                store.clamp_persisted_energy();
                 store.rebuild_cache()?;
                 store.load_link_graph();
                 store.load_reactivation();
@@ -550,6 +585,8 @@ impl HrmStore {
                     dirty: false,
                     readonly: Self::env_readonly(),
                 };
+                // #1008: the flat path needs the same clamp as the chiral one.
+                store.clamp_persisted_energy();
                 store.rebuild_cache()?;
                 store.load_link_graph();
                 store.load_reactivation();
@@ -3308,22 +3345,42 @@ mod tests {
                 let e = store.energy_of(&id).expect("inserted memory has an energy");
                 assert!(e <= ENERGY_CAP, "chiral={chiral}: insert wrote energy {e} above the cap {ENERGY_CAP}");
 
-                // Make the LOAD half non-vacuous. Insert already clamped the
-                // hemisphere energy, so a plain reload would pass even if the
-                // load path clamped nothing. Persist an OVER-cap energy directly
-                // — exactly the state the live store is in for records written
-                // before #965 — and require load to bring it down.
-                if let Some(ref mut c) = store.chiral {
-                    let i = c.right.id_to_index[&id];
-                    c.right.energy[i] = 8.5;
-                } else {
-                    let i = store.medium.get_wavefront_index(&id).unwrap();
-                    store.medium.store.energy[i] = 8.5;
-                }
-                store.mark_dirty();
-                store.flush().unwrap();
                 id
             };
+            // Put an OVER-cap energy on DISK — the state the live store is in for
+            // records written before #965. This has to happen after the writer is
+            // dropped: `HrmStore` auto-saves on Drop when dirty, so doctoring the
+            // medium while the store is still alive is silently undone (measured:
+            // 8.5 before, 1.0 after). Both earlier versions of this test did that
+            // and so never put an over-cap value on disk at all — the assertion
+            // below then passed at 1.0 with load never asked to clamp anything.
+            if chiral {
+                let mut cm = crate::medium::chiral::ChiralMedium::load(&path).unwrap();
+                let i = cm.right.id_to_index[&hot_id];
+                cm.right.energy[i] = 8.5;
+                cm.save(&path).unwrap();
+            } else {
+                let mut m = crate::medium::Medium::load(&path).unwrap();
+                let i = m.get_wavefront_index(&hot_id).unwrap();
+                m.store.energy[i] = 8.5;
+                m.save(&path).unwrap();
+            }
+
+            // ⭐ Assert the PRECONDITION. Without this the test cannot tell "load
+            // clamped it" from "there was nothing over the cap to clamp", which is
+            // exactly how both previous versions passed for the wrong reason.
+            let on_disk = if chiral {
+                let cm = crate::medium::chiral::ChiralMedium::load(&path).unwrap();
+                cm.right.energy[cm.right.id_to_index[&hot_id]]
+            } else {
+                let m = crate::medium::Medium::load(&path).unwrap();
+                m.store.energy[m.get_wavefront_index(&hot_id).unwrap()]
+            };
+            assert!(
+                on_disk > ENERGY_CAP,
+                "chiral={chiral}: the file holds {on_disk}, not an over-cap energy — this test would prove nothing about load"
+            );
+
             let store = HrmStore::load(make_test_pipeline(), path).unwrap();
             let e = store.energy_of(&hot_id).expect("memory survives reload");
             assert!(e <= ENERGY_CAP,

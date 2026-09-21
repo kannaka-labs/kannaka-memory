@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Fixed — over-cap energy really is clamped on load now (#1008)
+
+0.16.6 said: *"Persisted over-cap energies are clamped on load: the live 7.74 /
+8.51 records come down to 2.0 on the first restart of this version."* **That was
+not true.** Nothing on the load path touched them — the four `ENERGY_CAP` sites
+were in `insert` and `sync_cache_to_medium`, both write paths — so a store
+written by an older build kept its over-cap energies through every restart.
+
+The test that was supposed to prove otherwise was vacuous, and instructively so.
+It set an over-cap energy on the hemisphere and called `flush()`, but `flush()`
+runs `sync_cache_to_medium`, which rewrites every energy from the cache —
+measured at 8.5 before the flush and 1.0 after. The file never held an over-cap
+value, so the assertion passed at 1.0 with load never asked to clamp anything.
+Its author had anticipated exactly this vacuity and written a countermeasure
+that did not work. A second attempt, persisting via the medium's own `save()`,
+failed the same way for a different reason: `HrmStore` auto-saves on `Drop`, so
+doctoring the file while the writer is alive is undone before the test reads it.
+
+`HrmStore::load` now clamps every persisted energy on both the chiral and flat
+paths, before the cache is rebuilt so `all_memories()` agrees. The test doctors
+the file after the writer is dropped and **asserts the precondition** — that the
+file really does hold an over-cap value — so it can no longer pass by having
+nothing to clamp. Both halves are mutation-checked: removing the clamp fails it,
+and neutralising the doctoring fails it with "this test would prove nothing".
+
+This is also the best current explanation for the 2.2125 record found on a live
+store in #997: it survived load because load did not clamp.
+
 ### Fixed — a stream create the broker already refused is not re-issued (#969, #996)
 
 A permissions refusal for `$JS.API.STREAM.CREATE` arrives as an async `-ERR` with
