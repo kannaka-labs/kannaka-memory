@@ -2273,3 +2273,58 @@ fn swarm_coupling_cannot_push_energy_past_the_cap() {
         wire.store.energy[0]
     );
 }
+
+/// #978: ingest cost per item grows with store size. The issue attributes it
+/// to "interference with every existing wavefront". `HrmStore::insert` measured
+/// FLAT to n=400 on both backends, so if the O(n) is real it is not there —
+/// this measures `Medium::store`, which is the call that runs
+/// `apply_interference` over every existing row (a WAVEFRONT_DIM dot product
+/// each). Growth here and flatness there would locate it exactly.
+#[test]
+#[ignore = "probe: cargo test --lib probe_medium_store_cost_vs_size -- --ignored --nocapture"]
+fn probe_medium_store_cost_vs_size() {
+    use std::time::Instant;
+    const BATCH: usize = 50;
+    let pipeline = make_test_pipeline();
+    let mut medium = Medium::new();
+    let mut n = 0usize;
+    let mut first: Option<u128> = None;
+    for b in 0..8 {
+        let t = Instant::now();
+        for i in 0..BATCH {
+            medium.store(&format!("probe memory {b}-{i}"), 0.8, &pipeline).unwrap();
+        }
+        let per_us = t.elapsed().as_micros() / BATCH as u128;
+        n += BATCH;
+        let ratio = first.map(|f| per_us as f64 / f as f64).unwrap_or(1.0);
+        if first.is_none() { first = Some(per_us.max(1)); }
+        println!("PROBE medium.store n={n} {per_us} us/store  x{ratio:.2} vs first batch");
+    }
+}
+
+/// #978, chiral half. `absorb` routes to `ChiralMedium::store_with_facets` on a
+/// chiral store and to `Medium::store` on a flat one, and the fleet runs
+/// chiral — so a growth curve measured only on the flat path would not be
+/// evidence about production. Smaller n than the flat probe because facet
+/// minting adds several rows per item.
+#[test]
+#[ignore = "probe: cargo test --lib probe_chiral_store_cost_vs_size -- --ignored --nocapture"]
+fn probe_chiral_store_cost_vs_size() {
+    use std::time::Instant;
+    const BATCH: usize = 25;
+    let pipeline = make_test_pipeline();
+    let mut cm = crate::medium::chiral::ChiralMedium::new();
+    let mut n = 0usize;
+    let mut first: Option<u128> = None;
+    for b in 0..6 {
+        let t = Instant::now();
+        for i in 0..BATCH {
+            cm.store_with_facets(&format!("probe memory {b}-{i}. it has two sentences."), 0.8, &pipeline, None).unwrap();
+        }
+        let per_us = t.elapsed().as_micros() / BATCH as u128;
+        n += BATCH;
+        let ratio = first.map(|f| per_us as f64 / f as f64).unwrap_or(1.0);
+        if first.is_none() { first = Some(per_us.max(1)); }
+        println!("PROBE chiral.store_with_facets items={n} rows={} {per_us} us/item  x{ratio:.2}", cm.right.count());
+    }
+}

@@ -3471,6 +3471,49 @@ mod tests {
             "the real memory was dropped too — the filter is removing more than dreams"
         );
     }
+    /// #978: ingest cost per item grows with store size — 370 ms/item at 500,
+    /// 522-687 at 750-880, and a ~2000-item store that did not finish in 82
+    /// minutes. The issue attributes the remaining O(n)-per-insert to the
+    /// interference sweep over every existing wavefront.
+    ///
+    /// This measures the SHAPE rather than trusting the attribution, and does it
+    /// on BOTH backends: the interference loop I can see is on the flat path,
+    /// while the fleet runs chiral. If per-insert cost is flat on one and linear
+    /// on the other, the fix is not where the issue says it is.
+    ///
+    /// Debug build is fine: absolute numbers are meaningless here, the growth
+    /// curve is the whole point.
+    #[test]
+    #[ignore = "probe: cargo test --lib probe_ingest_cost_vs_store_size -- --ignored --nocapture"]
+    fn probe_ingest_cost_vs_store_size() {
+        use std::time::Instant;
+        const BATCH: usize = 50;
+        const BATCHES: usize = 8;
+        for chiral in [true, false] {
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+            if chiral { store.upgrade_to_chiral(); }
+            let mut n = 0usize;
+            let mut first: Option<u128> = None;
+            for b in 0..BATCHES {
+                let t = Instant::now();
+                for i in 0..BATCH {
+                    let seed = (b * BATCH + i) as f32;
+                    let mut v = vec![0.0f32; WAVEFRONT_DIM];
+                    for (k, slot) in v.iter_mut().enumerate() {
+                        *slot = ((k as f32 * 0.7 + seed).sin()).abs();
+                    }
+                    let m = HyperMemory::new(v, format!("probe memory {b}-{i}"));
+                    store.insert(m).unwrap();
+                }
+                let per_us = t.elapsed().as_micros() / BATCH as u128;
+                n += BATCH;
+                let ratio = first.map(|f| per_us as f64 / f as f64).unwrap_or(1.0);
+                if first.is_none() { first = Some(per_us.max(1)); }
+                println!("PROBE chiral={chiral} n={n} {per_us} us/insert  x{ratio:.2} vs first batch");
+            }
+        }
+    }
     #[test]
     fn energy_is_capped_at_write_and_on_load() {
         for chiral in [true, false] {
