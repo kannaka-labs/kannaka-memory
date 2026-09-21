@@ -3606,13 +3606,24 @@ mod tests {
         let id2 = insert_with_phase_and_layer(&mut engine, "the cat sat on the mat today", PI, 0);
 
         let amp_before_1 = engine.get_memory(&id1).unwrap().unwrap().amplitude;
+        let amp_before_2 = engine.get_memory(&id2).unwrap().unwrap().amplitude;
 
         let report = consolidation.consolidate(&mut engine, 0, 1);
 
         let amp_after_1 = engine.get_memory(&id1).unwrap().unwrap().amplitude;
+        let amp_after_2 = engine.get_memory(&id2).unwrap().unwrap().amplitude;
 
         assert!(report.destructive_pairs > 0, "should detect destructive pairs");
         assert!(amp_after_1 < amp_before_1, "amplitude should decrease: {amp_before_1} -> {amp_after_1}");
+        // The name says memorIES. `id2` was inserted as the opposed half of the
+        // pair and then never checked, so this could not tell "interference
+        // weakened both" from "it weakened whichever one it happened to touch".
+        // Measured: both 1.0 -> 0.5. The constructive test above already
+        // asserts its pair symmetrically; this one did not.
+        assert!(
+            amp_after_2 < amp_before_2,
+            "the opposed memory must weaken too: {amp_before_2} -> {amp_after_2}"
+        );
     }
 
     #[test]
@@ -3688,7 +3699,10 @@ mod tests {
     }
 
     #[test]
-    fn wiring_creates_skip_links_for_cross_layer_constructive_pairs() {
+    // Renamed from `wiring_creates_skip_links_for_cross_layer_constructive_pairs`
+    // for the same reason: skip links are gone, so this verifies only that
+    // consolidation runs over a cross-layer constructive pair.
+    fn consolidation_runs_over_cross_layer_constructive_pairs() {
         let mut engine = make_engine();
         engine.similarity_threshold = 0.99; // prevent auto-linking on insert
         let consolidation = ConsolidationEngine {
@@ -3704,7 +3718,7 @@ mod tests {
             mem.phase = 0.0;
             engine.store.insert(mem).unwrap()
         };
-        let id2 = {
+        {
             let mut mem = engine.pipeline.encode_memory("the cat sat on the mat today", Utc::now()).unwrap();
             mem.layer_depth = 1;
             mem.phase = 0.0;
@@ -3832,7 +3846,12 @@ mod tests {
     }
 
     #[test]
-    fn cross_cluster_wiring_creates_bridge_connections() {
+    // Renamed from `cross_cluster_wiring_creates_bridge_connections`. Skip-link
+    // wiring was removed (associations are emergent from ChiralMedium
+    // interference now) and its assertions went with it, leaving a test that
+    // checks only that consolidation ran — under a name promising bridge
+    // connections. The fixture is worth keeping; the claim was not.
+    fn consolidation_replays_across_orthogonal_clusters() {
         let mut engine = make_engine();
         let consolidation = ConsolidationEngine {
             interference_threshold: 0.3,
@@ -3847,16 +3866,16 @@ mod tests {
         for i in 0..100 { va[i] = 1.0; }
         crate::wave::normalize(&mut va);
         
-        let cat_id = insert_raw(&mut engine, va.clone(), "cats are fluffy animals", 0.0, 0);
-        let dog_id = insert_raw(&mut engine, va.clone(), "dogs are loyal pets", 0.0, 0);
+        insert_raw(&mut engine, va.clone(), "cats are fluffy animals", 0.0, 0);
+        insert_raw(&mut engine, va.clone(), "dogs are loyal pets", 0.0, 0);
         
         // Cluster B: technology-related memories (orthogonal vector)
         let mut vb = vec![0.0f32; dim];
         for i in 500..600 { vb[i] = 1.0; }
         crate::wave::normalize(&mut vb);
         
-        let code_id = insert_raw(&mut engine, vb.clone(), "coding in rust", 0.0, 0);
-        let ai_id = insert_raw(&mut engine, vb.clone(), "artificial intelligence", 0.0, 0);
+        insert_raw(&mut engine, vb.clone(), "coding in rust", 0.0, 0);
+        insert_raw(&mut engine, vb.clone(), "artificial intelligence", 0.0, 0);
         
         // Create a bridge memory with moderate similarity to both clusters
         let mut vc = vec![0.0f32; dim];
@@ -3864,7 +3883,7 @@ mod tests {
         for i in 500..550 { vc[i] = 0.7; }  // Moderate overlap with cluster B
         crate::wave::normalize(&mut vc);
         
-        let bridge_id = insert_raw(&mut engine, vc, "robot pets using AI", 0.0, 0);
+        insert_raw(&mut engine, vc, "robot pets using AI", 0.0, 0);
         
         // Run consolidation � skip link creation removed, just verify it runs
         let report = consolidation.consolidate(&mut engine, 0, 1);
