@@ -3707,7 +3707,6 @@ The market square opens for trading at nine each morning.";
     /// must be a live right id.
     #[test]
     fn backfill_canonicalizes_left_ids_and_never_double_mints() {
-        let _flag = crate::facet::lock_decompose_flag();
         let p = pipeline();
         let mut cm = ChiralMedium::new();
         let parent = cm.store(COMPOUND, 0.9, &p).unwrap();
@@ -3778,13 +3777,12 @@ The market square opens for trading at nine each morning.";
 
     #[test]
     fn write_path_flag_default_off_then_on_then_idempotent_backfill() {
-        // KANNAKA_FACET_DECOMPOSE is process-global; hold the lock so a
+        // #942: the flag is now a THREAD-LOCAL override in tests, so this
         // concurrent flag test cannot flip it mid-assertion.
-        let _flag = crate::facet::lock_decompose_flag();
         let p = pipeline();
 
         // ── flag OFF (the default): storing a compound mints nothing extra ──
-        std::env::remove_var("KANNAKA_FACET_DECOMPOSE");
+        let _off = crate::facet::decompose_for_test(false);
         let mut off = ChiralMedium::new();
         let before = off.right.metadata.len();
         let id_off = off.store_with_facets(COMPOUND, 0.9, &p, None).unwrap();
@@ -3798,7 +3796,7 @@ The market square opens for trading at nine each morning.";
         assert!(!off.has_facets(), "flag off left the medium claiming facets");
 
         // ── flag ON: the same content mints a linked constellation ──
-        std::env::set_var("KANNAKA_FACET_DECOMPOSE", "1");
+        let _on = crate::facet::decompose_for_test(true);
         let mut on = ChiralMedium::new();
         let parent = on.store_with_facets(COMPOUND, 0.9, &p, None).unwrap();
         let minted = facet_count(&on);
@@ -3816,7 +3814,7 @@ The market square opens for trading at nine each morning.";
 
         // ── backfill is once-only: decompose-twice == decompose-once ──
         let mut bf = ChiralMedium::new();
-        std::env::remove_var("KANNAKA_FACET_DECOMPOSE"); // backfill ignores the write flag
+        let _off = crate::facet::decompose_for_test(false); // backfill ignores the write flag
         let target = bf.store_with_facets(COMPOUND, 0.9, &p, None).unwrap();
         assert_eq!(facet_count(&bf), 0, "setup should be undecomposed");
 
@@ -3848,20 +3846,19 @@ The market square opens for trading at nine each morning.";
             "backfill decomposed a facet — facets of facets would fragment forever"
         );
 
-        std::env::remove_var("KANNAKA_FACET_DECOMPOSE");
+        let _off = crate::facet::decompose_for_test(false);
     }
 
     #[test]
     fn single_clause_content_is_never_decomposed_even_with_the_flag_on() {
-        let _flag = crate::facet::lock_decompose_flag();
         let p = pipeline();
-        std::env::set_var("KANNAKA_FACET_DECOMPOSE", "1");
+        let _on = crate::facet::decompose_for_test(true);
         let mut cm = ChiralMedium::new();
         let id = cm
             .store_with_facets("Kannaka Labs sits in the Deal District", 0.9, &p, None)
             .unwrap();
         assert_eq!(facet_count(&cm), 0, "an atomic memory was decomposed");
         assert!(!cm.is_decomposed(id));
-        std::env::remove_var("KANNAKA_FACET_DECOMPOSE");
+        let _off = crate::facet::decompose_for_test(false);
     }
 }

@@ -3048,12 +3048,11 @@ mod tests {
 
     #[test]
     fn backfill_all_facets_migrates_then_is_idempotent() {
-        let _flag = crate::facet::lock_decompose_flag();
         // #836 regression: write-time decomposition never touches memories
         // stored before the flag existed. The sweep must (a) count correctly
         // in dry-run without mutating, (b) mint facets on --apply, and
         // (c) mint NOTHING on a second apply -- `decomposed` is the watermark.
-        std::env::remove_var("KANNAKA_FACET_DECOMPOSE"); // pre-facet corpus
+        let _off = crate::facet::decompose_for_test(false); // pre-facet corpus
 
         const COMPOUND_A: &str = "The harbor beacon channel moved to twentyseven last spring. \
             The lighthouse keeper still logs every crossing by hand. \

@@ -64,88 +64,64 @@ const EXCLUDED_PREFIXES: &[&str] = &[
 /// the ADR-0048/0050 discipline of shipping the mechanism dark and enabling it
 /// on measured evidence. Read-side resolution is always on but is a no-op until
 /// facets exist, so an unset flag means the whole feature is inert.
+/// Per-THREAD override, tests only (#942).
+///
+/// The flag is read ambiently by `store_with_facets`, and `cargo test` runs
+/// tests as threads in one process — so a test that mutated the process
+/// environment changed what OTHER tests observed mid-run. #986 made the guard
+/// restore on drop, which fixed the durable leak but not the race: its own doc
+/// says a reader going through `decompose_enabled` "can still observe it ON
+/// while a flag test holds the lock", and closing that needs the setting to
+/// stop being ambient.
+///
+/// It has exactly ONE production call site, so making it thread-scoped in tests
+/// is a far smaller change than the "refactor every call site" that note
+/// anticipated. Each test thread sees only its own value; production is
+/// untouched and still reads the environment.
+#[cfg(test)]
+thread_local! {
+    static TEST_DECOMPOSE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub fn decompose_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_DECOMPOSE.with(|c| c.get()) {
+        return v;
+    }
     std::env::var("KANNAKA_FACET_DECOMPOSE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
         .unwrap_or(false)
 }
 
-/// Serializes the tests that MUTATE `KANNAKA_FACET_DECOMPOSE`.
+/// Set the flag for THIS THREAD only, restoring the previous value on drop.
 ///
-/// The flag is process-global and `cargo test` runs tests in parallel threads
-/// inside one process, so a test asserting "flag OFF stores exactly one
-/// wavefront" can be broken by a different test switching the flag ON at that
-/// instant. That is what happened: `write_path_flag_default_off_then_on_...`
-/// and `single_clause_content_is_never_decomposed_even_with_the_flag_on` fight
-/// over the same variable. The race is invisible at `--test-threads 1` and
-/// surfaces only when scheduling happens to interleave them, which makes it the
-/// worst kind of red build — one that blames whichever PR last changed the test
-/// count.
-///
-/// Every test that calls `set_var`/`remove_var` on this flag must hold this
-/// guard for its whole body and leave the flag unset.
-///
-/// This does NOT make the flag safe in general: a test elsewhere that merely
-/// *reads* the flag through `decompose_enabled` (any `absorb` does) can still
-/// observe it ON while a flag test holds the lock. Closing that hole means
-/// making the setting injectable rather than ambient, which is a real refactor
-/// of every `decompose_enabled` call site and is not attempted here.
+/// Replaces `lock_decompose_flag()` + `set_var` for tests that need a specific
+/// value: no process env is touched, so no other test can see it and no lock is
+/// needed to keep them apart.
 #[cfg(test)]
-static FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// A held flag lock that also RESTORES `KANNAKA_FACET_DECOMPOSE` on drop (#942).
-///
-/// Holding the mutex serializes the mutating tests against each other, but on
-/// its own it does not survive a panic: a test that does `set_var("…","1")` and
-/// then panics before its own cleanup leaves the flag ON process-wide, and the
-/// next test to *read* it through `decompose_enabled` — which does not take this
-/// lock — sees a stale ON it never set. That turns one test's failure into a
-/// cascade blamed on innocent tests, the worst shape of flake.
-///
-/// This guard snapshots the flag's value at lock time and, on drop, puts it
-/// back exactly — restoring a prior value or removing it if it was unset — and
-/// does so BEFORE the mutex is released, so the next locker always observes the
-/// restored state. Drop runs on the panic path too, so a panicking mutator can
-/// no longer poison the flag for everyone else; the mutex poisoning is still
-/// swallowed so the real assertion, not a lock error, is what surfaces.
-///
-/// This does NOT close the reader race in general: a non-flag test that reads
-/// `decompose_enabled` while a flag test legitimately holds the flag ON for the
-/// duration of its body can still observe ON. Closing that means making the
-/// setting injectable rather than ambient (issue #942 option 2), a refactor of
-/// the `decompose_enabled` call site that is out of scope here. What this fixes
-/// is the durable, cross-test leak — the flag is now ON only for the span of a
-/// single locked body, never left dangling past it.
-#[cfg(test)]
-pub(crate) struct FlagGuard {
-    // Field order matters: Rust drops fields top-to-bottom, but a type's own
-    // Drop::drop runs before any field drops, so `restore()` below executes
-    // while `_lock` is still held, then `_lock` releases. Restore-then-unlock.
-    prior: Option<String>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
+pub(crate) struct ThreadFlag(Option<bool>);
 
 #[cfg(test)]
-impl Drop for FlagGuard {
+impl Drop for ThreadFlag {
     fn drop(&mut self) {
-        match self.prior.take() {
-            Some(v) => std::env::set_var("KANNAKA_FACET_DECOMPOSE", v),
-            None => std::env::remove_var("KANNAKA_FACET_DECOMPOSE"),
-        }
+        TEST_DECOMPOSE.with(|c| c.set(self.0));
     }
 }
 
-/// Take the flag lock (ignoring poisoning) and snapshot the flag for restore.
-///
-/// A panicking test poisons the mutex; `into_inner` recovers it so every later
-/// flag test reports its own assertion rather than a lock error inherited from
-/// the first failure.
 #[cfg(test)]
-pub(crate) fn lock_decompose_flag() -> FlagGuard {
-    let lock = FLAG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let prior = std::env::var("KANNAKA_FACET_DECOMPOSE").ok();
-    FlagGuard { prior, _lock: lock }
+pub(crate) fn decompose_for_test(on: bool) -> ThreadFlag {
+    let prior = TEST_DECOMPOSE.with(|c| c.replace(Some(on)));
+    ThreadFlag(prior)
 }
+
+/// The env-mutating test guard that used to live here is gone (#942). It
+/// existed so tests could set `KANNAKA_FACET_DECOMPOSE` in the process
+/// environment without leaking, and serialized them with a mutex to keep
+/// them apart. Its own doc admitted the mutex could not stop a concurrent
+/// READER seeing the flag mid-flight — which is what #942 reported. No test
+/// touches the process environment now; `decompose_for_test` above is
+/// thread-scoped, so there is nothing to serialize and nothing to leak.
 
 /// Decompose `content` into atomic facet texts.
 ///
@@ -755,30 +731,33 @@ mod resolve_tests {
         );
     }
 
+    /// #942: the property the old mutex could not give. Four tests mutated
+    /// `KANNAKA_FACET_DECOMPOSE` in the process environment while `cargo test`
+    /// ran them as threads, so a reader in another test saw a value it never
+    /// set — 2 of 3 full-suite runs failed on "flag off must store exactly one
+    /// wavefront". Serializing the MUTATORS could not fix it, because the
+    /// victim was a READER that took no lock.
+    ///
+    /// The override is thread-scoped, so this asserts directly what the flake
+    /// denied: one thread's setting is invisible to another.
+    #[test]
+    fn a_thread_flag_is_invisible_to_other_threads() {
+        let _on = decompose_for_test(true);
+        assert!(decompose_enabled(), "control: this thread must see its own override");
+
+        let seen_elsewhere = std::thread::spawn(|| decompose_enabled())
+            .join()
+            .expect("probe thread");
+        assert!(
+            !seen_elsewhere,
+            "another thread observed this thread's flag — the #942 race is still open"
+        );
+    }
     #[test]
     fn overfetch_pool_scales_with_the_facet_cap() {
         assert_eq!(overfetch_pool(10), 10 * MAX_FACETS_PER_PARENT);
         assert_eq!(overfetch_pool(0), 0);
     }
 
-    /// #942: the flag guard must leave the flag exactly as it found it, so a
-    /// mutating test cannot leak an ON value to a later reader. This test holds
-    /// the guard itself, so it is serialized with the other flag tests.
-    #[test]
-    fn flag_guard_restores_unset_on_drop() {
-        {
-            let _flag = lock_decompose_flag();
-            std::env::set_var("KANNAKA_FACET_DECOMPOSE", "1");
-            assert!(decompose_enabled(), "flag is ON inside the guarded body");
-        } // guard drops here
-        assert!(
-            !decompose_enabled(),
-            "guard must clear a flag it found unset, even though the body set it ON",
-        );
-        assert!(
-            std::env::var("KANNAKA_FACET_DECOMPOSE").is_err(),
-            "the variable must be removed, not merely read as off",
-        );
-    }
 
 }

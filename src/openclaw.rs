@@ -1372,7 +1372,7 @@ impl KannakaMemorySystem {
     ///
     /// Tests use this rather than mutating `KANNAKA_REINFORCE_ON_REPEAT`, which
     /// is process-global and shared with every other test running in parallel —
-    /// the race `facet::lock_decompose_flag` exists to contain.
+    /// the race #942 reported (now closed by a thread-scoped test override).
     pub fn set_reinforce_on_repeat(&mut self, on: bool) {
         self.reinforce_on_repeat = on;
     }
