@@ -218,6 +218,10 @@ pub fn recall_temporal_floor() -> f32 {
         .unwrap_or(TEMPORAL_SUPERSEDED_FLOOR)
 }
 
+/// How far ahead of the scoring instant an `observed_at` may sit before the
+/// memory counts as "not yet observed" rather than clock skew between hosts.
+pub const OBSERVATION_SKEW_TOLERANCE_SECS: i64 = 300;
+
 /// Confirmation-recency weight for one wavefront, in `(0, 1]`.
 ///
 /// - Not currently true (`Expired` / `Future`) → [`TEMPORAL_SUPERSEDED_FLOOR`].
@@ -245,6 +249,22 @@ pub fn temporal_weight(
         }
     }
     let confirmed = meta.observed_at.unwrap_or(meta.created_at);
+    // Observed AFTER the instant being scored → floor, not "brand new".
+    //
+    // `max(0)` below clamps a negative age to zero, which reads as maximal
+    // freshness. Against the wall clock that is unreachable; under `RecallAsOf`
+    // it is not, and it inverts the ranking — scoring as of February, a claim
+    // observed in May came back weight 1.0, ahead of everything actually known
+    // in February. A fact not yet observed is the same case as one not yet in
+    // force, so it gets the same answer the `effective_at` check gives.
+    //
+    // The tolerance is for clock skew between synced hosts: a freshly gossiped
+    // memory can carry an `observed_at` a few seconds ahead of the local clock,
+    // and flooring a genuinely current fact over that would be worse than the
+    // bug being fixed. It is orders of magnitude below any real as-of gap.
+    if (confirmed - now).num_seconds() > OBSERVATION_SKEW_TOLERANCE_SECS {
+        return floor;
+    }
     let age_days = (now - confirmed).num_seconds().max(0) as f32 / 86_400.0;
     let w = 0.5f32.powf(age_days / half_life_days.max(1e-3));
     // Clamp above the floor: a merely OLD but still-true fact must never rank
@@ -1479,6 +1499,47 @@ mod tests {
         assert!(
             ranked.iter().any(|r| r.id == old_id),
             "and the older one stays retrievable — demotion, not deletion"
+        );
+    }
+
+    /// Scoring as of a past instant must not rank a LATER memory as freshest.
+    ///
+    /// The age clamp (`max(0)`) reads a negative age as zero — maximal
+    /// recency. Unreachable against a wall clock, reachable through `--at`,
+    /// and it inverts the answer: asked "what did we use in February", the
+    /// system replied with the value adopted in May, ranked top.
+    #[test]
+    fn a_memory_observed_after_the_as_of_instant_is_floored_not_freshest() {
+        let _scoring = TEMPORAL_SCORING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use chrono::{Duration, TimeZone, Utc};
+
+        let feb = Utc.with_ymd_and_hms(2023, 2, 1, 0, 0, 0).unwrap();
+        let may = Utc.with_ymd_and_hms(2023, 5, 1, 0, 0, 0).unwrap();
+        let asked = Utc.with_ymd_and_hms(2023, 2, 2, 0, 0, 0).unwrap();
+        let floor = TEMPORAL_SUPERSEDED_FLOOR;
+
+        let mut known = WavefrontMeta::new(Uuid::new_v4(), "known in february".into());
+        known.observed_at = Some(feb);
+        let mut later = WavefrontMeta::new(Uuid::new_v4(), "adopted in may".into());
+        later.observed_at = Some(may);
+
+        let w_known = temporal_weight(&known, asked, 180.0, floor);
+        let w_later = temporal_weight(&later, asked, 180.0, floor);
+
+        assert_eq!(w_later, floor, "a not-yet-observed memory must be floored");
+        assert!(
+            w_known > w_later,
+            "what was actually known must outrank what had not happened yet"
+        );
+
+        // Clock skew is NOT a future observation: a memory a few seconds ahead
+        // of the scoring instant must stay fresh, not drop to the floor.
+        let mut skewed = WavefrontMeta::new(Uuid::new_v4(), "just gossiped in".into());
+        skewed.observed_at = Some(asked + Duration::seconds(OBSERVATION_SKEW_TOLERANCE_SECS - 30));
+        let w_skew = temporal_weight(&skewed, asked, 180.0, floor);
+        assert!(
+            w_skew > 0.99,
+            "a few seconds of host skew must not demote a current fact to the floor"
         );
     }
 
