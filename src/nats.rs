@@ -478,6 +478,18 @@ fn names_denied_stream_create(msg: &str) -> bool {
     is_permissions_error(msg) && msg.contains("$JS.API.STREAM.CREATE")
 }
 
+/// Whether to put `$JS.API.STREAM.CREATE` on the wire at all (#969).
+///
+/// Separate from [`should_attempt_stream_create`], which answers "is this
+/// identity the kind that creates streams?" from its credentials. This one
+/// answers the narrower question the broker has already settled: it refused
+/// this connection once, so every later create is doomed — and doomed
+/// expensively, because a permissions refusal arrives as an async `-ERR` with
+/// no JetStream reply, leaving the request to wait out `JS_API_TIMEOUT`.
+fn should_issue_stream_create(create_denied_here: bool) -> bool {
+    !create_denied_here
+}
+
 /// Whether to attempt `$JS.API.STREAM.CREATE` for the PRESENCE stream (#933).
 ///
 /// `should_attempt_stream_create` gates on "we supplied credentials", which is
@@ -1813,6 +1825,28 @@ impl SwarmTransport {
     ) -> Result<(), NatsError> {
         let payload = config.to_string();
         let mut conn = self.lock_conn()?;
+
+        // #969: never re-issue a create this broker has already refused on
+        // this connection. A denied create is answered with an ASYNC `-ERR
+        // Permissions Violation` and NO JetStream reply, so the request below
+        // cannot fail fast — it waits out JS_API_TIMEOUT and only then errors.
+        // A connect ensures two streams (QUEEN_PHASES, QUEEN_EVENTS), so a
+        // non-writer identity paid ~6 s of dead stall on every connect, plus a
+        // "server error" line per attempt that reads like a fault and is not
+        // one. On O1, where `swarm serve` reloads at the writer's save cadence
+        // (#563), that repeated every few minutes all day, and those lines were
+        // misread as the CAUSE of the restarts during the 0.16.7 roll.
+        //
+        // The refusal is the broker's own verdict, recorded by the reader
+        // thread (#933) and cleared when `reconnect()` replaces the Conn — so a
+        // genuine writer that reconnects still creates. The callers treat an
+        // Err here as "not writable", which is exactly what a refused identity
+        // is; they already degrade to retained reads and say so.
+        if !should_issue_stream_create(conn.stream_create_denied) {
+            return Err(NatsError::Protocol(
+                "this connection was refused $JS.API.STREAM.CREATE; not retrying".to_string(),
+            ));
+        }
 
         let create_subject = format!("$JS.API.STREAM.CREATE.{stream_name}");
         let resp = self
@@ -3739,6 +3773,74 @@ mod tests {
         ));
         assert!(!names_denied_stream_create("Authorization Violation"));
         assert!(!names_denied_stream_create("Unknown Protocol Operation"));
+    }
+
+    /// #969: once refused, the create never goes back on the wire.
+    ///
+    /// Asserted over a real socket rather than on the predicate alone, because
+    /// the predicate being right proves nothing about `ensure_js_stream`
+    /// consulting it. The fake broker completes the handshake and then answers
+    /// NOTHING — exactly how a permissions refusal behaves, since the `-ERR`
+    /// is async and no JetStream reply ever comes. So the pre-fix path can
+    /// only end by waiting out JS_API_TIMEOUT (3 s).
+    ///
+    /// Both assertions fail if the guard is removed: the call takes 3 s
+    /// instead of milliseconds, and it ends in "no JetStream reply" rather
+    /// than naming the refusal. Controlled by running it that way.
+    #[test]
+    fn a_refused_stream_create_is_not_put_back_on_the_wire() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        // Minimal broker: accept, PONG the handshake PING, then stay silent
+        // and hold the socket open for the life of the test.
+        let broker = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // The client reads INFO first and refuses anything else, so a
+            // silent socket never gets as far as the handshake.
+            let _ = sock.write_all(
+                b"INFO {\"server_id\":\"fake\",\"version\":\"2.10.0\",\"proto\":1,\"headers\":true,\"max_payload\":1048576}\r\n",
+            );
+            let _ = sock.flush();
+            let mut reader = BufReader::new(sock.try_clone().expect("clone"));
+            let mut line = String::new();
+            // CONNECT then PING; answer the first PING we see.
+            for _ in 0..4 {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line.starts_with("PING") {
+                    let _ = sock.write_all(b"PONG\r\n");
+                    let _ = sock.flush();
+                    break;
+                }
+            }
+            // Only has to outlive the call under test; the test does not join
+            // this thread, so a long sleep would just linger.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let transport = SwarmTransport::connect(&format!("nats://{addr}"))
+            .expect("handshake against the fake broker");
+        // The broker's verdict, as the reader thread would have recorded it.
+        transport.lock_conn().expect("lock").stream_create_denied = true;
+
+        let started = Instant::now();
+        let err = transport.ensure_stream().expect_err("a refused create cannot succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "create was re-issued and waited out the {JS_API_TIMEOUT:?} JetStream timeout ({elapsed:?})"
+        );
+        assert!(
+            err.to_string().contains("not retrying"),
+            "the error should name the refusal, got: {err}"
+        );
+        drop(transport);
+        // Deliberately not joined: the broker only needs to outlive the call
+        // above, and waiting on its sleep would add idle seconds to the suite.
+        drop(broker);
     }
 
     /// #928: how a JetStream reply is read as evidence about the stream. The
