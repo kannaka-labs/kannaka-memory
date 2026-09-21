@@ -59,10 +59,18 @@ for p in $PATHS; do
   printf '   %-48s %s\n' "$p" "$("$p" --version 2>/dev/null | head -1)"
 done
 
-# 4. Keep the checkout and the binary telling the same story.
+# 4. Keep the checkout and the binary telling the same story. Check out the TAG
+#    being rolled, not master: master can be ahead of the release (during the
+#    v0.16.7 roll two PRs merged while the fleet was mid-roll, and this left the
+#    checkout two commits past the binary it was supposed to match). The five
+#    units that exec target/release/kannaka run the copied release binary, so
+#    the checkout is a source reference — but if anything ever builds here it
+#    must build what is running.
 if [ -d "$HOME/kannaka-memory/.git" ]; then
-  ( cd "$HOME/kannaka-memory" && git fetch -q origin && git pull -q --ff-only origin master 2>/dev/null \
-    && echo "   checkout now at $(git rev-parse --short HEAD)" ) || echo "   (checkout not fast-forwarded — left alone)"
+  ( cd "$HOME/kannaka-memory" && git fetch -q --tags origin \
+    && git checkout -q --detach "$VER" 2>/dev/null \
+    && echo "   checkout now at $VER ($(git rev-parse --short HEAD))" ) \
+    || echo "   (checkout not moved to $VER — left alone)"
 fi
 
 # 5. Start one at a time and verify what each PROCESS executes.

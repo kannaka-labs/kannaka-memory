@@ -5838,10 +5838,23 @@ fn main() {
                         .map(|s| s.trim().to_string())
                         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                     let identity = kannaka_memory::nats::AnnounceIdentity::from_store();
+                    // The label `join` would have published. Passing "" here
+                    // put an EMPTY display_name in the presence record — the
+                    // phase helper maps empty to None, but the presence JSON
+                    // embeds the string as given, so each sync overwrote the
+                    // join's label and the roster rendered the agent nameless.
+                    // `join` defaults an unset --display-name to the agent id;
+                    // config carries the operator's choice, so prefer it and
+                    // fall back the same way.
+                    let display_name = if cfg.agent.display_name.is_empty() {
+                        agent_id.clone()
+                    } else {
+                        cfg.agent.display_name.clone()
+                    };
                     swarm_publish_heartbeat(
                         &mut sys,
                         &agent_id,
-                        "",
+                        &display_name,
                         &transport,
                         "sync",
                         identity.as_ref(),

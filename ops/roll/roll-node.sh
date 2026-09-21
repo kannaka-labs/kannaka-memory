@@ -57,7 +57,8 @@ for b in "${BINS[@]}"; do
   OLDV=$("$b" --version 2>/dev/null); OLD=$(printf '%s\n' "$OLDV" | sed -n '1p' | cut -d' ' -f2)
   $SUDO mv -f "$b" "$b.previous" && $SUDO cp "$T/kannaka" "$b" && $SUDO chmod 755 "$b" && $SUDO chown "$(stat -c %U:%G "$b.previous")" "$b" 2>/dev/null
   command -v restorecon >/dev/null && $SUDO restorecon "$b" 2>/dev/null
-  say "  $b: $OLD -> $("$b" --version | head -1 | cut -d' ' -f2)"
+  NEWV=$("$b" --version 2>/dev/null); say "  $b: $OLD -> $(printf '%s
+' "$NEWV" | sed -n '1p' | cut -d' ' -f2)"
 done
 
 if [ "$STAGE_ONLY" = "--stage-only" ]; then
@@ -75,5 +76,6 @@ for u in "${UNITS[@]}"; do
   case "$exe" in *.previous*|*.bak*|"") say "  !! $u: $st exe=${exe:-none} — STILL ON THE OLD BINARY"; FAIL=$((FAIL+1));;
     *) say "  ok $u: $st exe=$exe";; esac
 done
-say "== on disk: =="; for b in "${BINS[@]}"; do say "  $b $("$b" --version | head -1)"; done
+say "== on disk: =="; for b in "${BINS[@]}"; do V=$("$b" --version 2>/dev/null); say "  $b $(printf '%s
+' "$V" | sed -n '1p')"; done
 [ "$FAIL" = "0" ] && say "== ROLLED $VER ==" || die "$FAIL unit(s) not on the new binary"
