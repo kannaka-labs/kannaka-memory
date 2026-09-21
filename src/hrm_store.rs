@@ -1319,8 +1319,31 @@ impl HrmStore {
     /// Apply observation effects to recall results.
     /// Ranked results get proportionally stronger observation.
     /// Batched: one field-settle pass per recall, not per result.
+    /// Whether a recall may reshape the field it just read (#977).
+    ///
+    /// Observation is deliberate — "attention IS computation" — and it is the
+    /// ADR-0036 replay signal behind tier promotion, so it stays ON by default
+    /// and this changes nothing for any existing caller.
+    ///
+    /// What it buys is measurability. Every recall calls `mark_dirty()`, so a
+    /// one-shot CLI recall pays a full medium + sidecar save on exit for what
+    /// the caller asked to be a read: kannaka-bench measured p50 2817 ms
+    /// against 246 ms for an exact cosine over the same embeddings, with one
+    /// recall per fresh store — every one paying that save. There was no way
+    /// to separate the medium's ranking cost from the write it provokes.
+    /// `KANNAKA_RECALL_OBSERVE=0` (or off/false/no) separates them.
+    ///
+    /// Same shape as `KANNAKA_RECALL_XI_BOOST` (#975): a knob that makes a
+    /// behaviour measurable without shipping a change to it.
+    fn recall_observation_enabled() -> bool {
+        std::env::var("KANNAKA_RECALL_OBSERVE")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
+            .unwrap_or(true)
+    }
+
     fn apply_observation(&mut self, results: &[Resonance]) {
         if results.is_empty() { return; }
+        if !Self::recall_observation_enabled() { return; }
         let observations: Vec<(usize, f32)> = results.iter().enumerate()
             .filter_map(|(i, resonance)| {
                 self.medium.get_wavefront_index(&resonance.id).map(|index| {
@@ -2927,8 +2950,13 @@ impl MediumBackend for HrmStore {
                     })
                 })
                 .collect();
-            self.medium.observe_wavefronts(&observations);
-            self.mark_dirty();
+            // #977: the chiral branch observes inline rather than through
+            // `apply_observation`, so it needs the same gate — otherwise the knob
+            // would silently do nothing on exactly the stores the fleet runs.
+            if Self::recall_observation_enabled() {
+                self.medium.observe_wavefronts(&observations);
+                self.mark_dirty();
+            }
 
             Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
         } else {
@@ -3331,6 +3359,42 @@ mod tests {
     /// same cap, or an over-amplitude memory enters above a ceiling nothing can
     /// lower it to and wins recalls on weight alone. Covers the chiral and flat
     /// insert sites and both load sites (via flush + reload).
+    /// #977: a recall marks the store dirty, so a one-shot CLI read pays a
+    /// full save on exit. Observation stays on by default; this proves the
+    /// opt-out actually reaches BOTH observation sites — the flat one via
+    /// `apply_observation` and the chiral one, which observes inline and so
+    /// would have silently ignored a gate placed only in the shared helper.
+    /// Chiral is what the fleet runs, so that is the one that matters.
+    #[test]
+    fn recall_observation_can_be_switched_off_on_both_paths() {
+        for chiral in [true, false] {
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+            if chiral { store.upgrade_to_chiral(); }
+            store.insert(HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "an observed memory".to_string())).unwrap();
+            store.flush().unwrap();
+
+            // Control: with observation ON a recall dirties the store.
+            std::env::remove_var("KANNAKA_RECALL_OBSERVE");
+            store.dirty = false;
+            let _ = store.resonate_query("an observed memory", 3).unwrap();
+            assert!(
+                store.dirty,
+                "chiral={chiral}: control failed — recall did not dirty the store, so the OFF case below proves nothing"
+            );
+
+            // Opt out: the same recall must leave the store clean.
+            std::env::set_var("KANNAKA_RECALL_OBSERVE", "0");
+            store.dirty = false;
+            let _ = store.resonate_query("an observed memory", 3).unwrap();
+            let dirtied = store.dirty;
+            std::env::remove_var("KANNAKA_RECALL_OBSERVE");
+            assert!(
+                !dirtied,
+                "chiral={chiral}: KANNAKA_RECALL_OBSERVE=0 still dirtied the store — a read is still paying for a write"
+            );
+        }
+    }
     #[test]
     fn energy_is_capped_at_write_and_on_load() {
         for chiral in [true, false] {
