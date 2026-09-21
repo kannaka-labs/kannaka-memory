@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-### Fixed — over-cap energy really is clamped on load now (#1008)
+### Fixed — over-cap energy really is clamped on load now (#1008, #1009)
 
 0.16.6 said: *"Persisted over-cap energies are clamped on load: the live 7.74 /
 8.51 records come down to 2.0 on the first restart of this version."* **That was
@@ -29,6 +29,56 @@ and neutralising the doctoring fails it with "this test would prove nothing".
 
 This is also the best current explanation for the 2.2125 record found on a live
 store in #997: it survived load because load did not clamp.
+
+### Added — `recall --at`: score recency as of a chosen instant (#994)
+
+`temporal_weight` decays from `observed_at` to *now* and clamps up to the
+superseded floor, and that clamp binds at two half-lives — 360 days by default.
+So on any store whose contents are older than that, every candidate returns the
+floor: the temporal factor degrades into a constant multiplier that cannot
+reorder anything, does not fail, and reports nothing. Measured on longmemeval
+(2023 data, 2026 wall clock): similarity 0.25 for every candidate, ordering
+byte-identical to the flag being off. Lowering the floor only moves the
+constant.
+
+`--at` measures recency from a chosen instant, which is also the honest question
+an agent asks — "what did we use last March" wants recency as of March, not
+today. `recall --batch` takes a per-row `at`, because a benchmark run asks
+hundreds of questions each with its own date and a process-wide flag cannot
+express that.
+
+### Docs — ADRs recorded (#962, #998)
+
+**ADR-0063: referential memory** — a fact with an authority must not be held as
+a wave. **ADR-0051** records that the Phase 3 gate was satisfied and the flag
+measured negative; the preconditions themselves shipped in 0.16.8 (#992).
+
+### Added — two recall knobs that make measurement possible (#977, #1010; #979, #1011)
+
+Neither changes default behaviour. Both exist because a measured problem could
+not be isolated without them.
+
+`KANNAKA_RECALL_OBSERVE=0` stops a recall reshaping the field it just read.
+Observation is deliberate ("attention IS computation") and is the ADR-0036
+replay signal behind tier promotion, so it stays on — but every recall calls
+`mark_dirty()`, and a one-shot CLI read therefore pays a full save on exit.
+Measured against a copy of a live 1671-memory store: a single `recall` took
+**9.45 s and rewrote all 135 MB** of the `.hrm`. ⚠ Gated at BOTH observation
+sites — the chiral branch observes inline rather than through the shared helper,
+so a gate in the helper alone would have done nothing on the stores the fleet
+runs.
+
+`KANNAKA_RECALL_INCLUDE_DREAMS=0` returns evidence only. A dream row is a
+cross-cluster synthesis, not a turn, so it can never be the evidence a question
+needs — yet after a *single* deep dream it took rank 1 in **24 of 30** bench
+questions, moving MRR from 0.950 to 0.529 while hit@15 held. The filter
+over-fetches and truncates rather than returning short, because the complaint is
+that each dream is a top-k slot spent. `resonate_query` became a thin wrapper
+over a private inner method so the filter lives in one place rather than at each
+of its four return paths.
+
+Still open in #977 and #979: the speedup itself, why dreams outrank real
+memories, and the unexplained 2.3x post-dream recall improvement.
 
 ### Fixed — a stream create the broker already refused is not re-issued (#969, #996)
 
