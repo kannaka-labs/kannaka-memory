@@ -1153,7 +1153,14 @@ impl ChiralMedium {
                 // Already has a right-side pair? Boost it
                 if let Some(&right_id) = self.left_to_right.get(&left_id) {
                     if let Some(&idx) = self.right.id_to_index.get(&right_id) {
-                        self.right.energy[idx] += energy * 0.1; // Gentle reinforcement
+                        // #997: gentle, but it had no ceiling at all — the only
+                        // energy write in the medium with none. A right-side
+                        // memory that keeps winning the callosal gate is
+                        // reinforced every dream, so this is the one path that
+                        // can climb without bound; the sibling write at the
+                        // chiral upgrade below already clamps to ENERGY_CAP.
+                        self.right.energy[idx] =
+                            (self.right.energy[idx] + energy * 0.1).min(ENERGY_CAP);
                     }
                 } else {
                     // No pair yet — create one via *chiral mutation* (fold +

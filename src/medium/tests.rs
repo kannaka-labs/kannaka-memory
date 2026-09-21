@@ -2199,3 +2199,54 @@ fn kuramoto_order_separates_aligned_from_spread_phases() {
          if this equals the aligned value, order has gone constant (#825)"
     );
 }
+
+/// #997: swarm coupling must respect ENERGY_CAP, not its own private ceiling.
+///
+/// Both coupling paths clamped to 10.0 — a limit that predates the cap — so a
+/// peer's energy could lift a local memory five times past the bound every
+/// other write path enforces. The multiplier is a value the remote side
+/// chooses, which is exactly why the ceiling has to be ours.
+///
+/// Driven through the real `sync_with` / `import_phase_state`, not a helper:
+/// the point is that these call sites clamp, and a predicate test would not
+/// say that. Both start at the cap and are coupled hard, so the pre-fix code
+/// climbs above it. Controlled by mutation — restoring `10.0` fails both.
+#[test]
+fn swarm_coupling_cannot_push_energy_past_the_cap() {
+    let pipeline = make_test_pipeline();
+    let v = pipeline.encode_text("a memory both sides hold").unwrap();
+
+    // Local medium, one memory sitting exactly at the ceiling.
+    let mut local = Medium::new();
+    local.add_wavefront(&v, "a memory both sides hold".to_string(), 1.0).unwrap();
+    local.store.energy[0] = ENERGY_CAP;
+
+    // A peer holding the same memory, hot. `sync_with` multiplies the peer's
+    // energy in, so an unbounded peer is the whole hazard.
+    let mut peer = Medium::new();
+    peer.add_wavefront(&v, "a memory both sides hold".to_string(), 1.0).unwrap();
+    peer.store.energy[0] = 9.0;
+
+    local.sync_with(&peer, 1.0);
+    assert!(
+        local.store.energy[0] <= ENERGY_CAP,
+        "sync_with lifted energy to {}, past ENERGY_CAP {ENERGY_CAP}",
+        local.store.energy[0]
+    );
+
+    // The same coupling over the wire, where the remote value is unverifiable.
+    let mut wire = Medium::new();
+    wire.add_wavefront(&v, "a memory both sides hold".to_string(), 1.0).unwrap();
+    wire.store.energy[0] = ENERGY_CAP;
+    // Built through the real export path, so the content hashes are the ones
+    // `import_phase_state` actually matches on.
+    let mut remote = peer.export_phase_state("peer");
+    remote.energies[0] = 9.0;
+    remote.phases[0] = wire.store.phase[0] + 0.5;
+    wire.import_phase_state(&remote, 1.0);
+    assert!(
+        wire.store.energy[0] <= ENERGY_CAP,
+        "import_phase_state lifted energy to {}, past ENERGY_CAP {ENERGY_CAP}",
+        wire.store.energy[0]
+    );
+}

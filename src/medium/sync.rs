@@ -79,8 +79,13 @@ impl Medium {
                 let amplitude_boost = coupling * other.store.energy[j] * best_coherence;
                 self.store.energy[i] += amplitude_boost * 0.1; // Scale down to prevent runaway
 
-                // Ensure energy stays positive and reasonable
-                self.store.energy[i] = self.store.energy[i].clamp(0.001, 10.0);
+                // #997: the ceiling is ENERGY_CAP, not 10.0. This clamp predates
+                // the cap and kept its own private limit, so swarm coupling
+                // could lift a local memory five times past the bound every
+                // other write path enforces — and a PEER's energy is the
+                // multiplier here, so this is the ceiling that most needs to be
+                // one we control.
+                self.store.energy[i] = self.store.energy[i].clamp(0.001, ENERGY_CAP);
             }
         }
     }
@@ -148,7 +153,11 @@ impl Medium {
 
                 // Apply energy coupling (amplitude reinforcement)
                 let energy_boost = coupling * remote_energy * 0.1; // Scale down
-                self.store.energy[our_idx] = (self.store.energy[our_idx] + energy_boost).clamp(0.001, 10.0);
+                // #997: ENERGY_CAP, not 10.0 — see the note in `sync_with`. This
+                // is the same coupling reached over the wire, where the
+                // multiplier is a value we did not compute.
+                self.store.energy[our_idx] =
+                    (self.store.energy[our_idx] + energy_boost).clamp(0.001, ENERGY_CAP);
             }
         }
     }
