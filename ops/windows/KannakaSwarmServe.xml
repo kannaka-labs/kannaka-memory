@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Kannaka ask responder as a Windows Scheduled Task. The counterpart of
+  ops/serve-oracle3/kannaka-swarm-serve.service on a Linux node.
+
+  Register (the task runs as whoever registers it; Windows fills in the SID,
+  which is why none is stored here):
+
+      copy ops\windows\kannaka-swarm-serve.cmd "%USERPROFILE%\.local\bin\"
+      schtasks /create /tn KannakaSwarmServe /xml ops\windows\KannakaSwarmServe.xml /f
+      schtasks /run    /tn KannakaSwarmServe
+
+  Remove:  schtasks /delete /tn KannakaSwarmServe /f
+
+  Requires %USERPROFILE%\.kannaka-nats.env with NATS_USER / NATS_PASSWORD; the
+  wrapper refuses to start without it rather than advertise an ask it cannot
+  answer.
+
+  Three settings differ deliberately from the sibling KannakaSwarmJoin task,
+  which is a beacon rather than a responder:
+    * DisallowStartIfOnBatteries / StopIfGoingOnBatteries false - a node whose
+      presence advertises `ask` must not stop answering on a power event.
+    * StopOnIdleEnd false - same reason.
+    * MultipleInstancesPolicy IgnoreNew - two responders on one HRM must never
+      race; the wrapper already re-execs the binary itself.
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Kannaka ask responder - answers KANNAKA.ask.&lt;agent&gt; and KANNAKA.recall.&lt;agent&gt; (ADR-0026), windowless and self-restarting via kannaka-swarm-serve.cmd.</Description>
+    <URI>\KannakaSwarmServe</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RestartOnFailure>
+      <Count>10</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <LogonTrigger />
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless cmd.exe /c "%USERPROFILE%\.local\bin\kannaka-swarm-serve.cmd"</Arguments>
+    </Exec>
+  </Actions>
+</Task>

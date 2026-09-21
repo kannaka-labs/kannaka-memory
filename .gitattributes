@@ -1,0 +1,5 @@
+# schtasks requires its task XML to be UTF-16, which git would otherwise store
+# as an opaque binary blob — unreviewable, in a directory an operator has to
+# trust before registering it. This stores the file as UTF-8 and materialises
+# UTF-16 in the working tree, so diffs stay readable and the file stays valid.
+ops/windows/KannakaSwarmServe.xml working-tree-encoding=UTF-16LE-BOM text eol=crlf
