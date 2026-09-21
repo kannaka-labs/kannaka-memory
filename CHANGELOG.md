@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.9] — 2026-09-21
+
 ### Fixed — over-cap energy really is clamped on load now (#1008, #1009)
 
 0.16.6 said: *"Persisted over-cap energies are clamped on load: the live 7.74 /
@@ -52,6 +54,50 @@ express that.
 **ADR-0063: referential memory** — a fact with an authority must not be held as
 a wave. **ADR-0051** records that the Phase 3 gate was satisfied and the flag
 measured negative; the preconditions themselves shipped in 0.16.8 (#992).
+
+### Fixed — one data directory, one agent identity (#946, #1016)
+
+Two `kannaka remember` invocations against one data directory published under
+two *different* agent ids twenty seconds apart. ADR-0039's corroboration rests
+on distinct-lineage agreement, so a process that mints a fresh identity per run
+can manufacture its own corroborating peers — the Sybil shape the gate exists to
+prevent. The gate is off today, so this closes a hole rather than stopping an
+exploit.
+
+Two causes. A minted id was never written down: `persist_agent_id_compat()` is
+called from three init paths and never from `load()`, so a node that never ran
+`init` minted a new identity every process. And the persisted `agent_id` file
+was consulted **only when `config.toml` was absent** — a config that merely
+omitted `[agent] id` skipped it and minted, even on a node that already had a
+good id on disk. The precedence documented in `load()` (env > config.toml >
+persisted file > generate new) was aspirational rather than implemented.
+
+A serde default cannot tell "configured" from "defaulted", so the raw TOML is
+now checked for the key before deserializing. Persisting is best-effort and
+skipped under `KANNAKA_READONLY`.
+
+Still open in #946: binding an id to a lineage inside the gate, whether an
+ephemeral id should publish to `KANNAKA.memory.new` at all, and that this subject
+is bound to no JetStream stream so a sync cannot be audited after the fact.
+
+### Tests — ingest-cost probes, and the O(n²) located (#978; #1013, #1014, #1015)
+
+Three `#[ignore]`d probes (no CI cost) that measure ingest cost against store
+size. They locate #978's quadratic precisely, and correct where the issue
+placed it:
+
+| path | growth over ~8x size |
+|---|---|
+| `Medium::store` (flat backend) | **x18.74** |
+| `store_with_facets` (chiral, 3x rows) | x1.01 |
+| `HrmStore::insert` (either backend) | flat |
+
+The O(n) per insert is `apply_interference`, reached through `Medium::store` —
+not `HrmStore::insert`, which is flat on both backends. A store is flat for
+exactly one process lifetime: `HrmStore::new` sets `chiral: None`, and
+`ChiralMedium::load` converts a v1 file on first reload. That window is when
+bulk ingest happens, which is why a benchmark sees O(n²) and the fleet does not
+(both live stores verified on disk as v2/chiral).
 
 ### Added — two recall knobs that make measurement possible (#977, #1010; #979, #1011)
 
