@@ -264,26 +264,39 @@ fn store_and_recall_roundtrip() {
 }
 
 #[test]
-fn apply_interference_affects_energy() {
+// Renamed from `apply_interference_affects_energy`, which this cannot show.
+// Measured by mutation: with `apply_interference`'s energy write removed from
+// core.rs, storing still moves energy[0] from 1.0 to 1.0279 (with it: 1.0876).
+// So interference is roughly two thirds of the change and something else is the
+// rest — which means a bare "energy changed" assertion is satisfied by the
+// remainder alone and cannot isolate interference. Isolating it needs a control
+// arm (an orthogonal, non-interfering store) that this fixture does not have.
+fn storing_a_memory_changes_existing_wavefront_energy() {
     let mut medium = Medium::new();
-    let vector1 = vec![1.0; WAVEFRONT_DIM]; // All positive
-    let vector2 = vec![-1.0; WAVEFRONT_DIM]; // All negative (should cause destructive interference)
+    let vector1 = vec![1.0; WAVEFRONT_DIM];
 
     // Add first wavefront
     medium.add_wavefront(&vector1, "positive".to_string(), 1.0).unwrap();
     let initial_energy = medium.store.energy[0];
 
-    // Store second to trigger interference (apply_interference is private, go through store_audio path via raw)
-    // Use a direct approach: add wavefront then check interference manually
-    // Actually, we need to test apply_interference directly.
-    // Since it's now private in core.rs, we test through store() which calls it.
+    // `apply_interference` is private to core.rs, so this goes through `store()`,
+    // which calls it. (The old comment block here was a record of that being
+    // worked out, and `vector2` was a destructive partner that was never used.)
     let pipeline = make_test_pipeline();
     medium.store("negative memory", 1.0, &pipeline).unwrap();
 
     // Energy should change due to interference
     // Note: we can't directly test apply_interference since it's private,
     // but store() calls it internally. The first wavefront's energy should have changed.
-    assert!(medium.store.energy[0] != initial_energy || medium.wavefront_count() == 2);
+    // Was: `energy[0] != initial_energy || wavefront_count() == 2`. The second
+    // disjunct is TRUE by construction once two wavefronts are stored, so the
+    // assertion could never fail and the test named for interference affecting
+    // energy did not check that it does. Measured: 1.0 -> 1.0876.
+    let after = medium.store.energy[0];
+    assert!(
+        (after - initial_energy).abs() > 1e-6,
+        "storing an interfering memory must change the first wavefront's energy: {initial_energy} -> {after}"
+    );
 }
 
 #[test]

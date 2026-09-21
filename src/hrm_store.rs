@@ -3338,14 +3338,16 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
 
-        // Create and populate store
-        {
+        // Create and populate store. The block yields the inserted id so the
+        // reload below can check identity, not just content.
+        let id = {
             let mut store = HrmStore::new(pipeline1, path.clone());
             let memory = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "persistent content".to_string());
             let id = store.insert(memory).unwrap();
             store.flush().unwrap(); // Force save
             assert_eq!(store.count(), 1);
-        }
+            id
+        };
 
         // Load store and verify
         {
@@ -3353,6 +3355,14 @@ mod tests {
             assert_eq!(store.count(), 1);
             let memories = store.all_memories().unwrap();
             assert_eq!(memories[0].content, "persistent content");
+            // The id was captured on insert and never checked. Content surviving a
+            // round trip does not mean IDENTITY survived it, and an id rewritten on
+            // reload breaks every external reference to the memory — the same defect
+            // #949 fixed on the import path.
+            assert_eq!(
+                memories[0].id, id,
+                "the reloaded memory must keep the id it was inserted with"
+            );
         }
     }
 
