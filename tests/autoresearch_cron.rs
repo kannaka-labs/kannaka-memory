@@ -165,6 +165,10 @@ fn run(s: &Scratch, extra_env: &[(&str, &str)]) -> i32 {
         std::env::var("PATH").unwrap_or_default()
     );
     let mut cmd = Command::new("bash");
+    // `cargo test` exports CARGO (and often CARGO_HOME) into the test process.
+    // The cron has neither, and leaving them set would let find_cargo succeed
+    // through a door production does not have.
+    cmd.env_remove("CARGO").env_remove("CARGO_HOME");
     cmd.arg(&script)
         .env("PATH", path)
         .env("AUTORESEARCH_REPO", s.repo())
@@ -236,6 +240,77 @@ fn an_explicitly_root_owned_checkout_may_opt_in() {
         "OODA_ALLOW_ROOT=1 must lift the refusal:\n{log}"
     );
     assert_eq!(code, 0, "and the cycle should then run normally\n{log}");
+}
+
+/// Move the cargo stub off PATH and into a scratch `$HOME/.cargo/bin`, the way
+/// rustup installs it. Returns the HOME to run with.
+fn hide_cargo_in_home(s: &Scratch) -> PathBuf {
+    let home = s.root.join("home");
+    fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+    fs::rename(s.bin().join("cargo"), home.join(".cargo/bin/cargo")).unwrap();
+    home
+}
+
+/// PATH with nothing of ours on it — enough to run the script, no cargo.
+fn bare_path(s: &Scratch) -> String {
+    format!("{}:/usr/bin:/bin", s.bin().display())
+}
+
+#[test]
+fn cargo_is_found_by_path_when_a_scope_strips_it_from_path() {
+    // THE 126-night failure. A systemd-run scope inherits
+    // PATH=/sbin:/bin:/usr/sbin:/usr/bin, and rustup puts cargo in
+    // ~/.cargo/bin, which only a login profile adds. `cargo run` exited 127
+    // with "No such file or directory" and `2>/dev/null` ate the sentence.
+    let s = scratch(GOOD_RESEARCH, 0);
+    make_binary_stale(&s);
+    let home = hide_cargo_in_home(&s);
+
+    let code = run(
+        &s,
+        &[
+            ("OODA_ALLOW_BUILD", "1"),
+            ("PATH", &bare_path(&s)),
+            ("HOME", &home.display().to_string()),
+        ],
+    );
+    let log = s.log();
+
+    assert!(
+        !log.contains("CANNOT BUILD"),
+        "cargo under $HOME/.cargo/bin must be found even when PATH lacks it:\n{log}"
+    );
+    assert!(
+        s.cargo_calls().contains("build --release --bin research"),
+        "and must actually be invoked; cargo saw: {:?}",
+        s.cargo_calls()
+    );
+    assert_eq!(code, 0, "the cycle should then complete\n{log}");
+}
+
+#[test]
+fn a_genuinely_absent_cargo_says_so_instead_of_failing_blank() {
+    let s = scratch(GOOD_RESEARCH, 0);
+    make_binary_stale(&s);
+    fs::remove_file(s.bin().join("cargo")).unwrap();
+    let empty_home = s.root.join("empty-home");
+    fs::create_dir_all(&empty_home).unwrap();
+
+    let code = run(
+        &s,
+        &[
+            ("OODA_ALLOW_BUILD", "1"),
+            ("PATH", &bare_path(&s)),
+            ("HOME", &empty_home.display().to_string()),
+        ],
+    );
+    let log = s.log();
+
+    assert_eq!(code, 1, "a missing cargo must fail the run\n{log}");
+    assert!(
+        log.contains("CANNOT BUILD") && log.contains("not on PATH"),
+        "the failure must name the missing tool, not print nothing:\n{log}"
+    );
 }
 
 #[test]

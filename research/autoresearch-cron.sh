@@ -104,13 +104,20 @@ echo "resolved OODA level=$LEVEL (state=${STATE_LEVEL:-none}, env=${OODA_LEVEL:-
 
 # ── Running and building the research binary (#939) ─────────────────────────
 # This script used to invoke `cargo run --release --bin research` with stderr
-# sent to /dev/null. On a one-core 5.5 GB box, inside a MemoryMax=2200M scope,
-# under `timeout 600`, that compiles first — and a stale target tree means a
-# cold build every night. It aborted 126 nights out of 126, and the discarded
-# stderr is what made the cause unknowable for four months.
+# sent to /dev/null, and aborted 126 nights out of 126.
 #
-# So: run the PREBUILT binary, keep its stderr, and never rebuild implicitly.
-# A build is a separate, budgeted, separately-logged act.
+# The cause was NOT that the rebuild did not fit under MemoryMax, which is what
+# #939 (and the first pass at this fix) assumed. It never reached a compile.
+# `cargo` is at ~/.cargo/bin/cargo, on PATH only via the shell profile, and a
+# systemd-run scope inherits PATH=/sbin:/bin:/usr/sbin:/usr/bin. Reproduced on
+# O1 on 2026-09-21: exit 127, "failed to run command 'cargo': No such file or
+# directory". Empty stdout, so awk matched no fitness line, so the loop printed
+# "FAILED (no fitness line)" — and the one sentence naming the real cause went
+# to /dev/null. Four months of a silent, trivially fixable fault.
+#
+# So: run the PREBUILT binary, keep its stderr, never rebuild implicitly, and
+# resolve cargo by path rather than trusting an inherited PATH. A build is a
+# separate, budgeted, separately-logged act.
 
 # Is the prebuilt binary newer than everything it is built from?
 research_binary_is_stale() {
@@ -121,13 +128,39 @@ research_binary_is_stale() {
     return 1
 }
 
+# Where cargo actually is. A `systemd-run` scope inherits PATH from the manager,
+# which is `/sbin:/bin:/usr/sbin:/usr/bin` — rustup installs to ~/.cargo/bin, put
+# on PATH by the shell profile that a scope never sources. THIS is what failed
+# for 126 consecutive nights: `cargo run` inside the cron's scope exited 127
+# with "failed to run command 'cargo': No such file or directory", and the
+# `2>/dev/null` sent that sentence nowhere. It never reached a compile at all.
+find_cargo() {
+    local c
+    c="${CARGO:-}"
+    [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
+    c=$(command -v cargo 2>/dev/null) && [[ -n "$c" ]] && { echo "$c"; return 0; }
+    for c in "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" "${HOME:-/root}/.cargo/bin/cargo" \
+             /usr/local/cargo/bin/cargo /usr/local/bin/cargo; do
+        [[ -x "$c" ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
 # The ONLY place this script compiles. Its own timeout, its own log, and an
 # exit status read from cargo rather than from a pipeline's last command —
 # `if ! cargo build ... | tail -5` tests tail, which always succeeds.
 build_research() {
     local why="$1"
-    echo "building research ($why); budget ${BUILD_TIMEOUT}s, log $BUILD_LOG"
-    if timeout "$BUILD_TIMEOUT" cargo build --release --bin research >>"$BUILD_LOG" 2>&1; then
+    local cargo_bin
+    if ! cargo_bin=$(find_cargo); then
+        echo "CANNOT BUILD: cargo is not on PATH ($PATH) and was not found at"
+        echo "  \${CARGO}, \${CARGO_HOME}/bin/cargo, \$HOME/.cargo/bin/cargo, /usr/local/bin/cargo."
+        echo "A systemd-run scope does not source a login profile, so a rustup install"
+        echo "under ~/.cargo/bin is invisible to it. Set CARGO=/path/to/cargo in the unit."
+        return 1
+    fi
+    echo "building research ($why) with $cargo_bin; budget ${BUILD_TIMEOUT}s, log $BUILD_LOG"
+    if timeout "$BUILD_TIMEOUT" "$cargo_bin" build --release --bin research >>"$BUILD_LOG" 2>&1; then
         echo "build ok"
         return 0
     fi
