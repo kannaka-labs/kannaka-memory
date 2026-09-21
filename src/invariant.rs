@@ -608,7 +608,7 @@ mod perf_probe {
     /// Not a correctness test — a measurement, kept out of the normal run.
     /// `cargo test --release --lib perf_probe -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "perf probe, not a correctness test: cargo test --release --lib perf_probe -- --ignored --nocapture"]
     fn measure_against_naive() {
         use std::time::Instant;
         let n = 1500usize;

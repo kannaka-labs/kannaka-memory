@@ -1111,8 +1111,13 @@ fn extract_wavefront_count_patterns() {
     assert_eq!(extract_wavefront_count("wavefronts strengthened"), None);
 }
 
+// Was #[ignore]d as "Requires git repo - run manually". It does not: the test
+// builds its OWN repo in a TempDir and configures a user there, so it is
+// hermetic. What it needs is the `git` BINARY, which CI has (it checks the
+// repo out with it). Deliberately not guarded by a "skip if git is missing"
+// branch — a silent skip is a vacuous pass, and this file had one of those
+// removed in #1001.
 #[test]
-#[ignore] // Requires git repo - run manually
 fn save_and_commit_creates_git_commit() {
     use tempfile::TempDir;
 
@@ -1154,8 +1159,13 @@ fn save_and_commit_creates_git_commit() {
     assert!(hrm_path.exists());
 }
 
+// Was #[ignore]d as "Requires git repo - run manually". It does not: the test
+// builds its OWN repo in a TempDir and configures a user there, so it is
+// hermetic. What it needs is the `git` BINARY, which CI has (it checks the
+// repo out with it). Deliberately not guarded by a "skip if git is missing"
+// branch — a silent skip is a vacuous pass, and this file had one of those
+// removed in #1001.
 #[test]
-#[ignore] // Requires git repo - run manually
 fn history_returns_commits() {
     use tempfile::TempDir;
 
