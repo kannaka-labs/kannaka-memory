@@ -25,13 +25,20 @@
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 set -u
 
-REPO=/home/opc/kannaka-memory
-LOG_DIR=/home/opc/.kannaka
+# Overridable so the script's own guards can be exercised against a scratch
+# tree (tests/autoresearch-cron.test.sh); the defaults are O1's real paths.
+REPO="${AUTORESEARCH_REPO:-/home/opc/kannaka-memory}"
+LOG_DIR="${AUTORESEARCH_LOG_DIR:-/home/opc/.kannaka}"
 LOG="$LOG_DIR/autoresearch-$(date +%Y-%m-%d).log"
 LEVEL="${OODA_LEVEL:-4}"
 RUNS="${OODA_RUNS:-5}"
 KEEP_THRESHOLD="${OODA_KEEP:-0.005}"
 MAX_RUNTIME_SEC="${OODA_MAX_RUNTIME:-3600}"  # 60 min ceiling
+RUN_TIMEOUT="${OODA_RUN_TIMEOUT:-600}"       # per research invocation
+BUILD_TIMEOUT="${OODA_BUILD_TIMEOUT:-2400}"  # a cold build on a one-core box
+RESEARCH_BIN="$REPO/target/release/research"
+BUILD_LOG="$LOG_DIR/autoresearch-build-$(date +%Y-%m-%d).log"
+RUN_ERR="$LOG_DIR/.autoresearch-run.err"
 
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
@@ -71,19 +78,89 @@ fi
 LEVEL="${OODA_LEVEL:-${STATE_LEVEL:-4}}"
 echo "resolved OODA level=$LEVEL (state=${STATE_LEVEL:-none}, env=${OODA_LEVEL:-unset})"
 
+# ── Running and building the research binary (#939) ─────────────────────────
+# This script used to invoke `cargo run --release --bin research` with stderr
+# sent to /dev/null. On a one-core 5.5 GB box, inside a MemoryMax=2200M scope,
+# under `timeout 600`, that compiles first — and a stale target tree means a
+# cold build every night. It aborted 126 nights out of 126, and the discarded
+# stderr is what made the cause unknowable for four months.
+#
+# So: run the PREBUILT binary, keep its stderr, and never rebuild implicitly.
+# A build is a separate, budgeted, separately-logged act.
+
+# Is the prebuilt binary newer than everything it is built from?
+research_binary_is_stale() {
+    [[ -x "$RESEARCH_BIN" ]] || return 0
+    local newer
+    newer=$(find src Cargo.toml Cargo.lock -type f -newer "$RESEARCH_BIN" 2>/dev/null | head -5)
+    [[ -n "$newer" ]] && { echo "$newer"; return 0; }
+    return 1
+}
+
+# The ONLY place this script compiles. Its own timeout, its own log, and an
+# exit status read from cargo rather than from a pipeline's last command —
+# `if ! cargo build ... | tail -5` tests tail, which always succeeds.
+build_research() {
+    local why="$1"
+    echo "building research ($why); budget ${BUILD_TIMEOUT}s, log $BUILD_LOG"
+    if timeout "$BUILD_TIMEOUT" cargo build --release --bin research >>"$BUILD_LOG" 2>&1; then
+        echo "build ok"
+        return 0
+    fi
+    local rc=$?
+    echo "BUILD FAILED (exit $rc$([[ $rc == 124 ]] && echo ', timed out')); last lines of $BUILD_LOG:"
+    tail -15 "$BUILD_LOG" | sed 's/^/    /'
+    return 1
+}
+
+# One research invocation. Prints the fitness value on stdout, or nothing;
+# stderr is kept so a failure can say why.
+run_research() {
+    : >"$RUN_ERR"
+    timeout "$RUN_TIMEOUT" "$RESEARCH_BIN" --level "$LEVEL" 2>"$RUN_ERR" \
+        | awk '/^fitness:|^l[0-9]_fitness:/ { print $2; exit }'
+}
+
+# Why a run produced no fitness line — the detail the /dev/null was eating.
+explain_failed_run() {
+    if [[ -s "$RUN_ERR" ]]; then
+        echo "    stderr: $(tail -3 "$RUN_ERR" | tr '\n' ' ')"
+    else
+        echo "    (no stderr; the binary produced no fitness line — check $RESEARCH_BIN --level $LEVEL by hand)"
+    fi
+}
+
+STALE_FILES=$(research_binary_is_stale) && {
+    if [[ ! -x "$RESEARCH_BIN" ]]; then
+        REASON="$RESEARCH_BIN is missing"
+    else
+        REASON="$RESEARCH_BIN ($(date -r "$RESEARCH_BIN" -Iseconds 2>/dev/null)) is older than its sources, e.g. $(echo "$STALE_FILES" | tr '\n' ' ')"
+    fi
+    if [[ "${OODA_ALLOW_BUILD:-0}" == "1" ]]; then
+        echo "$REASON — OODA_ALLOW_BUILD=1, building"
+        build_research "stale or missing binary" || exit 1
+    else
+        echo "ABORTING: $REASON."
+        echo "This script will not compile inside the cron's memory scope. Build it deliberately:"
+        echo "    cd $REPO && cargo build --release --bin research"
+        echo "or re-run with OODA_ALLOW_BUILD=1 to let this script build it (budget ${BUILD_TIMEOUT}s, log $BUILD_LOG)."
+        exit 1
+    fi
+}
+
 # â”€â”€ Baseline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 echo "--- baseline ---"
 BASELINE_SUM=0
 BASELINE_RUNS=0
 for i in $(seq 1 "$RUNS"); do
-    RESULT=$(timeout 600 cargo run --release --quiet --bin research -- --level "$LEVEL" 2>/dev/null \
-             | awk '/^fitness:|^l[0-9]_fitness:/ { print $2; exit }')
+    RESULT=$(run_research)
     if [[ -n "$RESULT" ]]; then
         BASELINE_SUM=$(echo "$BASELINE_SUM + $RESULT" | bc -l)
         BASELINE_RUNS=$((BASELINE_RUNS + 1))
         echo "  run $i fitness=$RESULT"
     else
         echo "  run $i FAILED (no fitness line)"
+        explain_failed_run
     fi
 done
 
@@ -122,8 +199,11 @@ if ! grep -q "$PARAM:.*$TO," src/bin/research.rs; then
     exit 0
 fi
 
-# Build (must succeed before we run anything).
-if ! cargo build --release --quiet --bin research 2>&1 | tail -5; then
+# Build (must succeed before we run anything). The param edit above changes
+# source, so this build is unavoidable — unlike the implicit one the baseline
+# used to trigger. It goes through build_research so a failure is reported from
+# cargo's own exit status and its output survives in $BUILD_LOG.
+if ! build_research "hypothesis $PARAM $FROM -> $TO"; then
     echo "build failed; reverting"
     git checkout -- src/bin/research.rs
     exit 1
@@ -140,12 +220,14 @@ echo "--- hypothesis runs ---"
 HYP_SUM=0
 HYP_RUNS=0
 for i in $(seq 1 "$RUNS"); do
-    RESULT=$(timeout 600 cargo run --release --quiet --bin research -- --level "$LEVEL" 2>/dev/null \
-             | awk '/^fitness:|^l[0-9]_fitness:/ { print $2; exit }')
+    RESULT=$(run_research)
     if [[ -n "$RESULT" ]]; then
         HYP_SUM=$(echo "$HYP_SUM + $RESULT" | bc -l)
         HYP_RUNS=$((HYP_RUNS + 1))
         echo "  run $i fitness=$RESULT"
+    else
+        echo "  run $i FAILED (no fitness line)"
+        explain_failed_run
     fi
 done
 

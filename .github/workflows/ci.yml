@@ -88,8 +88,11 @@ jobs:
         # (glyph event -> Fano-line well -> beam -> recall_against_ids boost)
         # that must gate so the loop can't silently break. The heavier
         # integration tests (dolt/audio, external deps) stay excluded by not
-        # naming them.
-        run: cargo test --lib --bins --test nats_contract_conformance --test attention_gravity_e2e
+        # naming them. autoresearch_cron (issue #939) is named for the same
+        # reason: it guards the nightly OODA cron's invocation path, which
+        # failed silently for 126 consecutive nights, and it needs only bash,
+        # git and a scratch directory.
+        run: cargo test --lib --bins --test nats_contract_conformance --test attention_gravity_e2e --test autoresearch_cron
 
       - name: Bridge feature (hive_bridge policy/map/roster + bridge daemons)
         working-directory: kannaka-memory
