@@ -45,6 +45,30 @@ exec >> "$LOG" 2>&1
 
 echo "=== autoresearch start: $(date -Iseconds) level=$LEVEL runs=$RUNS keep=<=-$KEEP_THRESHOLD ==="
 
+# ── Never as root (#939) ────────────────────────────────────────────────────
+# O1's crontab invoked this through `sudo systemd-run --scope` to get the
+# memory cap, which also ran it as uid 0. The first thing the script does is
+# `git reset --hard origin/master`, so every firing rewrote part of an
+# opc-owned checkout as root. By 2026-09-21 that was 176 working-tree files
+# and 991 objects under .git, and an ordinary `git pull` failed with
+# "unable to unlink old 'ops/roll/roll-node.sh': Permission denied" — the
+# repo had become un-updatable by its owner, silently, one night at a time.
+#
+# The memory cap does not require running the payload as root:
+#   sudo systemd-run --scope --collect -p MemoryMax=2200M -p MemorySwapMax=0 \
+#        --uid=opc --setenv=HOME=/home/opc <this script>
+# `id -u` rather than $EUID: it is portable to sh, and it is resolvable on
+# PATH, which is how tests/autoresearch_cron.rs exercises this branch without
+# needing a root runner.
+if [[ "$(id -u)" -eq 0 && "${OODA_ALLOW_ROOT:-0}" != "1" ]]; then
+    echo "REFUSING to run as root: this script rewrites $REPO, and doing that as"
+    echo "uid 0 leaves root-owned files in a checkout its owner can no longer update."
+    echo "Add --uid=<owner> --setenv=HOME=<owner home> to the systemd-run invocation"
+    echo "(the memory cap is unaffected), or set OODA_ALLOW_ROOT=1 if the checkout"
+    echo "really is root's."
+    exit 1
+fi
+
 # Lock so two cron firings (or a manual run + cron) don't collide.
 LOCK_DIR="$LOG_DIR/.autoresearch.lock"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then

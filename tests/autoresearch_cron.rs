@@ -180,9 +180,63 @@ fn run(s: &Scratch, extra_env: &[(&str, &str)]) -> i32 {
     cmd.output().expect("run cron").status.code().unwrap_or(-1)
 }
 
+/// Put a stub `id` on PATH so the root-refusal branch can be exercised without
+/// a root runner. The script resolves `id` on PATH for exactly this reason.
+fn stub_id_as_root(s: &Scratch) {
+    write_exec(
+        &s.bin().join("id"),
+        "#!/bin/sh\nif [ \"$1\" = \"-u\" ]; then echo 0; else /usr/bin/id \"$@\"; fi\n",
+    );
+}
+
 const GOOD_RESEARCH: &str = "#!/bin/sh\necho 'fitness:              0.130145'\n";
 const FAILING_RESEARCH: &str =
     "#!/bin/sh\necho 'ld: cannot open shared object file' >&2\nexit 101\n";
+
+#[test]
+fn running_as_root_is_refused_before_the_checkout_is_touched() {
+    // O1's crontab reached this script through `sudo systemd-run --scope`, so
+    // it ran as uid 0 and its `git reset --hard` rewrote an opc-owned checkout
+    // as root — 176 working-tree files and 991 objects under .git by the time
+    // a plain `git pull` started failing with "Permission denied".
+    let s = scratch(GOOD_RESEARCH, 0);
+    stub_id_as_root(&s);
+
+    let code = run(&s, &[]);
+    let log = s.log();
+
+    assert_eq!(code, 1, "running as root must abort\n{log}");
+    assert!(
+        log.contains("REFUSING to run as root"),
+        "the refusal must name the problem:\n{log}"
+    );
+    assert!(
+        log.contains("--uid="),
+        "and must name the fix, since the memory cap is why sudo was there:\n{log}"
+    );
+    assert!(
+        !log.contains("--- baseline ---"),
+        "it must refuse BEFORE doing any work on the checkout:\n{log}"
+    );
+}
+
+#[test]
+fn an_explicitly_root_owned_checkout_may_opt_in() {
+    // A root-owned checkout is a legitimate configuration; the guard is about
+    // the accident, not the arrangement. Without this, the refusal would be
+    // untestable in the direction that matters — that it can be turned off.
+    let s = scratch(GOOD_RESEARCH, 0);
+    stub_id_as_root(&s);
+
+    let code = run(&s, &[("OODA_ALLOW_ROOT", "1")]);
+    let log = s.log();
+
+    assert!(
+        !log.contains("REFUSING to run as root"),
+        "OODA_ALLOW_ROOT=1 must lift the refusal:\n{log}"
+    );
+    assert_eq!(code, 0, "and the cycle should then run normally\n{log}");
+}
 
 #[test]
 fn a_stale_binary_aborts_loudly_instead_of_building_inside_the_cron() {
