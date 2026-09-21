@@ -311,6 +311,69 @@ pub(crate) fn verify_blake3_trailing<P: AsRef<Path>>(path: P) -> Result<(), Medi
     Ok(())
 }
 
+/// Offsets of the wall-clock timestamp in a .hrm header.
+///
+/// v1 and v2 lay the header out identically — magic(4) + version(4) +
+/// `timestamp_millis`(8) — so one window covers both.
+const HRM_TIMESTAMP_RANGE: std::ops::Range<u64> = 8..16;
+
+/// A digest of what a .hrm file MEANS, ignoring when it was written.
+///
+/// `blake3` over the whole file answers "are these the same bytes", which is
+/// not the question an operator asks. Every save stamps `Utc::now()` into the
+/// header and the trailing checksum covers it, so two saves of identical
+/// content a millisecond apart differ — same length, different checksum,
+/// identical meaning. #952 fixed the other half of this (HashMaps serialized
+/// in iteration order) and noted that sorting alone does not make saves
+/// byte-identical; this is that remainder.
+///
+/// Skips the timestamp window and the trailing 32-byte checksum (which is a
+/// function of both). Two saves of an unchanged medium produce the same
+/// digest; any change to hemispheres, callosum or scales changes it.
+///
+/// This does NOT make the FILES byte-identical, and deliberately so: the
+/// save timestamp is real information. It makes the QUESTION answerable
+/// without destroying it.
+pub fn content_digest<P: AsRef<Path>>(path: P) -> Result<String, MediumError> {
+    let path = path.as_ref();
+    let size = std::fs::metadata(path)?.len();
+    let end = HRM_TIMESTAMP_RANGE.end;
+    if size < 32 + end {
+        // Too small to hold a header and a checksum. Digest what is there
+        // rather than inventing a window past the end of the file.
+        let bytes = std::fs::read(path)?;
+        return Ok(blake3::hash(&bytes).to_hex().to_string());
+    }
+    let body_len = size - 32;
+    let mut f = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 65536];
+    let mut pos = 0u64;
+    while pos < body_len {
+        let want = (body_len - pos).min(buf.len() as u64) as usize;
+        let n = std::io::Read::read(&mut f, &mut buf[..want])?;
+        if n == 0 { break; }
+        // Feed only the bytes outside the timestamp window. The window is
+        // 8 bytes at a fixed offset, so it falls inside the first chunk in
+        // practice — but slicing per chunk keeps this correct for any
+        // buffer size rather than relying on that.
+        let chunk_start = pos;
+        let chunk_end = pos + n as u64;
+        let skip_start = HRM_TIMESTAMP_RANGE.start.max(chunk_start);
+        let skip_end = end.min(chunk_end);
+        if skip_start >= skip_end {
+            hasher.update(&buf[..n]);
+        } else {
+            let a = (skip_start - chunk_start) as usize;
+            let b = (skip_end - chunk_start) as usize;
+            hasher.update(&buf[..a]);
+            hasher.update(&buf[b..n]);
+        }
+        pos = chunk_end;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 impl ChiralMedium {
     /// Save the chiral medium to a .hrm v2 file.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), MediumError> {
@@ -734,6 +797,54 @@ mod tests {
     use crate::codebook::Codebook;
     use crate::encoding::{EncodingPipeline, SimpleHashEncoder};
     use std::path::PathBuf;
+
+    /// #952 left this half open and it was lost when the issue auto-closed:
+    /// sorting the HashMaps removed the nondeterministic ORDER, but every save
+    /// still stamps `Utc::now()` into the header and the trailing checksum
+    /// covers it. So a file hash still cannot answer "did this store change",
+    /// which is the cheapest integrity check an operator has — and the one the
+    /// encoder-flip runbook leans on ("assert the store sha changed").
+    ///
+    /// Three assertions, and the third keeps the other two honest: a digest
+    /// that ignored the whole file would pass the first two.
+    #[test]
+    fn content_digest_ignores_the_save_timestamp_but_not_the_content() {
+        let encoder = Box::new(SimpleHashEncoder::new(384, 42));
+        let pipeline = EncodingPipeline::new(encoder, Codebook::new(384, WAVEFRONT_DIM, 42));
+        let mut cm = ChiralMedium::new();
+        cm.store("a memory that should hash the same twice", 0.9, &pipeline).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let a: PathBuf = dir.path().join("a.hrm");
+        let b: PathBuf = dir.path().join("b.hrm");
+        let c: PathBuf = dir.path().join("c.hrm");
+
+        cm.save(&a).unwrap();
+        // Guarantee a different millisecond, so the header really does differ.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cm.save(&b).unwrap();
+
+        let whole = |p: &PathBuf| blake3::hash(&std::fs::read(p).unwrap()).to_hex().to_string();
+        assert_ne!(
+            whole(&a),
+            whole(&b),
+            "the files should NOT be byte-identical: the save timestamp is real information and this does not remove it"
+        );
+        assert_eq!(
+            content_digest(&a).unwrap(),
+            content_digest(&b).unwrap(),
+            "same content saved twice must produce the same content digest"
+        );
+
+        cm.store("a second memory, so the content genuinely differs", 0.9, &pipeline)
+            .unwrap();
+        cm.save(&c).unwrap();
+        assert_ne!(
+            content_digest(&a).unwrap(),
+            content_digest(&c).unwrap(),
+            "a real change must move the digest, or it is measuring nothing"
+        );
+    }
 
     // ─── ADR-0049 facet-encoding serialization lock ──────────────────────────
     //
