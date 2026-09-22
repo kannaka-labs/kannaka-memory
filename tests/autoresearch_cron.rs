@@ -1,22 +1,30 @@
 //! Guards for `research/autoresearch-cron.sh` (#939).
 //!
 //! The nightly OODA cron aborted 126 nights out of 126 between 2026-05-09 and
-//! 2026-09-12. It invoked `cargo run --release --bin research` — which compiles
-//! first — inside a `MemoryMax=2200M` scope on a one-core box under a 600 s
-//! timeout, with the build's stderr sent to `/dev/null`. The research binary
-//! itself was fine; run directly on O1 it finishes in under four minutes.
+//! 2026-09-12, invoking `cargo run --release --bin research` with stderr sent
+//! to `/dev/null`.
 //!
-//! Three properties keep that from recurring, and all three are asserted here
-//! by running the real script against a scratch tree with a stubbed `cargo`
-//! and a stubbed research binary:
+//! #939 and the first fix both blamed a cold rebuild that would not fit under
+//! `MemoryMax=2200M`. That was wrong: it never reached a compile. `cargo` is at
+//! `~/.cargo/bin/cargo`, on PATH only via the shell profile, and a
+//! `systemd-run` scope inherits `PATH=/sbin:/bin:/usr/sbin:/usr/bin`. It exited
+//! 127 — "failed to run command 'cargo': No such file or directory" — which
+//! gave empty stdout, no fitness line, and a discarded explanation.
+//!
+//! The properties asserted here, by running the real script against a scratch
+//! tree with a stubbed `cargo` and a stubbed research binary:
 //!
 //! 1. it runs the PREBUILT binary, and never compiles implicitly before the
 //!    baseline;
 //! 2. a missing or stale binary aborts loudly and says so, rather than
 //!    silently triggering a build inside the cron's memory scope;
-//! 3. a failed run reports the binary's stderr instead of discarding it, and a
-//!    failed build is detected from cargo's exit status rather than from a
-//!    pipeline whose last command is `tail`.
+//! 3. a failed run reports the binary's stderr instead of discarding it;
+//! 4. cargo is resolved by path, so a scope's stripped PATH cannot hide it,
+//!    and a genuinely absent cargo is named rather than failing blank;
+//! 5. a build failure is reported with cargo's OWN exit status — not `tail`'s,
+//!    and not the 0 that a false `if` with no else branch returns;
+//! 6. it refuses to run as root, which is how `sudo systemd-run` left 176
+//!    working-tree files and 991 git objects owned by uid 0.
 
 #![cfg(unix)]
 

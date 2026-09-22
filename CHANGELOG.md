@@ -1,6 +1,86 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.10] — 2026-09-21
+
+### Fixed — autoresearch had produced nothing for 126 nights, and the reason was a PATH (#939, #1023, #1024, #1025)
+
+`research/autoresearch-cron.sh` runs nightly on O1 and again on Sundays at OODA
+level 5. **Every one of the 126 retained logs ends the same way**, from
+2026-05-09 to 2026-09-12: five `FAILED (no fitness line)` and `all baseline runs
+failed; aborting`. `experiments/ooda-state.json` has been frozen at
+`"last_harvest": "2026-04-14"` throughout.
+
+**The stated cause was wrong, and so was the first fix's restatement of it.**
+#939 attributed the abort to a cold rebuild that would not fit under
+`MemoryMax=2200M`, and #1023 repeated that. The script never reached a compile.
+Running the original command inside the exact cron scope with stderr visible:
+
+```
+timeout: failed to run command 'cargo': No such file or directory
+cargo exit=127
+```
+
+`cargo` is at `~/.cargo/bin/cargo`, which rustup adds to PATH from the shell
+profile. A `systemd-run` scope sources no profile and inherits the manager's
+`PATH=/sbin:/bin:/usr/sbin:/usr/bin`. Exit 127 gives empty stdout, so the `awk`
+fitness match found nothing, so the loop printed "FAILED (no fitness line)" —
+and the one sentence naming the cause went to `2>/dev/null`. Four months of a
+fault one absolute path wide, and the discarded stderr is what made it last.
+
+What changed:
+
+- The baseline and hypothesis loops run the **prebuilt** `target/release/research`
+  and keep its stderr; a failed run prints it instead of only "no fitness line".
+- A missing or stale binary aborts loudly, naming the binary, what is newer than
+  it, and the command to build it. `OODA_ALLOW_BUILD=1` opts back in.
+- Every compile goes through one `build_research` helper that resolves cargo
+  through `$CARGO`, PATH, `$CARGO_HOME/bin`, `$HOME/.cargo/bin` and
+  `/usr/local`, with its own timeout and its own log — and refuses with a named
+  reason when none of them holds an executable.
+- The script **refuses to run as root**. O1's crontab reached it through
+  `sudo systemd-run --scope` for the memory cap, so its opening
+  `git reset --hard origin/master` had been rewriting an opc-owned checkout as
+  uid 0 — **176 working-tree files and 991 objects under `.git`** by 2026-09-21,
+  at which point `git pull` failed with `unable to unlink old
+  'ops/roll/roll-node.sh': Permission denied` and the script's own nightly sync
+  had been failing identically, reported nowhere. `--uid=<owner>` keeps the
+  memory cap and fixes it; `OODA_ALLOW_ROOT=1` is there for a checkout that
+  really is root's.
+
+Two status-reading defects were found in the same file, both the same shape:
+`if ! cargo build ... | tail -5` tested `tail`, so a failed build reported
+success (#1023); and `local rc=$?` placed after a false `if` reported every
+failed build as `exit 0` (#1025). The second survived its first test because
+that test asserted only that a failure was reported, never what the report said.
+
+`tests/autoresearch_cron.rs` runs the real script against a scratch tree with a
+stubbed cargo and a stubbed research binary, and is named explicitly in
+`ci.yml`. Six mutation controls were run against the real script on O1 and all
+six were detected.
+
+⚠ Operational, not in this tag: O1's crontab now passes `--uid=opc
+--setenv=HOME=/home/opc --setenv=OODA_ALLOW_BUILD=1`, both entries log to a real
+file instead of `/dev/null`, and the Sunday entry's `-p
+WorkingDirectory=` — not a valid property for a scope, so that run had **never
+started** either — has been removed. A no-push validation cycle on 2026-09-21
+completed baseline, build, hypothesis and revert: the first full OODA cycle in
+126 nights.
+
+### Fixed — the facet-decompose flag is per thread, so tests stop racing (#942, #1022)
+
+Four tests mutated `KANNAKA_FACET_DECOMPOSE` in the **process** environment
+while `cargo test` ran them as threads, so a reader in another test saw a value
+it never set: 2 of 3 full-suite runs failed on *"flag off must store exactly one
+wavefront"*. #986 made the guard restore on drop, which fixed the durable leak
+but not the race, and said so — the victim was a reader that took no lock, and
+serialising the mutators could never reach it.
+
+The refactor #986 declined turned out to be one function: `decompose_enabled`
+has exactly one production call site. Tests now set a **thread-local override**
+that it consults first; production is untouched and still reads the environment.
+Net −25 lines, with the mutex, the restore-on-drop guard and its test all dead
+and removed. The new test has a control arm so it cannot pass by the override
+doing nothing.
 
 ### Fixed — a reply may only go to the inbox that asked (#943, #1020)
 
