@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### A fresh store is chiral from birth — `remember --batch` no longer builds a different store (#917, #1031)
+
+`HrmStore::new` started FLAT and only became chiral when the next process
+loaded it (`ChiralMedium::load` converts a v1 file). So the shape of a store
+depended on how many processes had touched it: twenty `kannaka remember`
+calls, each saving and the next reloading, produced a v2 store with **61**
+rows from twenty compound turns; one `remember --batch` of the same twenty
+lines never reloaded, stayed on the flat branch of `absorb`, minted **no
+facets**, and wrote a v1 store with **20** rows. The flat branch also pays
+`apply_interference` over the whole medium on every insert — 0.797·n ms/item,
+455 ms/item at n=600 against 100 chiral, ~16× at n=2400 — so bulk ingest was
+quadratic for no reason but a missed reload. Identical input, different store;
+ruled an ingest correctness bug, not a benchmark artifact.
+
+Now `new` builds the chiral medium the way a v1→v2 conversion would (an
+empty `from_medium`), so a store that was never reloaded is the same shape as
+one that was, the first save is already v2, and bulk ingest runs flat in n
+(a full 2,989-item LongMemEval store in 356 s, measured). `HrmStore::new_flat`
+keeps the legacy v1 medium reachable for tests of the flat path and of
+`upgrade_to_chiral`.
+
+**Consequence for kannaka-bench:** every published hit@k / recall@k /
+evidence-coverage figure was measured on stores built by `remember --batch`,
+i.e. with no facet rows, while an incremental user's store is mostly facet
+rows by count. Those numbers need re-taking on this build.
+
 ### ⚠ Read before rolling — dreams start forgetting for real (#917, #1035)
 
 `stage_prune` and `stage_retention_triage` soft-delete by setting
