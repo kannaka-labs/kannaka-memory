@@ -283,6 +283,36 @@ fn no_rotation_knob_is_overwritten_by_the_level_it_is_measured_at() {
     );
 }
 
+/// Not being overwritten is not the same as being READ, and the difference is
+/// not academic: `dream_gravity` had no L4 override and was still inert there,
+/// because the L4 path never reads it. The first replacement picked for slot 5,
+/// `xi_repulsion_weight`, turned out to be a dead field outright — present in
+/// the `Params` struct and its initialiser, read nowhere — so the override
+/// check above passed it and one dead knob was swapped for another. CI went
+/// green on that branch. This is the assertion that catches it.
+#[test]
+fn every_rotation_knob_is_actually_read_by_the_research_binary() {
+    let src = fs::read_to_string("src/bin/research.rs").expect("research.rs");
+    let knobs = rotation_knobs();
+    assert!(!knobs.is_empty(), "control failed: no rotation knobs parsed");
+
+    let mut unread = Vec::new();
+    for (name, _) in &knobs {
+        // A knob reaches the measured code only through `params.<name>` —
+        // the struct field and the initialiser do not count, which is the
+        // whole point.
+        if !src.contains(&format!("params.{name}")) {
+            unread.push(name.clone());
+        }
+    }
+    assert!(
+        unread.is_empty(),
+        "these rotation knobs are never read as `params.<name>`, so sweeping them\n\
+         changes nothing the fitness can see:\n    {}",
+        unread.join("\n    ")
+    );
+}
+
 /// The other way a slot goes quietly dead: the `FROM` value drifts out of step
 /// with `experiment_params()`, the `sed` matches nothing, and the script exits
 /// 0 with "param edit did not take" — a skipped cycle that looks like a run.

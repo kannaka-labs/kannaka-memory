@@ -269,7 +269,13 @@ case $((DAY % 7)) in
     #
     # Replacements are knobs that survive the clone into BOTH l4_params and
     # l5_params, so the hypothesis reaches the code the fitness measures.
-    5) PARAM="xi_repulsion_weight";   FROM=0.3;   TO=0.35 ;;
+    #
+    # A knob must also be READ on the measured path — absence of an override is
+    # not enough. `xi_repulsion_weight` was the first pick for slot 5 and is a
+    # dead field: it appears only in the Params struct and its initialiser,
+    # `params.xi_repulsion_weight` is read nowhere. Replacing one dead knob
+    # with another is exactly the failure this comment exists to prevent.
+    5) PARAM="hallucination_amplitude"; FROM=0.7; TO=0.65 ;;
     6) PARAM="noise_floor";           FROM=0.18;  TO=0.16 ;;
 esac
 echo "--- hypothesis: $PARAM $FROM -> $TO ---"
