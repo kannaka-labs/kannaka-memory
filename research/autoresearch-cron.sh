@@ -160,11 +160,17 @@ build_research() {
         return 1
     fi
     echo "building research ($why) with $cargo_bin; budget ${BUILD_TIMEOUT}s, log $BUILD_LOG"
-    if timeout "$BUILD_TIMEOUT" "$cargo_bin" build --release --bin research >>"$BUILD_LOG" 2>&1; then
+    # Capture cargo's status at the call, not after the `if`. A false `if` with
+    # no else branch returns 0, so `local rc=$?` placed below it reported every
+    # failed build as "exit 0" — the same shape of defect as reading a status
+    # from `| tail`, and it survived the first round of tests because they
+    # asserted only that the failure was reported, never what it said.
+    local rc=0
+    timeout "$BUILD_TIMEOUT" "$cargo_bin" build --release --bin research >>"$BUILD_LOG" 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
         echo "build ok"
         return 0
     fi
-    local rc=$?
     echo "BUILD FAILED (exit $rc$([[ $rc == 124 ]] && echo ', timed out')); last lines of $BUILD_LOG:"
     tail -15 "$BUILD_LOG" | sed 's/^/    /'
     return 1

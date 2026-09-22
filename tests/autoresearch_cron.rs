@@ -368,6 +368,14 @@ fn an_opt_in_build_is_budgeted_and_its_failure_is_detected() {
         log.contains("BUILD FAILED"),
         "a failing cargo must be reported as a failure:\n{log}"
     );
+    // The first cut of this test stopped at the line above, and the message it
+    // accepted said "BUILD FAILED (exit 0)" every time: `local rc=$?` sat after
+    // an `if` whose false branch returns 0. Assert the number, or the report is
+    // free to be wrong about the one fact it exists to carry.
+    assert!(
+        log.contains("BUILD FAILED (exit 101)"),
+        "the reported status must be cargo's own (101 here), not the `if`'s:\n{log}"
+    );
     assert!(
         s.cargo_calls().contains("build --release --bin research"),
         "the opt-in path must actually build; cargo saw: {:?}",
