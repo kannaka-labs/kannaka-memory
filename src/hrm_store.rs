@@ -677,6 +677,28 @@ impl HrmStore {
                 .map(|(id, m)| (*id, m.times_seen))
                 .collect();
 
+        // #917: the GHOSTING ITSELF. `stage_retention_triage` and `stage_prune`
+        // soft-delete by setting `amplitude = 0.0` through `get_mut`, which
+        // writes the CACHE; the medium's energy is untouched. The rebuild below
+        // reconstructs amplitude from `chiral.right.energy[i]`, so every ghost
+        // came back alive before anything could act on it — a dream reporting
+        // "ghosted 37" and then leaving 37 live rows.
+        //
+        // #497 already preserves a ghost's ADR-0037 `updated_at` stamp across
+        // this clear, so a ghost kept its recovery-window paperwork and lost
+        // the ghosting it documents. This is the other half.
+        //
+        // Restoring it here is also what makes it durable: `sync_cache_to_medium`
+        // writes every energy back FROM the cache, so a ghost that survives the
+        // rebuild reaches the medium on the next flush. Losing it here is what
+        // made the counter structurally unable to keep its own work.
+        let saved_ghosts: std::collections::HashSet<uuid::Uuid> = self
+            .memory_cache
+            .iter()
+            .filter(|(_, m)| m.amplitude <= 0.0)
+            .map(|(id, _)| *id)
+            .collect();
+
         self.memory_cache.clear();
 
         if let Some(ref chiral) = self.chiral {
@@ -793,6 +815,15 @@ impl HrmStore {
             if let Some(mem) = self.memory_cache.get_mut(&id) {
                 mem.layer_depth = layer;
                 mem.last_consolidated_at = consolidated;
+            }
+        }
+
+        // Restore ghosts (#917). Last, so nothing above can revive one: a ghost
+        // is the strongest statement the cache holds about a row, and a rebuild
+        // must not be the thing that overrules it.
+        for id in saved_ghosts {
+            if let Some(mem) = self.memory_cache.get_mut(&id) {
+                mem.amplitude = 0.0;
             }
         }
 
@@ -3056,6 +3087,8 @@ impl Drop for HrmStore {
             }
         }
     }
+
+
 }
 
 #[cfg(test)]
@@ -4771,6 +4804,109 @@ mod tests {
             store.dream_entropy_touched_count(),
             1,
             "only the hallucinated wavefront counts toward the touched set"
+        );
+    }
+
+    /// #917: a ghost must survive the rebuild that follows the dream that made
+    /// it.
+    ///
+    /// `stage_retention_triage` and `stage_prune` soft-delete by setting
+    /// `amplitude = 0.0` through `get_mut`, which writes the CACHE only. Every
+    /// dream ends in a path that calls `rebuild_cache`, which reconstructed
+    /// amplitude from the medium's energy — untouched by the ghosting — so the
+    /// ghost came back alive. Measured on 0.16.1 as a dream reporting
+    /// "ghosted 37" and then leaving 37 live rows.
+    ///
+    /// The control arm is the point: a LIVE row beside the ghost must keep its
+    /// real amplitude. A rebuild that zeroed everything would pass a test that
+    /// only looked at the ghost.
+    #[test]
+    fn a_ghost_survives_rebuild_cache() {
+        for chiral in [true, false] {
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+            if chiral {
+                store.upgrade_to_chiral();
+            }
+
+            let ghost_id = store
+                .insert(HyperMemory::new(vec![0.25; WAVEFRONT_DIM], "distractor: ghost me".to_string()))
+                .unwrap();
+            let live_id = store
+                .insert(HyperMemory::new(vec![0.75; WAVEFRONT_DIM], "keep me alive".to_string()))
+                .unwrap();
+
+            // Ghost exactly as the consolidation stages do.
+            store.get_mut(&ghost_id).unwrap().unwrap().amplitude = 0.0;
+            assert_eq!(
+                store.get(&ghost_id).unwrap().unwrap().amplitude,
+                0.0,
+                "chiral={chiral}: control failed - the ghosting itself did not take"
+            );
+
+            store.rebuild_cache().unwrap();
+
+            assert_eq!(
+                store.get(&ghost_id).unwrap().unwrap().amplitude,
+                0.0,
+                "chiral={chiral}: the rebuild revived a ghost"
+            );
+            assert!(
+                store.get(&live_id).unwrap().unwrap().amplitude > 0.0,
+                "chiral={chiral}: control failed - a live row must keep its amplitude"
+            );
+        }
+    }
+
+    /// #917: and it must still be a ghost after a FRESH LOAD.
+    ///
+    /// This is the assertion the issue asked for, and it is the one that makes
+    /// the fix durable rather than cosmetic. `sync_cache_to_medium` writes
+    /// every energy back FROM the cache on flush, so a ghost that survives
+    /// `rebuild_cache` reaches the medium and comes back 0.0 on load. Before
+    /// the fix it never got that far: the rebuild revived it in memory, and
+    /// the flush then wrote the revived value.
+    ///
+    /// It also settles a question the issue raised but could not answer — the
+    /// hemisphere energy floor does NOT lift a ghost back. Measured, not
+    /// assumed: without that, "ghosting writes through to the medium" would
+    /// have been the wrong remedy to reach for.
+    ///
+    /// The live row is the control: if load clamped everything to zero, or the
+    /// store came back empty, the ghost assertion alone would pass on a lie.
+    #[test]
+    fn a_ghost_is_still_a_ghost_after_a_fresh_load() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        let (ghost_id, live_id) = {
+            let mut store = HrmStore::new(make_test_pipeline(), path.clone());
+            store.upgrade_to_chiral();
+            let ghost = store
+                .insert(HyperMemory::new(vec![0.25; WAVEFRONT_DIM], "distractor: ghost me".to_string()))
+                .unwrap();
+            let live = store
+                .insert(HyperMemory::new(vec![0.75; WAVEFRONT_DIM], "keep me".to_string()))
+                .unwrap();
+            store.get_mut(&ghost).unwrap().unwrap().amplitude = 0.0;
+            // The rebuild a dream does between ghosting and the flush. WITHOUT
+            // this line the test passes on the BROKEN code — `flush` alone
+            // writes the cached 0.0 straight through, so there is nothing for
+            // the bug to undo. Verified by mutation: with the fix reverted and
+            // this line removed, the test still went green.
+            store.rebuild_cache().unwrap();
+            store.flush().unwrap();
+            (ghost, live)
+        };
+
+        let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+        assert_eq!(
+            reloaded.get(&ghost_id).unwrap().map(|m| m.amplitude),
+            Some(0.0),
+            "a ghost did not survive a fresh load"
+        );
+        assert!(
+            reloaded.get(&live_id).unwrap().map(|m| m.amplitude).unwrap_or(0.0) > 0.0,
+            "control failed - a live row must come back alive, or the assertion above proves nothing"
         );
     }
 }
