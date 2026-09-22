@@ -511,6 +511,43 @@ fn note_stream_create_denied() {
     PROCESS_STREAM_CREATE_DENIED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Read side of [`note_stream_create_denied`].
+fn stream_create_denied_in_process() -> bool {
+    PROCESS_STREAM_CREATE_DENIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How to report a `-ERR` that arrives while a JetStream request is in flight.
+///
+/// #969: the broker refusing `$JS.API.STREAM.CREATE` to a reader identity is
+/// an EXPECTED condition, fully handled — `created=false`, the read lane is
+/// proven by `stream_readable`, and `jetstream_ok` stays true. Printing it as
+/// `[nats] server error: …` made it read like a fault. On O1, where #563 makes
+/// `swarm serve` exit to reload roughly every four minutes, that was hundreds
+/// of alarming lines a day; on the night of the 0.16.6 roll they were misread
+/// as the cause of the restarts, which they were not.
+///
+/// Reclassifying the LINE only. Nothing about the create path changes: a
+/// genuine writer never receives this refusal, so no writer is downgraded.
+#[derive(Debug, PartialEq, Eq)]
+enum ServerErrReport {
+    /// Something this code does not expect. Say so.
+    ServerError,
+    /// The broker declining stream creation to an identity that does not own
+    /// streams. `first_time` is false once the process has already said it,
+    /// so four transports do not say it four times.
+    StreamCreateRefused { first_time: bool },
+}
+
+fn classify_server_err(msg: &str, already_denied: bool) -> ServerErrReport {
+    if names_denied_stream_create(msg) {
+        ServerErrReport::StreamCreateRefused {
+            first_time: !already_denied,
+        }
+    } else {
+        ServerErrReport::ServerError
+    }
+}
+
 /// Test-only: clear the process refusal. The flag is global to the test binary,
 /// so a test that sets it must put it back or it silently disables stream
 /// creation for every test that runs afterwards.
@@ -1674,17 +1711,27 @@ impl SwarmTransport {
                     let _ = conn.pong();
                 }
                 Ok(ReadOutcome::Frame(Frame::ServerErr(m))) => {
-                    eprintln!("[nats] server error: {m}");
                     // #933: a denied JetStream request is answered with an
                     // async -ERR and no reply, so the call below simply times
                     // out. Record the refusal while we can still see it —
                     // "the broker said no to STREAM.CREATE on this
                     // connection" is the fact worth remembering, and it is
                     // the only honest basis for not trying again.
-                    if names_denied_stream_create(&m) {
-                        conn.stream_create_denied = true;
-                        // ...and for every OTHER connection this process opens.
-                        note_stream_create_denied();
+                    match classify_server_err(&m, stream_create_denied_in_process()) {
+                        ServerErrReport::StreamCreateRefused { first_time } => {
+                            // #969: expected, and already handled. Said once
+                            // per process, not once per transport, and not as
+                            // a fault.
+                            if first_time {
+                                eprintln!(
+                                    "[nats] stream create not permitted for this identity; retained reads active ({m})"
+                                );
+                            }
+                            conn.stream_create_denied = true;
+                            // ...and for every OTHER connection this process opens.
+                            note_stream_create_denied();
+                        }
+                        ServerErrReport::ServerError => eprintln!("[nats] server error: {m}"),
                     }
                     if is_auth_error(&m) {
                         fatal = true;
@@ -3932,6 +3979,74 @@ mod tests {
         reset_stream_create_denied_for_test();
         assert!(should_issue_stream_create(false), "the test-only reset must restore the default");
     }
+    /// #969: the refusal is reported as what it is, and only once.
+    ///
+    /// The broker declining `$JS.API.STREAM.CREATE` to a reader identity is an
+    /// expected, fully handled condition — `created=false`, the read lane is
+    /// proven, `jetstream_ok` stays true. Logged as `[nats] server error`, it
+    /// read like a fault: on O1, where #563 makes `swarm serve` exit to reload
+    /// about every four minutes, that is hundreds of alarming lines a day, and
+    /// on the 0.16.6 roll they were misread as the CAUSE of the restarts.
+    ///
+    /// The control arms are the point. An unrelated `-ERR` and an auth failure
+    /// must still be reported as server errors, or this change would have
+    /// bought quiet by hiding real faults.
+    #[test]
+    fn a_stream_create_refusal_is_not_reported_as_a_server_error() {
+        const REFUSAL: &str =
+            "Permissions Violation for Publish to \"$JS.API.STREAM.CREATE.QUEEN_PHASES\"";
+
+        assert_eq!(
+            classify_server_err(REFUSAL, false),
+            ServerErrReport::StreamCreateRefused { first_time: true },
+            "the first refusal in a process is the one worth printing"
+        );
+        assert_eq!(
+            classify_server_err(REFUSAL, true),
+            ServerErrReport::StreamCreateRefused { first_time: false },
+            "four transports must not say it four times"
+        );
+
+        // Controls: everything else stays a server error.
+        for other in [
+            "Permissions Violation for Publish to \"KANNAKA.work.thing\"",
+            "Authorization Violation",
+            "Unknown Protocol Operation",
+            "Maximum Payload Violation",
+        ] {
+            assert_eq!(
+                classify_server_err(other, false),
+                ServerErrReport::ServerError,
+                "reclassifying {other:?} would hide a real fault"
+            );
+            assert_eq!(
+                classify_server_err(other, true),
+                ServerErrReport::ServerError,
+                "a prior stream-create refusal must not silence {other:?}"
+            );
+        }
+    }
+
+    /// The read side must actually follow the write side, or the "say it once"
+    /// behaviour is decided by a constant.
+    #[test]
+    fn the_process_denial_flag_reads_back_what_was_written() {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_stream_create_denied_for_test();
+        assert!(
+            !stream_create_denied_in_process(),
+            "control failed: the flag must start clear, or the assertion below proves nothing"
+        );
+        note_stream_create_denied();
+        assert!(
+            stream_create_denied_in_process(),
+            "the refusal was recorded but does not read back"
+        );
+        reset_stream_create_denied_for_test();
+        assert!(!stream_create_denied_in_process());
+    }
+
     /// #969: once refused, the create never goes back on the wire.
     ///
     /// Asserted over a real socket rather than on the predicate alone, because
