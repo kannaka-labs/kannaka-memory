@@ -109,14 +109,132 @@ pub(crate) fn write_temp_sibling(
     Ok(tmp)
 }
 
+/// Attempts made at the final rename, and the pause between them (#934 P4).
+const RENAME_ATTEMPTS: usize = 3;
+const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Is this rename failure worth another try?
+///
+/// On Windows `std::fs::rename` is `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`, which fails with access-denied while ANOTHER
+/// process holds the target open without `FILE_SHARE_DELETE` — something
+/// antivirus scanners and non-Rust readers do routinely and briefly. Before
+/// #933 the plain `std::fs::write` silently succeeded; failing loudly is the
+/// right direction, but it introduced a new transient failure:
+///
+///     failed to write ...: rename: Access is denied. (os error 5)
+///
+/// Only `PermissionDenied` retries. `NotFound`, `CrossesDevices` and the rest
+/// are permanent — retrying them would just delay an honest error. A file that
+/// is genuinely held still fails, 100 ms later than before.
+fn rename_is_retryable(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// fsync the directory that now holds the renamed entry (#934 P2).
+///
+/// `sync_all()` on the temp file durably lands its DATA, but the directory
+/// entry the rename creates is metadata: without this, a power cut can leave
+/// the old name pointing at the old contents. Unix only — Windows has no
+/// directory handle to flush this way.
+///
+/// Best-effort: the data is already durable and the rename already succeeded,
+/// so a failure here is weaker than what the caller had before #933, not
+/// stronger. Refusing a completed write over it would be the worse trade.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(f) = std::fs::File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
+
 /// Rename a staged temp sibling over its target. The temp file is removed if
 /// the rename fails, so a failed write never leaves litter behind.
 fn commit_temp_sibling(tmp: &Path, path: &Path) -> Result<(), String> {
-    if let Err(e) = std::fs::rename(tmp, path) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(format!("rename: {e}"));
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..RENAME_ATTEMPTS {
+        match std::fs::rename(tmp, path) {
+            Ok(()) => {
+                sync_parent_dir(path);
+                return Ok(());
+            }
+            Err(e) => {
+                if attempt + 1 < RENAME_ATTEMPTS && rename_is_retryable(&e) {
+                    std::thread::sleep(RENAME_RETRY_DELAY);
+                    last = Some(e);
+                    continue;
+                }
+                last = Some(e);
+                break;
+            }
+        }
     }
-    Ok(())
+    let _ = std::fs::remove_file(tmp);
+    Err(format!(
+        "rename: {}",
+        last.map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ))
+}
+
+/// Age past which an orphaned temp sibling is litter (#934 P3).
+const TEMP_LITTER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Remove `.kannaka-tmp-*` files in `dir` older than an hour.
+///
+/// Every temp sibling is a fresh `Uuid::new_v4()`, so a leftover can never
+/// collide with the `create_new` of a later write — the "fails forever" case
+/// does not exist. What does exist is that a hard kill between create and
+/// rename leaves the file behind and nothing ever reclaims it, so `~/.kannaka`
+/// accumulates them indefinitely.
+///
+/// The age floor is what makes this safe to call while other writes are in
+/// flight: a temp file belonging to a live write is seconds old, never an
+/// hour. A file whose age cannot be read is left alone — not knowing how old
+/// something is, is not a reason to delete it.
+pub(crate) fn sweep_temp_litter(dir: &Path) -> usize {
+    sweep_temp_litter_older_than(dir, TEMP_LITTER_MAX_AGE)
+}
+
+/// The body of [`sweep_temp_litter`], with the age floor injectable.
+///
+/// Split out so the two rules can be tested independently without touching
+/// the clock: `Duration::ZERO` exercises the NAME filter (everything matching
+/// goes, everything else stays), and the real hour exercises the AGE filter
+/// (nothing recent goes). Backdating an mtime would need a new dependency to
+/// assert what two calls already prove.
+fn sweep_temp_litter_older_than(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".kannaka-tmp-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue; // a future mtime: clock skew, not litter
+        };
+        if age >= max_age && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -268,6 +386,90 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".kannaka-tmp-"))
             .collect();
         assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #934 P3: an orphaned temp file is reclaimed once it is old enough.
+    ///
+    /// The age floor is the whole safety argument, so both sides are asserted:
+    /// a temp file belonging to a write happening RIGHT NOW is seconds old and
+    /// must survive, or this sweep would delete other processes work.
+    #[test]
+    fn sweep_removes_old_temp_litter_and_spares_everything_else() {
+        let d = temp_dir("sweep");
+        let old = d.join(".kannaka-tmp-11111111-1111-1111-1111-111111111111");
+        let fresh = d.join(".kannaka-tmp-22222222-2222-2222-2222-222222222222");
+        let real = d.join("kannaka.hrm");
+        let dotfile = d.join(".encoder");
+        for f in [&old, &fresh, &real, &dotfile] {
+            std::fs::write(f, b"x").unwrap();
+        }
+
+        // AGE rule: with the real hour-long floor, files created just now are
+        // writes in flight and must all survive. This is the assertion that
+        // stops the sweep deleting another process's work.
+        assert_eq!(
+            sweep_temp_litter(&d),
+            0,
+            "nothing recent may be swept — a live write's temp file is seconds old"
+        );
+        assert!(old.exists() && fresh.exists(), "no recent temp file may be removed");
+
+        // NAME rule: drop the age floor and only `.kannaka-tmp-*` goes.
+        assert_eq!(
+            sweep_temp_litter_older_than(&d, std::time::Duration::ZERO),
+            2,
+            "both temp siblings are litter once old enough"
+        );
+        assert!(!old.exists() && !fresh.exists(), "aged temp litter must be reclaimed");
+        assert!(real.exists(), "a real store file must never be touched");
+        assert!(dotfile.exists(), "an unrelated dotfile must never be touched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A sweep of a directory that does not exist is a no-op, not an error.
+    #[test]
+    fn sweep_of_a_missing_directory_is_harmless() {
+        assert_eq!(sweep_temp_litter(Path::new("definitely-not-a-real-dir-934")), 0);
+    }
+
+    /// #934 P4: only a transient failure is retried. Retrying a permanent one
+    /// would turn an honest error into a slow honest error, and retrying
+    /// everything would mask a real bug.
+    #[test]
+    fn only_permission_denied_is_retried() {
+        use std::io::ErrorKind;
+        assert!(rename_is_retryable(&std::io::Error::from(ErrorKind::PermissionDenied)));
+        for kind in [ErrorKind::NotFound, ErrorKind::AlreadyExists, ErrorKind::InvalidInput] {
+            assert!(
+                !rename_is_retryable(&std::io::Error::from(kind)),
+                "{kind:?} is permanent; retrying it only delays the error"
+            );
+        }
+    }
+
+    /// The retry must be bounded, or a permanently-held file hangs the writer.
+    #[test]
+    fn the_rename_retry_is_bounded_and_short() {
+        assert_eq!(RENAME_ATTEMPTS, 3);
+        assert!(
+            RENAME_ATTEMPTS * RENAME_RETRY_DELAY.as_millis() as usize <= 500,
+            "a held file must fail promptly, not hang the writer"
+        );
+    }
+
+    /// A write whose rename cannot succeed still reports the REAL error after
+    /// the retries, not a placeholder.
+    #[test]
+    fn an_unretryable_rename_failure_keeps_its_message() {
+        let d = temp_dir("badrename");
+        let target = d.join("sub").join("deep").join("target");
+        let tmp = write_temp_sibling(&d.join("target"), b"x", None).unwrap();
+        // Renaming into a directory that does not exist is NotFound: permanent.
+        let err = commit_temp_sibling(&tmp, &target).unwrap_err();
+        assert!(err.starts_with("rename: "), "unexpected error: {err}");
+        assert!(!err.contains("unknown"), "the real error must survive the retry loop: {err}");
+        assert!(!tmp.exists(), "a failed rename must not leave litter");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

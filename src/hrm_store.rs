@@ -522,6 +522,17 @@ impl HrmStore {
     }
 
     pub fn load(pipeline: EncodingPipeline, hrm_path: PathBuf) -> Result<Self, StoreError> {
+        // #934 P3: reclaim `.kannaka-tmp-*` orphaned by a hard kill between
+        // create and rename. Here because it is the one path every binary that
+        // touches a store goes through, and because the store directory is
+        // exactly where the litter lands. Only files an hour old or more, so a
+        // write in flight in another process is never touched.
+        if let Some(dir) = hrm_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let swept = crate::fs_util::sweep_temp_litter(dir);
+            if swept > 0 {
+                eprintln!("[store] reclaimed {swept} orphaned temp file(s) in {}", dir.display());
+            }
+        }
         // Detect format version from magic bytes before loading
         let is_v2 = if let Ok(mut f) = std::fs::File::open(&hrm_path) {
             let mut magic = [0u8; 4];
