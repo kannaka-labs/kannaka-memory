@@ -45,7 +45,21 @@ payload=$(cat <<JSON
 JSON
 )
 
-curl -s --max-time 15 -X POST "${FLUX_URL:-https://api.flux-universe.com}/api/events" \
+# The result is INSPECTED, not discarded. `>/dev/null || true` made an
+# outage, a revoked FLUX_TOKEN and a healthy run indistinguishable -- no
+# output, exit 0, nothing in the log -- on the one job whose silence means
+# everything it monitors (stale_crons included) goes unwatched as well.
+flux_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+  -X POST "${FLUX_URL:-https://api.flux-universe.com}/api/events" \
   -H "Authorization: Bearer ${FLUX_TOKEN:-}" \
   -H "Content-Type: application/json" \
-  -d "$payload" >/dev/null || true
+  -d "$payload" 2>/dev/null) || flux_code="000"
+
+case "$flux_code" in
+  2*) ;;
+  # A failed POST still must not abort the run or spam cron mail every tick,
+  # so the failure is one line plus an exit status -- enough to have a
+  # consequence somewhere, not enough to become noise.
+  *)  echo "$(date -Is) host-metrics: flux POST failed (http $flux_code)" >&2
+      exit 1 ;;
+esac
