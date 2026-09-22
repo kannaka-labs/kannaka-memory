@@ -1,5 +1,114 @@
 # Changelog
 
+## [Unreleased]
+
+### ⚠ Read before rolling — dreams start forgetting for real (#917, #1035)
+
+`stage_prune` and `stage_retention_triage` soft-delete by setting
+`amplitude = 0.0` through `get_mut`, which writes the CACHE; the medium's
+energy is untouched. Every dream ends in a path that calls `rebuild_cache`,
+which reconstructed amplitude from the medium — so **every ghost came back
+alive before anything could act on it.** Measured on 0.16.1: a dream reporting
+`pruned 25` left 11 distractors live and 0 rows at amplitude <= 0. The O1 log
+line "retention triage audio:heard: ghosted 37" was counted at ghost time.
+
+The fleet has therefore been running with forgetting silently undone. This
+release stops that, and the consequence is operational rather than theoretical:
+
+- retention triage is NOT the exposure — `KANNAKA_TRIAGE=1` is set on O1, but
+  there is no `[retention]` section in its config, so there are no rules;
+- **`stage_prune` is.** It is core dream behaviour, gated by no flag, and at
+  the 0.16.1 rate that is roughly 25 rows a night per node, ongoing;
+- ghosts are SOFT deletes with the ADR-0037 recovery window, so nothing is lost
+  immediately — but `stage_compact_ghosts` hard-deletes past the 7-day horizon,
+  so real deletion begins about a week after this lands;
+- before the fix, `compact_ghosts` reclaimed nothing at all: its first test is
+  `amplitude != 0.0 -> continue`, and no ghost ever reached it with amplitude 0.
+
+Counts for scale at the time of writing: kannaka-prime 1187, gossipghost-01
+1149, the workstation 1678, the witness 434. **Take a substrate snapshot before
+rolling**, and expect `total_memories` to trend DOWN for the first time.
+
+Pinned memories are protected on every path (ADR-0031), and `compact_ghosts`
+fails closed — it refuses to reclaim a ghost whose stamp is missing, because a
+ghost that lingers costs space while a ghost deleted without its window is gone.
+
+The fix itself is small: `rebuild_cache` preserves a ghost across the clear,
+alongside the cache-only state it already preserved. #497 had preserved a
+ghost's `updated_at` stamp, so a ghost kept its recovery-window paperwork and
+lost the ghosting that paperwork documents. Measurement also settled a question
+the issue left open: the hemisphere energy floor does NOT lift a ghost back.
+
+### Fixed — atomic-write follow-ups: dir fsync, temp litter, rename retry (#934, #1033)
+
+Three items from the #933 adversarial review. The parent directory is now
+fsynced after the rename (unix), so a power cut cannot leave the old name
+pointing at old contents. `.kannaka-tmp-*` orphaned by a hard kill between
+create and rename is reclaimed from `HrmStore::load`, with an hour-old floor so
+a concurrent writer's temp file is never touched. And the rename retries three
+times at 50 ms on `PermissionDenied` only — the transient Windows failure where
+another process briefly holds the target — while a permanent error still fails
+at once, with its real message.
+
+P1 was checked and needs no change: the only symlinks under `~/.kannaka` are
+piper's shared libraries and a `snapshots` directory link, and the latter is
+safe because the temp sibling is derived from the target's parent, so both
+resolve into the same real directory. That also keeps it a same-filesystem
+rename, which matters because `/var/oled` is a different filesystem from `/`.
+
+### Fixed — self-origin is every identity this node published under (#890, #1032)
+
+`swarm exemplars publish --agent-id X` publishes under X, but both absorb
+sweeps compared the incoming source against `cfg.agent.id` alone, so a node
+re-absorbed its own material as a peer's: false cross-agent novelty, provenance
+stamped `swarm:<override>`, and autoabsorb quota spent on its own output.
+
+`self_identities()` is now the single source of truth, unioning the configured
+id, the legacy `agent_id` file, and anything recorded at publish time. The
+override is a run-time argument, so it is recorded when used — on a SUCCESSFUL
+publish only, because recording at parse time would let a dry run teach this
+node to ignore a real peer that happens to use that id.
+
+### Fixed — three of seven OODA rotation slots could never move the fitness (#1029)
+
+#939 got the nightly cron running again; its first real cycle then showed ten
+runs across both arms all returning exactly 0.202656. Three slots were dead:
+`chain_carry_strength` and `dream_gravity` are overwritten by both levels the
+cron runs (research.rs:1477, :3436, :3460), and `kuramoto_steps` had a `FROM`
+of 20 after the value moved to 50 in June, so its `sed` matched nothing and the
+night exited 0 on "param edit did not take".
+
+Each dead slot still wrote a confident `revert` row — a negative result nobody
+measured. The cycle now flags bit-identical arms as `INERT?`.
+
+⚠ The first fix replaced one dead knob with another: `xi_repulsion_weight` is a
+dead FIELD, read nowhere. The guard asked "is it overwritten?" when the question
+is "does it reach the measured code?" — and CI passed the branch that carried
+it.
+
+### Fixed — a stream-create refusal is not a server error (#969, #1027)
+
+#1018 took the doomed `$JS.API.STREAM.CREATE` attempts from four per
+`swarm serve` start to one, verified on O1 after the v0.16.10 roll against a
+pre-registered prediction. The surviving line is no longer printed as
+`[nats] server error`: the broker declining stream creation to a reader identity
+is expected and fully handled, so it now says so once per process. Nothing about
+the create path changed — a genuine writer never receives this refusal.
+
+### Fixed — KANNAKA_RECALL_OBSERVE=0 does not stop the write (#977, #1030)
+
+#1010's doc comment claimed the knob separated "the medium's ranking cost from
+the write it provokes". It does not. ADR-0036 calls `record_retrieval()` on
+every hit through `store.get_mut`, which marks dirty on its own, so the full
+save still happens. Measured on a real 1678-memory / 135 MB store: plain
+16608 ms, `RECALL_OBSERVE=0` 8484 ms (still rewritten), `READONLY=1` 9752 ms
+(not rewritten), both 4638 ms. Comment only; the read-only recall path is #977.
+
+### Security — rustls-webpki 0.103.13, rand 0.8.6 (#1028)
+
+Five dependabot alerts (1 high, 1 medium, 3 low) to zero. Lockfile only, bumped
+with `cargo update --precise`: exactly two version lines and two checksums moved.
+
 ## [0.16.10] — 2026-09-21
 
 ### Fixed — autoresearch had produced nothing for 126 nights, and the reason was a PATH (#939, #1023, #1024, #1025)
