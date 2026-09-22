@@ -23,6 +23,15 @@ one that was, the first save is already v2, and bulk ingest runs flat in n
 keeps the legacy v1 medium reachable for tests of the flat path and of
 `upgrade_to_chiral`.
 
+The flat "view" medium that several readers still consult (`consciousness_metrics`,
+`find_associated`, the legacy `recall_resonance`, the queen's phase derivation)
+was a load-time snapshot: `sync_medium_from_chiral` filled it only when empty, so
+every row written in-process after load was invisible to those readers — and a
+store chiral from birth would have had an empty view for its whole first
+process. The sync now appends the rows the view lacks, by id, after each chiral
+write (once per bulk load). Visible effect: the metrics a long-running writer
+publishes now count the memories it absorbed since it started.
+
 **Consequence for kannaka-bench:** every published hit@k / recall@k /
 evidence-coverage figure was measured on stores built by `remember --batch`,
 i.e. with no facet rows, while an incremental user's store is mostly facet

@@ -647,6 +647,8 @@ impl HrmStore {
     /// Leave bulk mode and rebuild the cache once for everything absorbed.
     pub fn end_bulk(&mut self) -> Result<(), StoreError> {
         BULK_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+        // #1031: one flat-view sync for the whole batch, then one cache rebuild.
+        self.sync_medium_from_chiral();
         self.rebuild_cache()?;
         self.mark_dirty();
         Ok(())
@@ -1220,6 +1222,10 @@ impl HrmStore {
             self.medium.add_wavefront(&vector, content.clone(), importance)
                 .map_err(|e| StoreError::Other(format!("add_wavefront failed: {e}")))?
         };
+        if self.chiral.is_some() {
+            // #1031: keep the flat view current for its remaining readers.
+            self.sync_medium_from_chiral();
+        }
         // The medium has the wavefront for tensor/vector math, but the
         // higher-level `all_memories()` / `assess()` paths read from
         // `memory_cache`. Insert a matching HyperMemory record so
@@ -1242,13 +1248,28 @@ impl HrmStore {
 
     /// Ensure the flat medium is populated from chiral state (for backward compat).
     /// Call this before operations that need the flat medium view.
+    ///
+    /// #1031: this used to fill the flat view only when it was EMPTY, which made
+    /// it a load-time snapshot — every right-hemisphere row written afterwards
+    /// in the same process was invisible to the readers that still consult the
+    /// flat view (`consciousness_metrics`, `find_associated`, the legacy
+    /// `recall_resonance`, the queen's phase derivation, `apply_consolidation`).
+    /// That was survivable only because a fresh store started flat and became
+    /// chiral on reload. With a store chiral from birth the flat view would
+    /// start empty and stay empty, so this now appends every right row the
+    /// flat view lacks, by id, and is called after each chiral write (once per
+    /// bulk load, in `end_bulk`). Rows are raw appends — no interference pass —
+    /// so it costs one id lookup per row, not the flat medium's O(n) insert.
     pub fn sync_medium_from_chiral(&mut self) {
         if let Some(ref chiral) = self.chiral {
-            if self.medium.wavefront_count() == 0 && chiral.right.count() > 0 {
-                // Build flat medium from right hemisphere
+            if chiral.right.count() > 0 {
+                // Append the right-hemisphere rows the flat view lacks
                 for i in 0..chiral.right.count() {
-                    let vector = chiral.right.wavefronts.row(i).to_vec();
                     let meta = &chiral.right.metadata[i];
+                    if self.medium.get_wavefront_index(&meta.id).is_some() {
+                        continue;
+                    }
+                    let vector = chiral.right.wavefronts.row(i).to_vec();
                     let _ = self.medium.add_wavefront(
                         &vector,
                         meta.content.clone(),
@@ -2811,6 +2832,8 @@ impl MediumBackend for HrmStore {
             // otherwise gain ungated control of `expires_at` (floor any memory of
             // ours) and `tier` (pin memories in our store). That change lands WITH
             // the sanitization, not before it. See ADR-0051.
+            // #1031: keep the flat view current for its remaining readers.
+            self.sync_medium_from_chiral();
         } else {
             // Flat-medium path, unchanged.
             let wavefront_id = self.medium.add_wavefront(&memory.vector, memory.content.clone(), memory.amplitude)
@@ -3053,6 +3076,9 @@ impl MediumBackend for HrmStore {
             let id = chiral.store_with_facets(content, importance, &self.pipeline, category)
                 .map_err(|e| StoreError::Other(format!("chiral store failed: {e}")))?;
             if !BULK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                // #1031: the parent and its facets also join the flat view;
+                // in bulk mode `end_bulk` does this once.
+                self.sync_medium_from_chiral();
                 self.rebuild_cache().ok();
             }
             self.mark_dirty();
@@ -4032,6 +4058,10 @@ mod tests {
     /// Build a flat (non-chiral) store and insert a wavefront with full control
     /// over vector / energy / phase / tier directly in the authoritative store.
     /// Returns the assigned UUID. Caller should `rebuild_cache()` afterward.
+    // Writes straight into the FLAT medium (controlled energy/phase/tier), so
+    // its callers build the store with `new_flat` — on a chiral store these rows
+    // would live only in the flat view and `rebuild_cache` would not see them
+    // (#1031). `apply_chiral_map_consistency` covers the chiral apply path.
     fn insert_ctl(
         store: &mut HrmStore,
         vector: Vec<f32>,
@@ -4071,7 +4101,7 @@ mod tests {
     #[test]
     fn apply_holographic_preservation() {
         // N near-duplicate, phase-locked memories + some unrelated ones.
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
 
         // Cluster: 3 near-identical vectors (cos ~ 1.0), phase 0 (locked).
         let base = vec![0.5f32; WAVEFRONT_DIM];
@@ -4133,7 +4163,7 @@ mod tests {
         // member's link OUT is inherited by the carrier. Regression for the
         // dropped/dangling-connection gap on the ADR-0036 destructive path.
         let mut store =
-            HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+            HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
 
         // Merge group of 3 near-identical, phase-locked dups. dup[0] is strongest
         // so it is deterministically the carrier; dup[1]/dup[2] are absorbed.
@@ -4193,7 +4223,7 @@ mod tests {
 
     #[test]
     fn apply_pinned_and_longterm_protected() {
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
 
         // A Pinned duplicate pair — Pinned must never be grouped/removed.
         let base = vec![0.5f32; WAVEFRONT_DIM];
@@ -4235,7 +4265,7 @@ mod tests {
     fn apply_longterm_never_evicted() {
         // A low-energy LongTerm with no reactivation must NOT be evicted (only
         // ShortTerm is eviction-eligible).
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         let mut v = vec![0.0f32; WAVEFRONT_DIM]; v[42] = 1.0;
         let lt = insert_ctl(&mut store, v, "weak long", 0.01, 0.0, Tier::LongTerm, 0);
         let report = store.apply_consolidation(&apply_opts());
@@ -4245,7 +4275,7 @@ mod tests {
 
     #[test]
     fn apply_shortterm_evict_respects_reactivation() {
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         // Below threshold, unreactivated -> evicted.
         let mut v1 = vec![0.0f32; WAVEFRONT_DIM]; v1[10] = 1.0;
         let evicted = insert_ctl(&mut store, v1, "cold short", 0.05, 0.0, Tier::ShortTerm, 0);
@@ -4261,7 +4291,7 @@ mod tests {
 
     #[test]
     fn apply_is_idempotent_second_run_absorbs_zero() {
-        let mut store = HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         let base = vec![0.5f32; WAVEFRONT_DIM];
         for k in 0..4 {
             let mut v = base.clone(); v[k] += 0.001;
@@ -4661,7 +4691,7 @@ mod tests {
     #[test]
     fn apply_absorb_cap_bounds_over_merge() {
         let mut store =
-            HrmStore::new(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+            HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
         // Three orthogonal clusters of 3 near-identical LongTerm memories each
         // (9) + one unrelated survivor = 10. All 3 clusters WOULD merge (absorb 6).
         for cluster in 0..3usize {
@@ -4699,7 +4729,7 @@ mod tests {
     #[test]
     fn dryrun_apply_parity() {
         let build = || {
-            let mut store = HrmStore::new(
+            let mut store = HrmStore::new_flat(
                 make_test_pipeline(),
                 NamedTempFile::new().unwrap().path().to_path_buf(),
             );
