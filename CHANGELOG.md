@@ -39,6 +39,25 @@ ghost's `updated_at` stamp, so a ghost kept its recovery-window paperwork and
 lost the ghosting that paperwork documents. Measurement also settled a question
 the issue left open: the hemisphere energy floor does NOT lift a ghost back.
 
+### Added — the bus now records when a memory is used, not only when it is written (#1038)
+
+`kannaka swarm serve` publishes `KANNAKA.events.memory.<agent>.recall` after
+each recall it serves on `KANNAKA.recall.<agent>`: the returned ids in rank
+order, their similarities, `top_k`, `via`, and a SHA-256 of the query. Never
+the query text and never content; the hash is there so a reader can tell one
+poller asking the same thing every minute from many distinct askers. It lands
+in `KANNAKA_MEMORY_EVENTS` under the existing capture (90-day window), after
+the reply so it delays none, as a plain publish so it cannot steal the
+responder connection's subscription bytes. Nothing replays that stream and the
+event changes no state.
+
+Why: the memory stream carried only `remember` events, so nothing on the bus
+could say which memories later mattered. kannaka-wave E-007 scores salience
+against exactly this. Not published: the CLI's local recall (it stays off NATS,
+as documented; the MCP plugin uses it) and `recall --batch` (a benchmark hit is
+not a memory mattering). Flows only once a release carrying this runs
+`swarm serve` on the hosts.
+
 ### Fixed — atomic-write follow-ups: dir fsync, temp litter, rename retry (#934, #1033)
 
 Three items from the #933 adversarial review. The parent directory is now
