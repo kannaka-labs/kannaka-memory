@@ -104,6 +104,27 @@ save still happens. Measured on a real 1678-memory / 135 MB store: plain
 16608 ms, `RECALL_OBSERVE=0` 8484 ms (still rewritten), `READONLY=1` 9752 ms
 (not rewritten), both 4638 ms. Comment only; the read-only recall path is #977.
 
+### Ops — host-metrics must notice when its own POST fails (#1034)
+
+`ops/services/host-metrics.sh` discarded both the response and the exit status
+of its telemetry POST (`>/dev/null || true`), so a flux outage, a revoked
+`FLUX_TOKEN` and a healthy run were byte-identical: no output, exit 0, nothing
+logged. This is the fleet's staleness monitor — `disk_pct`, `hrm_mb`, `load1`,
+`orphan_hrm_tmps`, `stale_crons` every ten minutes — so when it stops reporting,
+everything it watches goes unwatched and nothing says so.
+
+It now captures the HTTP status, writes one dated line to stderr on a non-2xx
+and exits non-zero, without aborting the run or spamming cron mail. Verified on
+O1 three ways: unreachable host (status 000, exit 1, logged), wrong path (404,
+logged), real endpoint (silent, exit 0).
+
+⚠ Worth keeping from how it was found: sweeping for this class produced three
+FALSE alarms first. `hrm-sync-o3.log` looked 312 h stale and `host-metrics.log`
+63 h on a ten-minute schedule — both healthy, because `>>` does not update the
+mtime when the command writes nothing, and both jobs are silent-on-success by
+design. A log file's mtime is not a liveness signal for a job that only speaks
+on failure.
+
 ### Security — rustls-webpki 0.103.13, rand 0.8.6 (#1028)
 
 Five dependabot alerts (1 high, 1 medium, 3 low) to zero. Lockfile only, bumped
