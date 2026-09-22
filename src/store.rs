@@ -273,6 +273,16 @@ pub trait MediumBackend: Send + Sync {
     /// reactivation survives even though those processes never persist the .hrm.
     fn flush_reactivation(&self) {}
 
+    /// ADR-0036 Phase 1: count a recall hit on `id` (`retrieval_count`,
+    /// `updated_at`). #977: the default reaches the memory through `get_mut`,
+    /// which dirties the whole store; HrmStore overrides it so a recall
+    /// touches only the reactivation sidecar, never the `.hrm`.
+    fn record_retrieval(&mut self, id: &Uuid) {
+        if let Ok(Some(m)) = self.get_mut(id) {
+            m.record_retrieval();
+        }
+    }
+
     /// ADR-0036: plan (and, from Phase 2, apply) resonance-merge consolidation.
     /// Default is a no-op returning an "off" report; only HrmStore implements it.
     /// Takes `&mut self` to accommodate the future apply path; Phase 0 never mutates.

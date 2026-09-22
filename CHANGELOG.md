@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### A recall no longer rewrites the store to count itself (#977)
+
+Every production recall ended in a full `.hrm` save. #1010 blamed
+observation, and observation is one writer — but with `KANNAKA_RECALL_OBSERVE=0`
+the file was still rewritten, because ADR-0036's `record_retrieval` reached
+each hit through `get_mut`, which marks the whole medium dirty on
+acquisition. On a 1,678-memory store that was a 135 MB rewrite per
+`kannaka recall`, and roughly half of a 16.6 s recall.
+
+`record_retrieval` is now a backend method that touches the cache and owes
+only the `.reactivation.json` sidecar (a few KB, merge-on-write, the same
+file the serve daemon already flushes). `save_medium` settles that debt
+without touching the `.hrm`; a recall that observes nothing writes nothing
+but the sidecar. Observation on recall keeps its default (on) — that is the
+"storage is computation" half, and a separate decision.
+
 ### A fresh store is chiral from birth — `remember --batch` no longer builds a different store (#917, #1031)
 
 `HrmStore::new` started FLAT and only became chiral when the next process

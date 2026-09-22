@@ -441,6 +441,13 @@ pub struct HrmStore {
     memory_cache: HashMap<Uuid, HyperMemory>,
     /// Dirty flag to track when the medium needs saving
     dirty: bool,
+    /// #977: a recall bumped `retrieval_count` on a hit and nothing else
+    /// changed. That belongs in the `.reactivation.json` sidecar (a few KB,
+    /// merge-on-write) — not in a rewrite of the whole `.hrm`, which is what
+    /// `get_mut` + `mark_dirty` used to cost every read: 135 MB per recall on a
+    /// 1,678-memory store, measured. `save_medium` flushes only the sidecar
+    /// when this is set and `dirty` is not.
+    retrieval_dirty: bool,
     /// When true, `save_medium` is a no-op — the process loads and mutates
     /// in RAM but never persists. Set via `KANNAKA_READONLY` so the long-
     /// running reader services (swarm serve / inbox serve / attention serve)
@@ -511,6 +518,7 @@ impl HrmStore {
             hrm_path,
             memory_cache: HashMap::new(),
             dirty: false,
+            retrieval_dirty: false,
             readonly: Self::env_readonly(),
         }
     }
@@ -589,6 +597,7 @@ impl HrmStore {
                     hrm_path,
                     memory_cache: HashMap::new(),
                     dirty: false,
+                    retrieval_dirty: false,
                     readonly: Self::env_readonly(),
                 };
                 // Populate flat medium view for backward compat (observe, coherence matrix, etc.)
@@ -622,6 +631,7 @@ impl HrmStore {
                     hrm_path,
                     memory_cache: HashMap::new(),
                     dirty: false,
+                    retrieval_dirty: false,
                     readonly: Self::env_readonly(),
                 };
                 // #1008: the flat path needs the same clamp as the chiral one.
@@ -920,12 +930,21 @@ impl HrmStore {
         // services hold KANNAKA_READONLY and drop their dirty flag silently.
         if self.readonly {
             self.dirty = false;
+            self.retrieval_dirty = false;
             return Ok(());
         }
 
         if !self.dirty {
+            // #977: nothing in the medium changed; only recall hits were
+            // counted. Persist those to the sidecar and leave the `.hrm`
+            // alone — a read must not cost a rewrite of the store.
+            if self.retrieval_dirty {
+                self.save_reactivation_merge(false);
+                self.retrieval_dirty = false;
+            }
             return Ok(());
         }
+        self.retrieval_dirty = false;
 
         // Sync any cache mutations back to the medium before saving
         self.sync_cache_to_medium();
@@ -2874,6 +2893,20 @@ impl MediumBackend for HrmStore {
         Ok(self.memory_cache.get_mut(id))
     }
 
+    /// #977: count a recall hit WITHOUT dirtying the medium. The trait default
+    /// goes through `get_mut`, which marks the whole store dirty on
+    /// acquisition — so every production recall ended in a full `.hrm`
+    /// rewrite (two independent writers, this one and observation; only
+    /// `KANNAKA_READONLY=1` suppressed it). `retrieval_count`/`updated_at`
+    /// live in the cache and persist through the reactivation sidecar, so
+    /// that is the only thing a pure read needs to flush.
+    fn record_retrieval(&mut self, id: &Uuid) {
+        if let Some(m) = self.memory_cache.get_mut(id) {
+            m.record_retrieval();
+            self.retrieval_dirty = true;
+        }
+    }
+
     fn facets_of(&self, parent: &Uuid) -> Vec<Uuid> {
         // parent_id lives on the canonical WavefrontMeta in the right
         // hemisphere, not on the cached HyperMemory. A flat store has no facet
@@ -3134,8 +3167,9 @@ impl MediumBackend for HrmStore {
 
 impl Drop for HrmStore {
     fn drop(&mut self) {
-        // Auto-save on drop if dirty
-        if self.dirty {
+        // Auto-save on drop if dirty (#977: a retrieval-only change flushes
+        // just the sidecar; save_medium decides which).
+        if self.dirty || self.retrieval_dirty {
             if let Err(e) = self.save_medium() {
                 eprintln!("Warning: Failed to auto-save HRM store on drop: {e}");
             }
@@ -3581,6 +3615,50 @@ mod tests {
     /// `apply_observation` and the chiral one, which observes inline and so
     /// would have silently ignored a gate placed only in the shared helper.
     /// Chiral is what the fleet runs, so that is the one that matters.
+    /// #977: counting a recall hit must not cost a rewrite of the medium.
+    /// Before, `get_mut` marked the store dirty on acquisition, so every
+    /// production recall ended in a full `.hrm` save on exit — 135 MB on a
+    /// 1,678-memory store, measured, and `KANNAKA_RECALL_OBSERVE=0` could not
+    /// stop it because this was the OTHER writer. The `.hrm` bytes are
+    /// compared before and after the flush: a save changes the header
+    /// timestamp (#984), so an unwanted rewrite cannot hide. Mutation-checked:
+    /// routing the count back through `get_mut` fails the dirty assertion.
+    #[test]
+    fn record_retrieval_flushes_the_sidecar_and_leaves_the_hrm_alone() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let id = {
+            let mut store = HrmStore::new(make_test_pipeline(), path.clone());
+            let id = store
+                .insert(HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a recalled memory".to_string()))
+                .unwrap();
+            store.flush().unwrap();
+            assert!(!store.dirty, "control: flush leaves the store clean");
+            let bytes_before = std::fs::read(&path).unwrap();
+
+            store.record_retrieval(&id);
+            assert!(!store.dirty, "a recall hit must not dirty the medium");
+            assert!(store.retrieval_dirty, "the hit must be owed to the sidecar");
+            assert_eq!(store.get(&id).unwrap().unwrap().retrieval_count, 1);
+
+            store.flush().unwrap();
+            assert!(!store.retrieval_dirty, "flush must settle the sidecar debt");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes_before,
+                "the .hrm was rewritten by a read"
+            );
+            let sidecar = std::fs::read_to_string(path.with_extension("reactivation.json"))
+                .expect("reactivation sidecar written");
+            assert!(sidecar.contains(&id.to_string()), "sidecar missing the hit: {sidecar}");
+            id
+        };
+
+        // The count is real, not just a cache artefact: it survives a reload.
+        let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+        assert_eq!(reloaded.get(&id).unwrap().unwrap().retrieval_count, 1);
+    }
+
     #[test]
     fn recall_observation_can_be_switched_off_on_both_paths() {
         for chiral in [true, false] {

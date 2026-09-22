@@ -1335,12 +1335,12 @@ impl KannakaMemorySystem {
         // ADR-0036 Phase 1: record reactivation on the hits. This is the
         // production recall path; it previously never bumped retrieval_count
         // (only the legacy ResonanceEngine::recall did), so the replay signal
-        // for tier promotion never accrued. get_mut marks dirty — inert under
-        // readonly (save_medium no-ops) and harmless for short-lived CLI.
+        // for tier promotion never accrued. #977: this used to go through
+        // get_mut, which marked the medium dirty — so a one-shot CLI recall
+        // rewrote the whole .hrm on exit (135 MB on a 1,678-memory store).
+        // record_retrieval touches the cache and the sidecar only.
         for r in &out {
-            if let Ok(Some(m)) = self.engine.store.get_mut(&r.id) {
-                m.record_retrieval();
-            }
+            self.engine.store.record_retrieval(&r.id);
         }
         // ADR-0040: observe recall familiarity as a cerebellar novelty signal
         // (dormant unless enabled). The top hit's strength is the familiarity
@@ -1518,10 +1518,9 @@ impl KannakaMemorySystem {
         }
         // ADR-0036 Phase 1: record reactivation on the beam-recall hits too
         // (the serve daemon's main path), so promotion has durable signal.
+        // #977: sidecar-only, never a medium rewrite.
         for r in &out {
-            if let Ok(Some(m)) = self.engine.store.get_mut(&r.id) {
-                m.record_retrieval();
-            }
+            self.engine.store.record_retrieval(&r.id);
         }
         Ok(out)
     }
