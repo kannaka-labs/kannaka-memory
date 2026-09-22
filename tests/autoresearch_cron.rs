@@ -102,15 +102,18 @@ fn scratch(research_body: &str, cargo_exit: i32) -> Scratch {
 
     // Every knob the nightly rotation can pick, at its FROM value, so the test
     // does not depend on today's day-of-year.
-    fs::write(
-        s.repo().join("src/bin/research.rs"),
-        "fn experiment_params() -> Params {\n    Params {\n        \
-         kuramoto_steps: 20,\n        kuramoto_threshold: 0.35,\n        \
-         prune_threshold: 0.095,\n        constructive_boost: 0.45,\n        \
-         destructive_penalty: 0.35,\n        chain_carry_strength: 0.5,\n        \
-         dream_gravity: 0.0,\n    }\n}\n",
-    )
-    .unwrap();
+    //
+    // GENERATED FROM THE ROTATION ITSELF. Hand-written, this fixture drifted:
+    // it still held the pre-2026-09-22 knobs, so on a day whose slot had
+    // changed the `sed` matched nothing, the script exited 0 on "param edit
+    // did not take", and the tests downstream of the hypothesis stage passed
+    // by never reaching it.
+    let mut params = String::from("fn experiment_params() -> Params {\n    Params {\n");
+    for (name, from) in rotation_knobs() {
+        params.push_str(&format!("        {name}: {from},\n"));
+    }
+    params.push_str("    }\n}\n");
+    fs::write(s.repo().join("src/bin/research.rs"), params).unwrap();
     fs::write(s.repo().join("Cargo.toml"), "[package]\nname = \"scratch\"\n").unwrap();
     fs::write(s.repo().join("Cargo.lock"), "# scratch\n").unwrap();
     fs::write(s.repo().join("experiments/ooda-state.json"), "{\"level\": 4}\n").unwrap();
@@ -202,8 +205,106 @@ fn stub_id_as_root(s: &Scratch) {
 }
 
 const GOOD_RESEARCH: &str = "#!/bin/sh\necho 'fitness:              0.130145'\n";
+
+/// A research stub whose fitness moves between runs, the way a knob that
+/// really is wired through behaves.
+fn varying_research(counter: &Path) -> String {
+    format!(
+        "#!/bin/sh\nn=$(cat {c} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {c}\necho \"fitness:              0.10000$n\"\n",
+        c = counter.display()
+    )
+}
 const FAILING_RESEARCH: &str =
     "#!/bin/sh\necho 'ld: cannot open shared object file' >&2\nexit 101\n";
+
+/// The knobs the nightly rotation sweeps, as `(name, from_value)`.
+fn rotation_knobs() -> Vec<(String, String)> {
+    let script = fs::read_to_string(SCRIPT).expect("autoresearch-cron.sh");
+    let mut out = Vec::new();
+    for line in script.lines() {
+        let t = line.trim_start();
+        if !t.starts_with(|c: char| c.is_ascii_digit()) || !t.contains("PARAM=") {
+            continue;
+        }
+        let name = t
+            .split("PARAM=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .map(str::to_string);
+        let from = t
+            .split("FROM=")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .map(|s| s.trim().to_string());
+        if let (Some(n), Some(f)) = (name, from) {
+            out.push((n, f));
+        }
+    }
+    out
+}
+
+/// The cross-file invariant that would have caught the dead knobs (#939
+/// follow-up).
+///
+/// The cron edits `experiment_params()` and then measures `--level $LEVEL`.
+/// But each level clones those params and overwrites some of them:
+///
+///     l4_params.chain_carry_strength = 0.7    (research.rs:1477)
+///     l5_params.chain_carry_strength = 0.7    (research.rs:3436)
+///     l5_params.dream_gravity        = 0.35   (research.rs:3460)
+///
+/// A rotation slot holding an overwritten knob can never move the fitness. It
+/// burns a full cycle and two builds, then writes a confident `revert` for a
+/// knob that was never tried — a negative result nobody measured. Two of the
+/// seven slots were in that state, and it showed on 2026-09-22 as ten runs
+/// across both arms all returning exactly 0.202656.
+#[test]
+fn no_rotation_knob_is_overwritten_by_the_level_it_is_measured_at() {
+    let src = fs::read_to_string("src/bin/research.rs").expect("research.rs");
+    let knobs = rotation_knobs();
+    assert!(
+        knobs.len() >= 7,
+        "control failed: parsed {} rotation knobs, so the assertions below would be near-vacuous",
+        knobs.len()
+    );
+
+    let mut dead = Vec::new();
+    for (name, _) in &knobs {
+        for level in ["l4", "l5"] {
+            if src.contains(&format!("{level}_params.{name} =")) {
+                dead.push(format!("{name} (overwritten by {level}_params)"));
+            }
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "these rotation knobs cannot move the fitness they are measured against:\n    {}",
+        dead.join("\n    ")
+    );
+}
+
+/// The other way a slot goes quietly dead: the `FROM` value drifts out of step
+/// with `experiment_params()`, the `sed` matches nothing, and the script exits
+/// 0 with "param edit did not take" — a skipped cycle that looks like a run.
+#[test]
+fn every_rotation_knob_matches_its_current_value_in_experiment_params() {
+    let src = fs::read_to_string("src/bin/research.rs").expect("research.rs");
+    let knobs = rotation_knobs();
+    assert!(!knobs.is_empty(), "control failed: no rotation knobs parsed");
+
+    let mut stale = Vec::new();
+    for (name, from) in &knobs {
+        // The same shape the script's `sed` anchors on: `<indent><name>: <from>,`
+        if !src.contains(&format!("{name}: {from},")) {
+            stale.push(format!("{name}: expected `{name}: {from},` in experiment_params()"));
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "the rotation would sed nothing and skip the cycle for:\n    {}",
+        stale.join("\n    ")
+    );
+}
 
 #[test]
 fn running_as_root_is_refused_before_the_checkout_is_touched() {
@@ -407,6 +508,59 @@ fn a_failed_run_reports_the_stderr_the_old_script_discarded() {
         log.contains("all baseline runs failed"),
         "and the abort itself is unchanged:\n{log}"
     );
+}
+
+/// Two arms that are bit-identical, run for run, are evidence about the
+/// WIRING, not the parameter — so the cycle must say so rather than file a
+/// `revert` that reads as a measured null.
+#[test]
+fn identical_arms_are_reported_as_a_possibly_inert_knob() {
+    let s = scratch(GOOD_RESEARCH, 0); // constant fitness on every run
+
+    let code = run(&s, &[]);
+    let log = s.log();
+
+    assert!(
+        log.contains("INERT KNOB?"),
+        "every run returning the same value must be flagged, not filed as a null:\n{log}"
+    );
+    assert!(
+        log.contains("may not reach"),
+        "the flag must say what it suspects and how to check it:\n{log}"
+    );
+    assert_eq!(code, 0, "the cycle still completes and still reverts\n{log}");
+}
+
+/// The control. A knob that genuinely moves the fitness must NOT be flagged,
+/// or the warning is noise on every cycle and will be ignored by the time it
+/// matters.
+#[test]
+fn a_knob_that_moves_the_fitness_is_not_flagged_inert() {
+    let dir = std::env::temp_dir().join(format!(
+        "autoresearch-ctr-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let counter = dir.join("ctr");
+    let s = scratch(&varying_research(&counter), 0);
+
+    let code = run(&s, &[]);
+    let log = s.log();
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        !log.contains("INERT KNOB?"),
+        "a fitness that changes between runs must not be flagged inert:\n{log}"
+    );
+    assert!(
+        log.contains("baseline avg="),
+        "control failed: the cycle must actually have run for the absence above to mean anything:\n{log}"
+    );
+    assert_eq!(code, 0, "the cycle completes\n{log}");
 }
 
 #[test]

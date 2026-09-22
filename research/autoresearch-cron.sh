@@ -215,11 +215,13 @@ STALE_FILES=$(research_binary_is_stale) && {
 echo "--- baseline ---"
 BASELINE_SUM=0
 BASELINE_RUNS=0
+BASELINE_VALUES=""
 for i in $(seq 1 "$RUNS"); do
     RESULT=$(run_research)
     if [[ -n "$RESULT" ]]; then
         BASELINE_SUM=$(echo "$BASELINE_SUM + $RESULT" | bc -l)
         BASELINE_RUNS=$((BASELINE_RUNS + 1))
+        BASELINE_VALUES="$BASELINE_VALUES $RESULT"
         echo "  run $i fitness=$RESULT"
     else
         echo "  run $i FAILED (no fitness line)"
@@ -242,16 +244,33 @@ echo "baseline avg=$BASELINE_AVG runs=$BASELINE_RUNS"
 # interactive sub-agent â€” this cron only nudges existing knobs.
 DAY=$(date +%j)
 case $((DAY % 7)) in
-    0) PARAM="kuramoto_steps";        FROM=20;    TO=22 ;;
+    # FROM must equal the value currently in experiment_params(), or the sed
+    # below matches nothing and the cycle exits 0 on "param edit did not take".
+    # This slot sat at FROM=20 after the value moved to 50 on 2026-06-05 (see
+    # the comment on kuramoto_steps in research.rs), so it silently skipped.
+    0) PARAM="kuramoto_steps";        FROM=50;    TO=55 ;;
     1) PARAM="kuramoto_threshold";    FROM=0.35;  TO=0.32 ;;
     2) PARAM="prune_threshold";       FROM=0.095; TO=0.105 ;;
     3) PARAM="constructive_boost";    FROM=0.45;  TO=0.50 ;;
     4) PARAM="destructive_penalty";   FROM=0.35;  TO=0.40 ;;
-    5) PARAM="chain_carry_strength";  FROM=0.5;   TO=0.6 ;;
-    # L6 seed: associative-recall gravity. query_gravity is now a tracked TSV
-    # column, so the keep/revert sees whether sharpening recall helps fitness
-    # (watch the gravity<->carrier_emergence tension). Sweeps 0.0 -> 0.25 first.
-    6) PARAM="dream_gravity";         FROM=0.0;   TO=0.25 ;;
+    # Slots 5 and 6 used to hold chain_carry_strength and dream_gravity. Both
+    # are DEAD KNOBS for this cron, because both levels it runs overwrite them
+    # after cloning experiment_params():
+    #
+    #   l4_params.chain_carry_strength = 0.7    (research.rs:1477)
+    #   l5_params.chain_carry_strength = 0.7    (research.rs:3436)
+    #   l5_params.dream_gravity        = 0.35   (research.rs:3460)
+    #
+    # and dream_gravity is read only inside run_l5_dream_chain, so at L4 it is
+    # not read at all. Editing either could never move the measured fitness —
+    # two of seven nights burned a full cycle and two builds, then logged a
+    # confident `revert` for a knob that was never actually tried. Observed on
+    # 2026-09-22: ten runs across both arms, all exactly 0.202656, delta 0.
+    #
+    # Replacements are knobs that survive the clone into BOTH l4_params and
+    # l5_params, so the hypothesis reaches the code the fitness measures.
+    5) PARAM="xi_repulsion_weight";   FROM=0.3;   TO=0.35 ;;
+    6) PARAM="noise_floor";           FROM=0.18;  TO=0.16 ;;
 esac
 echo "--- hypothesis: $PARAM $FROM -> $TO ---"
 
@@ -282,11 +301,13 @@ git -c user.name=autoresearch-cron -c user.email=autoresearch@kannaka.local \
 echo "--- hypothesis runs ---"
 HYP_SUM=0
 HYP_RUNS=0
+HYP_VALUES=""
 for i in $(seq 1 "$RUNS"); do
     RESULT=$(run_research)
     if [[ -n "$RESULT" ]]; then
         HYP_SUM=$(echo "$HYP_SUM + $RESULT" | bc -l)
         HYP_RUNS=$((HYP_RUNS + 1))
+        HYP_VALUES="$HYP_VALUES $RESULT"
         echo "  run $i fitness=$RESULT"
     else
         echo "  run $i FAILED (no fitness line)"
@@ -304,6 +325,29 @@ HYP_AVG=$(echo "scale=6; $HYP_SUM / $HYP_RUNS" | bc -l)
 DELTA=$(echo "scale=6; $HYP_AVG - $BASELINE_AVG" | bc -l)
 NEG_KEEP=$(echo "0 - $KEEP_THRESHOLD" | bc -l)
 echo "hyp avg=$HYP_AVG  baseline=$BASELINE_AVG  delta=$DELTA  keep_if<=$NEG_KEEP"
+
+# ── Did the hypothesis reach the code the fitness measures? ─────────────────
+# A knob the measured level overwrites after cloning `experiment_params()` —
+# or never reads — produces two arms that are BIT-IDENTICAL, run for run. The
+# cycle then logs a confident `revert`, which reads as "we tried this and it
+# did not help" when the knob was never actually tried. That is a negative
+# result nobody measured, and it is worse than no row at all.
+#
+# Distinguishing it from a real null is cheap: a genuine no-effect change on a
+# stochastic pipeline still jitters somewhere in the last digits. Every run in
+# both arms landing on the same value is evidence about the WIRING, not the
+# parameter. Reported, never acted on — the revert is correct either way.
+INERT=""
+ALL_VALUES="$(echo "$BASELINE_VALUES $HYP_VALUES" | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l)"
+TOTAL_RUNS=$((BASELINE_RUNS + HYP_RUNS))
+if [[ "$ALL_VALUES" == "1" ]] && (( TOTAL_RUNS >= 2 )); then
+    INERT=" INERT?"
+    echo "⚠ INERT KNOB? all $TOTAL_RUNS runs across BOTH arms returned the identical"
+    echo "  fitness$(echo "$BASELINE_VALUES" | awk '{print " "$1}'). Editing $PARAM in experiment_params() may not reach"
+    echo "  the L$LEVEL code path — check for an l${LEVEL}_params.$PARAM = ... override in"
+    echo "  src/bin/research.rs, and for whether L$LEVEL reads $PARAM at all."
+    echo "  The revert below is correct regardless; this row is NOT evidence about $PARAM."
+fi
 
 if (( $(echo "$DELTA <= $NEG_KEEP" | bc -l) )); then
     echo "KEEP â€” pushing $BRANCH to master"
@@ -323,8 +367,8 @@ fi
 COMMIT=$(git rev-parse --short HEAD)
 TSV="research/results-L${LEVEL}.tsv"
 {
-    printf '%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\tooda-cron %s %s->%s avg=%s base=%s\n' \
-        "$COMMIT" "$HYP_AVG" "$STATUS" "$PARAM" "$FROM" "$TO" "$HYP_AVG" "$BASELINE_AVG"
+    printf '%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\tooda-cron %s %s->%s avg=%s base=%s%s\n' \
+        "$COMMIT" "$HYP_AVG" "$STATUS" "$PARAM" "$FROM" "$TO" "$HYP_AVG" "$BASELINE_AVG" "$INERT"
 } >> "$TSV"
 
 if [[ "$STATUS" == "keep" ]]; then
