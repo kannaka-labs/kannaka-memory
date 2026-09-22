@@ -8,6 +8,7 @@
 //! handlers and the private helpers (_handle_serve_msg, _process_work_msg,
 //! _neighbors_reply) that are only called from within this module.
 
+use std::collections::BTreeSet;
 use std::process;
 
 use super::{data_dir, resolve_nats_url, store_dir, KannakaConfig};
@@ -25,6 +26,80 @@ fn warn_unknown_flag(ctx: &str, arg: &str) {
     if arg.starts_with("--") {
         eprintln!("[{ctx}] ignoring unknown flag: {arg}");
     }
+}
+
+/// Where the identities this node has published exemplars under are recorded.
+#[cfg(feature = "nats")]
+fn published_identities_path(cfg: &KannakaConfig) -> std::path::PathBuf {
+    store_dir(cfg).join("published-identities.json")
+}
+
+/// Remember that this node published as `agent_id` (#890).
+///
+/// `swarm exemplars publish --agent-id X` publishes under X, on the subject
+/// `KANNAKA.exemplar.X.<cluster>` and with `"agent_id": X` in the payload. The
+/// absorb sweeps then compared the incoming source against `cfg.agent.id`
+/// ALONE, so the node's own material came back as a peer's: false cross-agent
+/// novelty, provenance stamped `swarm:<override>`, and autoabsorb quota spent
+/// on its own output.
+///
+/// The override is a run-time argument, so absorb cannot infer it — it has to
+/// be recorded when it is used. Best-effort: a node that cannot write this
+/// file is no worse off than before the fix.
+#[cfg(feature = "nats")]
+fn record_published_identity(cfg: &KannakaConfig, agent_id: &str) {
+    if agent_id == cfg.agent.id || agent_id.is_empty() {
+        return; // the config identity is always self; nothing to remember
+    }
+    let path = published_identities_path(cfg);
+    let mut ids = read_published_identities(cfg);
+    if !ids.insert(agent_id.to_string()) {
+        return; // already known
+    }
+    let list: Vec<&String> = ids.iter().collect();
+    if let Ok(json) = serde_json::to_string_pretty(&list) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("[swarm] could not record published identity {agent_id}: {e}");
+        }
+    }
+}
+
+#[cfg(feature = "nats")]
+fn read_published_identities(cfg: &KannakaConfig) -> BTreeSet<String> {
+    std::fs::read_to_string(published_identities_path(cfg))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Every identity whose exemplars are this node's OWN (#890).
+///
+/// One chokepoint, so a future absorb path inherits the guard by construction
+/// rather than by someone remembering — the same reason the reply-inbox check
+/// moved into `SwarmTransport::reply` in #1020.
+///
+/// Three sources, all of them things this node can legitimately have published
+/// under:
+///   - `cfg.agent.id`, the configured identity;
+///   - the legacy `~/.kannaka/agent_id` file, which is what a config with no
+///     `[agent] id` falls back to (#1016);
+///   - anything recorded by `record_published_identity`.
+#[cfg(feature = "nats")]
+pub(crate) fn self_identities(cfg: &KannakaConfig) -> BTreeSet<String> {
+    let mut ids = read_published_identities(cfg);
+    if !cfg.agent.id.is_empty() {
+        ids.insert(cfg.agent.id.clone());
+    }
+    if let Some(legacy) = KannakaConfig::legacy_agent_id() {
+        if !legacy.is_empty() {
+            ids.insert(legacy);
+        }
+    }
+    ids
 }
 
 #[cfg(feature = "nats")]
@@ -1065,7 +1140,16 @@ pub(crate) fn handle_swarm_exemplars(
                     }
                 }
                 match transport.publish_exemplar(&agent_id, c.cluster_id, &payload) {
-                    Ok(()) => published += 1,
+                    Ok(()) => {
+                        published += 1;
+                        // #890: remember the identity we actually published
+                        // under, so a later absorb recognises this material as
+                        // our own. Recorded on SUCCESS only — recording at
+                        // argument-parse time would let a dry run or a failed
+                        // publish teach this node to ignore a real peer that
+                        // happens to use that id.
+                        record_published_identity(cfg, &agent_id);
+                    }
                     Err(e) => eprintln!("[exemplars] cluster {} publish failed: {e}", c.cluster_id),
                 }
             }
@@ -1403,7 +1487,9 @@ pub(crate) fn handle_swarm_absorb(
     let mut reinforced = 0usize;
     let mut skipped_threshold = 0usize;
     let mut skipped_self = 0usize;
-    let my_id = &cfg.agent.id;
+    // #890: self-origin is every identity this node may have published
+    // under, not just the configured one. See `self_identities`.
+    let my_ids = self_identities(cfg);
 
     // Sort by amplitude descending so we evaluate the strongest first.
     let mut ordered = exemplars;
@@ -1421,7 +1507,7 @@ pub(crate) fn handle_swarm_absorb(
 
     for e in ordered.iter().take(top_k) {
         let source = e.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
-        if source == my_id {
+        if my_ids.contains(source) {
             skipped_self += 1;
             continue;
         }
@@ -1866,7 +1952,9 @@ pub(crate) fn handle_swarm_autoabsorb(
         bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let my_id = &cfg.agent.id;
+    // #890: self-origin is every identity this node may have published
+    // under, not just the configured one. See `self_identities`.
+    let my_ids = self_identities(cfg);
     let mut absorbed = 0usize;
     // Re-sends of content already held: strengthened, but not a new contribution.
     let mut reinforced = 0usize;
@@ -1887,7 +1975,7 @@ pub(crate) fn handle_swarm_autoabsorb(
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string();
-        if source == *my_id {
+        if my_ids.contains(&source) {
             skipped_self += 1;
             continue;
         }
@@ -2704,5 +2792,104 @@ mod neighbors_tests {
     #[test]
     fn non_numeric_top_k_falls_back_to_default() {
         assert_eq!(neighbors_top_k(&serde_json::json!({ "top_k": "lots" })), 10);
+    }
+}
+
+/// #890: a node must not re-absorb exemplars it published under an override.
+///
+/// `swarm exemplars publish --agent-id X` publishes under X, but both absorb
+/// sweeps compared the incoming source against `cfg.agent.id` alone. The node's
+/// own material then came back as a peer's: false cross-agent novelty,
+/// provenance stamped `swarm:<override>`, and autoabsorb quota spent on its own
+/// output.
+#[cfg(all(test, feature = "nats"))]
+mod self_identity_tests {
+    use super::*;
+
+    fn cfg_with_dir(id: &str, dir: &std::path::Path) -> KannakaConfig {
+        let mut cfg = KannakaConfig::default();
+        cfg.agent.id = id.to_string();
+        // store_dir() derives the directory from hrm.path's parent (#769).
+        cfg.hrm.path = dir.join("kannaka.hrm").to_string_lossy().to_string();
+        cfg
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "km-self-ids-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_configured_identity_is_always_self() {
+        let d = tmpdir("cfg");
+        let cfg = cfg_with_dir("flaukowski", &d);
+        assert!(self_identities(&cfg).contains("flaukowski"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_override_published_under_is_recognised_as_self_afterwards() {
+        let d = tmpdir("override");
+        let cfg = cfg_with_dir("flaukowski", &d);
+
+        // The control: before publishing, that id is a stranger and absorb
+        // SHOULD take its material. Without this the assertion below could
+        // pass on a set that contains everything.
+        assert!(
+            !self_identities(&cfg).contains("cron-self-repro-agent"),
+            "control failed: an id never published under must not count as self"
+        );
+
+        record_published_identity(&cfg, "cron-self-repro-agent");
+
+        let ids = self_identities(&cfg);
+        assert!(
+            ids.contains("cron-self-repro-agent"),
+            "an exemplar published under an override must be recognised as our own"
+        );
+        assert!(
+            ids.contains("flaukowski"),
+            "recording an override must not displace the configured identity"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn recording_the_configured_identity_writes_nothing() {
+        // It is already self by definition; writing it would grow the file
+        // without bound across runs.
+        let d = tmpdir("noop");
+        let cfg = cfg_with_dir("flaukowski", &d);
+        record_published_identity(&cfg, "flaukowski");
+        record_published_identity(&cfg, "");
+        assert!(
+            !published_identities_path(&cfg).exists(),
+            "no override was used, so there was nothing to record"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_record_survives_a_second_process() {
+        // The whole point: publish happens in one invocation, absorb in a
+        // later one. An in-memory set would pass every other test here.
+        let d = tmpdir("persist");
+        let cfg = cfg_with_dir("flaukowski", &d);
+        record_published_identity(&cfg, "cron-self-repro-agent");
+
+        let reloaded = cfg_with_dir("flaukowski", &d);
+        assert!(
+            self_identities(&reloaded).contains("cron-self-repro-agent"),
+            "the override must be readable by a later invocation, not just this one"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
