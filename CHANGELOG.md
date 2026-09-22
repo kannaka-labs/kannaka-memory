@@ -1,8 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.11] — 2026-09-22
 
-### A recall no longer rewrites the store to count itself (#977)
+### A recall no longer rewrites the store to count itself (#977, PR #1041)
 
 Every production recall ended in a full `.hrm` save. #1010 blamed
 observation, and observation is one writer — but with `KANNAKA_RECALL_OBSERVE=0`
@@ -18,7 +18,7 @@ without touching the `.hrm`; a recall that observes nothing writes nothing
 but the sidecar. Observation on recall keeps its default (on) — that is the
 "storage is computation" half, and a separate decision.
 
-### A fresh store is chiral from birth — `remember --batch` no longer builds a different store (#917, #1031)
+### A fresh store is chiral from birth — `remember --batch` no longer builds a different store (#917, #1031, PR #1039)
 
 `HrmStore::new` started FLAT and only became chiral when the next process
 loaded it (`ChiralMedium::load` converts a v1 file). So the shape of a store
