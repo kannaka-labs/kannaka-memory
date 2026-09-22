@@ -1295,6 +1295,22 @@ pub enum EventPayload<'a> {
         agent_id: &'a str,
         memory_id: &'a uuid::Uuid,
     },
+    /// A daemon-served recall returned these memories, best first. The
+    /// durable record of a memory being *used* by someone other than its
+    /// writer — what kannaka-wave E-004/E-007 score "later mattered"
+    /// against. Carries the ids and scores, never the query text or the
+    /// content: `query_sha256` lets a reader tell one poller asking the
+    /// same thing every minute from many distinct askers without the log
+    /// holding what anyone asked. Replay ignores it (it changes no state).
+    /// Subject: `KANNAKA.events.memory.<agent_id>.recall`
+    MemoryRecall {
+        agent_id: &'a str,
+        memory_ids: &'a [uuid::Uuid],
+        similarities: &'a [f32],
+        top_k: usize,
+        query_sha256: &'a str,
+        via: &'a str,
+    },
     /// Wave-signature absorbed into the substrate. No per-agent suffix —
     /// every absorb in one stream for easier collective time-machine
     /// reconstruction. Subject: `KANNAKA.events.substrate.absorb`
@@ -1335,6 +1351,9 @@ impl<'a> EventPayload<'a> {
             EventPayload::MemoryForget { agent_id, .. } => {
                 format!("KANNAKA.events.memory.{agent_id}.forget")
             }
+            EventPayload::MemoryRecall { agent_id, .. } => {
+                format!("KANNAKA.events.memory.{agent_id}.recall")
+            }
             EventPayload::SubstrateAbsorb { .. } => {
                 "KANNAKA.events.substrate.absorb".to_string()
             }
@@ -1368,6 +1387,16 @@ impl<'a> EventPayload<'a> {
             EventPayload::MemoryForget { agent_id, memory_id } => {
                 obj.insert("agent_id".into(), serde_json::json!(agent_id));
                 obj.insert("memory_id".into(), serde_json::json!(memory_id));
+            }
+            EventPayload::MemoryRecall {
+                agent_id, memory_ids, similarities, top_k, query_sha256, via,
+            } => {
+                obj.insert("agent_id".into(), serde_json::json!(agent_id));
+                obj.insert("memory_ids".into(), serde_json::json!(memory_ids));
+                obj.insert("similarities".into(), serde_json::json!(similarities));
+                obj.insert("top_k".into(), serde_json::json!(top_k));
+                obj.insert("query_sha256".into(), serde_json::json!(query_sha256));
+                obj.insert("via".into(), serde_json::json!(via));
             }
             EventPayload::SubstrateAbsorb {
                 agent_id, class_index, amplitude, phase, frequency,
@@ -3650,6 +3679,38 @@ impl NatsSubscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recall event: its subject sits under the memory stream's
+    /// `KANNAKA.events.memory.>` capture, it carries the ids in rank order
+    /// with their scores, and it never carries the query or any content.
+    #[test]
+    fn memory_recall_event_names_ids_and_never_the_query() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let ids = [a, b];
+        let sims = [0.81f32, 0.64];
+        let hash = "ab".repeat(32);
+        let ev = EventPayload::MemoryRecall {
+            agent_id: "kannaka-prime",
+            memory_ids: &ids,
+            similarities: &sims,
+            top_k: 8,
+            query_sha256: &hash,
+            via: "daemon",
+        };
+        assert_eq!(ev.subject(), "KANNAKA.events.memory.kannaka-prime.recall");
+        let p = ev.payload_json();
+        assert_eq!(p["schema_version"], serde_json::json!("1.0"));
+        assert!(p["ts"].as_i64().is_some_and(|t| t > 1_600_000_000_000));
+        assert_eq!(p["memory_ids"][0], serde_json::json!(a));
+        assert_eq!(p["memory_ids"][1], serde_json::json!(b));
+        assert_eq!(p["similarities"].as_array().map(|v| v.len()), Some(2));
+        assert_eq!(p["top_k"], serde_json::json!(8));
+        assert_eq!(p["via"], serde_json::json!("daemon"));
+        for private in ["query", "content", "results"] {
+            assert!(p.get(private).is_none(), "recall event must not carry {private}");
+        }
+    }
 
     /// #701: the canonical envelope must stamp `schema_version` as the
     /// string "1.0" and `ts` as a unix-ms NUMBER — value AND type. An

@@ -576,6 +576,27 @@ pub(crate) fn handle_swarm_serve(
                         if let Some(ref rt) = recall_transport {
                             let payload = serde_json::json!({ "from": agent_id, "query": query, "results": results });
                             let _ = rt.reply(&reply, payload.to_string().as_bytes());
+                            // Durable record that these memories were used by a
+                            // peer (kannaka-wave E-004/E-007 ground truth). After
+                            // the reply, so it never delays one; plain publish,
+                            // no ack read, so it cannot steal this connection's
+                            // subscription bytes. Ids and scores only.
+                            let (ids, sims) = recalled_ids(&results);
+                            if !ids.is_empty() {
+                                let query_sha256 = sha256_hex(&query);
+                                if let Err(e) = rt.publish_event(
+                                    kannaka_memory::nats::EventPayload::MemoryRecall {
+                                        agent_id: &agent_id,
+                                        memory_ids: &ids,
+                                        similarities: &sims,
+                                        top_k,
+                                        query_sha256: &query_sha256,
+                                        via: "daemon",
+                                    },
+                                ) {
+                                    eprintln!("[events] Warning: recall event publish failed: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -627,6 +648,32 @@ pub(crate) fn neighbors_top_k(req: &serde_json::Value) -> usize {
         .and_then(|v| v.as_u64())
         .unwrap_or(10)
         .clamp(1, 100) as usize
+}
+
+/// The ids and similarities of a recall reply's rows, in rank order, for the
+/// recall event. A row whose id does not parse as a UUID is skipped rather
+/// than guessed at, so the event only ever names memories that exist.
+#[cfg(feature = "nats")]
+pub(crate) fn recalled_ids(results: &[serde_json::Value]) -> (Vec<uuid::Uuid>, Vec<f32>) {
+    results
+        .iter()
+        .filter_map(|r| {
+            let id = r.get("id")?.as_str()?.parse::<uuid::Uuid>().ok()?;
+            let sim = r.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            Some((id, sim))
+        })
+        .unzip()
+}
+
+/// Lower-case hex SHA-256, so a recall event can say "the same question
+/// again" without holding the question.
+#[cfg(feature = "nats")]
+pub(crate) fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Build the reply for one `KANNAKA.neighbors.<agent_id>` request.
@@ -2891,5 +2938,32 @@ mod self_identity_tests {
             "the override must be readable by a later invocation, not just this one"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(all(test, feature = "nats"))]
+mod recall_event_tests {
+    use super::{recalled_ids, sha256_hex};
+
+    #[test]
+    fn recalled_ids_keeps_rank_order_and_skips_unparseable_rows() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let rows = vec![
+            serde_json::json!({"id": a.to_string(), "similarity": 0.9, "content": "x"}),
+            serde_json::json!({"id": "not-a-uuid", "similarity": 0.8}),
+            serde_json::json!({"id": b.to_string(), "similarity": 0.7}),
+        ];
+        let (ids, sims) = recalled_ids(&rows);
+        assert_eq!(ids, vec![a, b]);
+        assert_eq!(sims, vec![0.9, 0.7]);
+    }
+
+    #[test]
+    fn query_hash_is_sha256_hex() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }
