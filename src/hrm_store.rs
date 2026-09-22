@@ -1325,13 +1325,29 @@ impl HrmStore {
     /// ADR-0036 replay signal behind tier promotion, so it stays ON by default
     /// and this changes nothing for any existing caller.
     ///
-    /// What it buys is measurability. Every recall calls `mark_dirty()`, so a
-    /// one-shot CLI recall pays a full medium + sidecar save on exit for what
-    /// the caller asked to be a read: kannaka-bench measured p50 2817 ms
-    /// against 246 ms for an exact cosine over the same embeddings, with one
-    /// recall per fresh store — every one paying that save. There was no way
-    /// to separate the medium's ranking cost from the write it provokes.
-    /// `KANNAKA_RECALL_OBSERVE=0` (or off/false/no) separates them.
+    /// What it buys is measurability of the OBSERVATION cost specifically.
+    ///
+    /// ⚠ It does NOT give a non-mutating recall, and an earlier version of
+    /// this comment claimed it separated "the medium's ranking cost from the
+    /// write it provokes". That was wrong. Observation is not the only writer
+    /// on the recall path: ADR-0036 Phase 1 calls `record_retrieval()` on every
+    /// hit through `store.get_mut`, which marks dirty on its own, so the full
+    /// medium + sidecar save still happens on exit with this knob set.
+    ///
+    /// Measured on a real 1678-memory / 135 MB store (2026-09-22, median of 3,
+    /// `recall --top-k 5`):
+    ///
+    /// | mode                         | median   | store rewritten |
+    /// |------------------------------|----------|-----------------|
+    /// | plain                        | 16608 ms | yes             |
+    /// | KANNAKA_RECALL_OBSERVE=0     |  8484 ms | **yes**         |
+    /// | KANNAKA_READONLY=1           |  9752 ms | no              |
+    /// | both                         |  4638 ms | no              |
+    ///
+    /// So the two costs are roughly comparable and independent, and only
+    /// `KANNAKA_READONLY=1` suppresses the write today. A recall path that is
+    /// read-only by construction is #977 and is a decision about ADR-0036
+    /// replay semantics, not a knob.
     ///
     /// Same shape as `KANNAKA_RECALL_XI_BOOST` (#975): a knob that makes a
     /// behaviour measurable without shipping a change to it.
