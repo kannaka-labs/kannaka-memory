@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Recall drops memories that expired before the instant it scores as of (#1044)
+
+`HrmStore` has carried `expires_at` since the temporal triple landed, `remember --expires` and
+the batch `expires` field stamp it, and nothing on the recall path read it: a superseded fact
+ranked exactly like a current one, with or without `--at`. Now `KannakaMemorySystem::recall`
+(and the beam path) skips a memory whose `expires_at` is at or before the recall instant
+(`--at`, else the wall clock), over-fetching only when the store holds any expiry at all so a
+store that never stamps one is byte-identical to before. `KANNAKA_RECALL_EXPIRED=keep`
+restores the old behaviour. Motivated by kannaka-bench E-L3c/E-L3d, where a write-time
+supersession reflex stamps `expires` at ingest and the harness had to simulate this rule.
+
+This sits beside, not instead of, the temporal-decay floor (`KANNAKA_RECALL_TEMPORAL_FLOOR`,
+which only applies when `KANNAKA_RECALL_TEMPORAL_EXP` > 0 and deliberately never reaches 0 so
+"what did we use before" stays answerable). That question is now answered with `--at`: recall
+as of an instant before the stamp still returns the older fact, which the new test checks.
+
 ### Added — Simulated Bifurcation as a `ConsolidationSolver` (kannaka-quantum Wave 4, W4.7a)
 
 `qubo::SimulatedBifurcation`: ballistic simulated bifurcation (Goto et al. 2019,

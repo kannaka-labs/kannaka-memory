@@ -1303,19 +1303,63 @@ impl KannakaMemorySystem {
         self.engine.store.flush_reactivation();
     }
 
+    /// #1044: whether recall drops memories whose `expires_at` is at or before
+    /// the instant recall is scored as of (`--at`, else the wall clock).
+    /// `KANNAKA_RECALL_EXPIRED=keep` restores the old behaviour. Default
+    /// `drop`: a memory that a later one superseded (`remember --expires`, the
+    /// batch `expires` field, a write-time supersession reflex) is not an
+    /// answer any more. Stores that never stamp `expires_at` — every store
+    /// before this landed — see no change.
+    fn recall_drops_expired() -> bool {
+        !matches!(
+            std::env::var("KANNAKA_RECALL_EXPIRED").ok().as_deref().map(str::trim),
+            Some("keep") | Some("0") | Some("off") | Some("false")
+        )
+    }
+
+    /// Superseded before `as_of`: the row exists, but it is no longer current.
+    fn expired_as_of(m: &crate::memory::HyperMemory, as_of: chrono::DateTime<Utc>) -> bool {
+        matches!(m.expires_at, Some(exp) if exp <= as_of)
+    }
+
+    /// Does any memory in the store carry an expiry at all? Cheap (one pass
+    /// over the cache) and it decides whether recall over-fetches so that a
+    /// dropped row does not shorten the answer.
+    fn store_has_expiries(&self) -> bool {
+        self.engine
+            .store
+            .all_memories()
+            .map(|ms| ms.iter().any(|m| m.expires_at.is_some()))
+            .unwrap_or(false)
+    }
+
     pub fn recall(&mut self, query: &str, top_k: usize) -> Result<Vec<RecallResult>, SystemError> {
-        let results = self.engine.store.resonate_query(query, top_k)
+        // #1044: over-fetch only when the store actually holds expiries, so
+        // the common case is byte-identical to before.
+        let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
+        let fetch = if drop_expired { top_k.saturating_add(5).max(top_k * 2) } else { top_k };
+        let as_of = crate::medium::hemisphere::recall_now();
+        let results = self.engine.store.resonate_query(query, fetch)
             .map_err(SystemError::Store)?;
         let now = Utc::now();
 
         let mut out = Vec::new();
         for (id, resonance_strength) in results {
+            if out.len() >= top_k {
+                break;
+            }
             if std::env::var("KANNAKA_RECALL_TRACE").is_ok()
                 && self.engine.store.get(&id).ok().flatten().is_none()
             {
                 eprintln!("[recall-trace] openclaw DROP: id {id} not in canonical store");
             }
             if let Some(m) = self.engine.store.get(&id).ok().flatten() {
+                if drop_expired && Self::expired_as_of(m, as_of) {
+                    if std::env::var("KANNAKA_RECALL_TRACE").is_ok() {
+                        eprintln!("[recall-trace] openclaw DROP: id {id} expired at {:?} (as of {as_of})", m.expires_at);
+                    }
+                    continue;
+                }
                 let age_hours = (now - m.created_at).num_seconds().max(0) as f64 / 3600.0;
                 out.push(RecallResult {
                     id,
@@ -1497,10 +1541,17 @@ impl KannakaMemorySystem {
         let results = self.engine.store.resonate_query_with_beam(beam, query, top_k)
             .map_err(SystemError::Store)?;
         let now = Utc::now();
+        // #1044: same rule on the beam path; the beam is a fixed candidate
+        // set, so there is nothing to over-fetch — a dropped row is a shorter answer.
+        let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
+        let as_of = crate::medium::hemisphere::recall_now();
 
         let mut out = Vec::with_capacity(results.len());
         for (id, strength) in results {
             if let Some(m) = self.engine.store.get(&id).ok().flatten() {
+                if drop_expired && Self::expired_as_of(m, as_of) {
+                    continue;
+                }
                 let age_hours = (now - m.created_at).num_seconds().max(0) as f64 / 3600.0;
                 out.push(RecallResult {
                     id,
@@ -3600,6 +3651,44 @@ mod tests {
             .downcast_mut::<crate::hrm_store::HrmStore>()
             .unwrap();
         assert!(hrm.set_temporal(id, None, None, Some(when)), "set_temporal must find the memory");
+    }
+
+    /// #1044: a superseded memory is not an answer any more. Two facts about
+    /// the same thing, the older one stamped `expires_at` at the moment the
+    /// newer arrived. Recall as of a later instant must return only the
+    /// current one; recall as of an instant BEFORE the stamp must still return
+    /// the older one (it was current then); `KANNAKA_RECALL_EXPIRED=keep`
+    /// restores the old behaviour. Mutation-checked: removing the
+    /// `expired_as_of` skip in `recall` fails the first assertion.
+    #[test]
+    fn recall_drops_a_memory_superseded_before_the_as_of_instant() {
+        let _lock = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("KANNAKA_RECALL_EXPIRED");
+        let dir = temp_dir("recallexpired");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let old = sys.remember("my personal best in the charity 5K run is 27:12").unwrap();
+        let new = sys.remember("my personal best in the charity 5K run is now 25:50").unwrap();
+        let stamp = Utc::now() - chrono::Duration::days(2);
+        expire(&mut sys, &old, stamp);
+
+        // Control: the older fact is in the store and resonates for this query
+        // when nothing filters it.
+        std::env::set_var("KANNAKA_RECALL_EXPIRED", "keep");
+        let kept: Vec<Uuid> = sys.recall("personal best 5K time", 5).unwrap().into_iter().map(|r| r.id).collect();
+        std::env::remove_var("KANNAKA_RECALL_EXPIRED");
+        assert!(kept.contains(&old) && kept.contains(&new), "control: both facts recall with the rule off: {kept:?}");
+
+        // As of now (after the stamp): only the current fact.
+        let now_ids: Vec<Uuid> = sys.recall("personal best 5K time", 5).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(now_ids.contains(&new), "the current fact must still recall: {now_ids:?}");
+        assert!(!now_ids.contains(&old), "the superseded fact was returned as of now: {now_ids:?}");
+
+        // As of an instant before the stamp: the older fact was current then.
+        let before = crate::medium::hemisphere::RecallAsOf::new(stamp - chrono::Duration::days(1));
+        let then_ids: Vec<Uuid> = sys.recall("personal best 5K time", 5).unwrap().into_iter().map(|r| r.id).collect();
+        drop(before);
+        assert!(then_ids.contains(&old), "as of before the stamp the older fact must recall: {then_ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole M8 fix reads `expires_at` off the CACHED memory that
