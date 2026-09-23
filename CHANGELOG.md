@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Added — Simulated Bifurcation as a `ConsolidationSolver` (kannaka-quantum Wave 4, W4.7a)
+
+`qubo::SimulatedBifurcation`: ballistic simulated bifurcation (Goto et al. 2019,
+2021), the quantum-inspired classical solver the September 2026 field review found
+actually delivers, beside `ClassicalAnneal` under the same ADR-0038 seam: same
+`SolveBudget`, same entropy-seeded provenance, exhaustive below `EXACT_THRESHOLD`
+so small dreams stay exact whichever solver is used. The QUBO is mapped to Ising
+by `x = (1 + s)/2` (a test checks the map preserves the ordering of every
+assignment up to a constant); the answer is the best `sign(x)` seen, scored with
+the problem's own `energy`, so it cannot report an energy the objective
+disagrees with. On random dense problems just above the exhaustive threshold it
+reaches the brute-force optimum, and it is at least as good as the annealer on
+the same seeds in the test's sample.
+
+Not wired into the engine: nothing selects a solver yet (T3.5's re-score-before-
+apply path decides that), so this changes no dream. Which solver keeps more of
+what later mattered is the one-week dream diff's question.
+
 ## [0.16.11] — 2026-09-22
 
 ### A recall no longer rewrites the store to count itself (#977, PR #1041)
