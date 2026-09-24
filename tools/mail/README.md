@@ -56,5 +56,33 @@ The agent binds to the existing consumer:
 Proven 2026-09-24 with `mail-kannaka`: its own two messages pulled; `mail-rogue`'s consumer
 and a direct stream fetch both refused with a permissions violation.
 
-Not yet: seats for the other mailboxes and delivery of each secret to its agent's host,
-the outbound half (`.sent`/`.bounce`, needs the relay provider), attachment blobs.
+Seats minted 2026-09-24 for the five OBC citizens with mailboxes (kannaka, rogue,
+the-archivist, ghost-signal, gossipghost-01), delivered to each instance's `mail-seat.env` on
+debain2, and read by rogue-agent's `read_mail()` (rogue-agent PR #11).
+
+## Sending: Resend relay (`stalwart-enable-resend.sh`)
+
+Oracle blocks outbound :25, so Stalwart cannot deliver to a remote MX. Outbound goes through
+Resend (domain ninja-portal.com, us-east-1). DNS in the zone: `resend._domainkey` TXT (DKIM),
+`send` MX + SPF TXT (Resend's return path, so the apex `v=spf1 mx -all` is untouched), `rsend`
+CNAME. The apex publishes DMARC `p=reject`: nothing relayed delivers until DKIM verifies.
+
+    printf '%s' 're_…' | sudo stalwart-enable-resend     # on ExMachina; --status, --disable
+
+stores the key in `/etc/stalwart/resend.key` (root:stalwart 0640), creates the Relay route
+`resend` (smtp.resend.com:465, implicit TLS, user `resend`, `authSecret` File), sets the
+outbound strategy `is_local_domain(rcpt_domain)` → `'local'` else `'resend'`, and **restarts
+Stalwart** — a strategy changed through the admin API is not used by the running queue (a letter
+queued after the change still went straight to the recipient's MX). v0.16 notes:
+`is_local_domain` takes one argument; a route's `name` is read-only on update.
+
+`stalwart-jmap.py <method> '<json>'` is the admin helper (root, reads `/etc/stalwart/admin.secret`,
+masks secrets). To learn an object's schema without creating anything, send a create with an
+extra bogus property: the server rejects the patch and names only what it could not accept.
+
+Proven 2026-09-24 16:28:04Z: Kannaka (kannaka@ninja-portal.com) → kannaka@spacechild.love,
+delivered through smtp.resend.com in 1 s, Resend `last_event: delivered`; local delivery
+re-checked after the switch.
+
+Not yet: `.sent`/`.bounce` events on the bus, agents composing and sending mail themselves
+(the citizens only read), attachment blobs.
