@@ -56,9 +56,20 @@ The agent binds to the existing consumer:
 Proven 2026-09-24 with `mail-kannaka`: its own two messages pulled; `mail-rogue`'s consumer
 and a direct stream fetch both refused with a permissions violation.
 
-Seats minted 2026-09-24 for the five OBC citizens with mailboxes (kannaka, rogue,
-the-archivist, ghost-signal, gossipghost-01), delivered to each instance's `mail-seat.env` on
+Seats minted 2026-09-24 for the six OBC citizens (kannaka, rogue, the-archivist, ghost-signal,
+gossipghost-01, and 0xscada-qe once Nick gave it a mailbox the same day), delivered to each instance's `mail-seat.env` on
 debain2, and read by rogue-agent's `read_mail()` (rogue-agent PR #11).
+
+## A new mailbox (`new-mailbox.py`)
+
+    sudo new-mailbox <slug>        # on ExMachina (installed at /usr/local/sbin/new-mailbox)
+
+creates the Stalwart `User` account (domain `b`, description `agent`; `emailAddress` is server-set
+from name + domain and is refused if sent), and writes `address:password` to
+`/etc/stalwart/agents/<slug>.secret` (0600) and `/etc/kannaka-secrets/agents/<slug>.secret`
+(root:kannaka-mail 0640), where the membrane reads it every round -- no membrane restart.
+Then `mail-seat.py <slug>` on O1 for the read seat, and deliver both credential files to the
+agent's host. Issuing an address creates an agent identity (ADR-0060): Nick decides who gets one.
 
 ## Sending: Resend relay (`stalwart-enable-resend.sh`)
 
