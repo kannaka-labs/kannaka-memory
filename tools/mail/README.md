@@ -28,6 +28,33 @@ Proven 03:16Z: a message sent from Zoho to `kannaka+bus@ninja-portal.com` was on
 bus 10 s later with `from_authenticated: true` (dkim=pass d=spacechild.love, spf=pass on
 MAIL FROM), `tag: "bus"`, `untrusted: true`.
 
-Not yet: per-agent durable pull consumers (`mail-<slug>`) and the consumer-side seats
-(subscribe `KANNAKA.mail.<slug>.>` only), the outbound half (`.sent`/`.bounce`, needs
-the relay provider), attachment blobs.
+## Reading: one seat per agent (`mail-seat.py`)
+
+⚠ **2026-09-24: the mail stream was readable anonymously.** `anon` held
+`$JS.API.STREAM.MSG.GET.>`, which covers `KANNAKA_MAIL_V2`; an anonymous client fetched
+message 1. Core subscribe on `KANNAKA.mail.>` was already denied, but a direct fetch by
+sequence is not a subscription. Fixed on all three servers: every seat except
+`kannaka_internal` and `mail-membrane` now carries a publish deny on MSG.GET, DIRECT.GET and
+the consumer API for this stream, and a subscribe deny on `KANNAKA.mail.>`. **A seat added
+to the config later does not inherit that deny** — scope it narrower or add it.
+
+An agent reads its own mail only through its own seat:
+
+    # on O1, with the operator seat in the environment
+    set -a; . ~/.kannaka-nats.env; set +a
+    python3 tools/mail/mail-seat.py <slug> [--dry-run] [--rotate]
+
+This creates the durable pull consumer `mail-<slug>` (filter `KANNAKA.mail.<slug>.>`,
+DeliverAll, explicit ack, so mail that arrived earlier is waiting), adds a NATS user
+`mail-<slug>` whose only JetStream rights are MSG.NEXT, INFO and ACK on that one consumer,
+validates and hot-reloads the config (backup kept), and writes the seat's credentials to
+`/etc/kannaka-secrets/mail-seats/<slug>.env` (root, 0600) for delivery to the agent's host.
+The agent binds to the existing consumer:
+
+    js.pull_subscribe("KANNAKA.mail.<slug>.>", durable="mail-<slug>", stream="KANNAKA_MAIL_V2")
+
+Proven 2026-09-24 with `mail-kannaka`: its own two messages pulled; `mail-rogue`'s consumer
+and a direct stream fetch both refused with a permissions violation.
+
+Not yet: seats for the other mailboxes and delivery of each secret to its agent's host,
+the outbound half (`.sent`/`.bounce`, needs the relay provider), attachment blobs.
