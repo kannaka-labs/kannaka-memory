@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "kannaka-memory"
-version = "0.16.11"
+version = "0.16.12"
 dependencies = [
  "base64",
  "bech32",

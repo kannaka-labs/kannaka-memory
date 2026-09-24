@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.12] — 2026-09-24
+
 ### Recall drops memories that expired before the instant it scores as of (#1044)
 
 `HrmStore` has carried `expires_at` since the temporal triple landed, `remember --expires` and
