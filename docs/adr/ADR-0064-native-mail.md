@@ -1,6 +1,6 @@
 # ADR-0064: Native mail — the mailbox is the record, memory holds the meaning
 
-**Status:** Proposed (2026-09-25)
+**Status:** Proposed (2026-09-25) · P0 shipped 2026-09-25 (read-only `kannaka mail`; gate 49/51 = 96.1%, see [ADR-0064-P0-gate.md](ADR-0064-P0-gate.md))
 **Builds on:** ADR-0060 (an address per agent, a real mailbox behind it), ADR-0062 (the mail
 membrane: inbound on the bus, outbound through a relay, sending needs the agent's own credential),
 ADR-0063 (a fact that has an authority must be held as a reference to it, not as a wave),

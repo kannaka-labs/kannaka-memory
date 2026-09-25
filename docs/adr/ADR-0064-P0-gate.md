@@ -114,6 +114,47 @@ Anchor = the latest message in the thread (`account:folder:uid`). Dates are UTC.
 ignored 22 (20 zoho + 2 np) = 51. **After the T40 close:** needs_reply 2 · waiting_on_them 2 · done 25 ·
 ignored 22.
 
-## Measured result
+## Measured result (2026-09-25 ~21:5xZ, appended after the run)
 
-*(Filled in after the classifier ran; see the section below, which was appended after the run.)*
+Run: `kannaka mail sync --days 30`, then `kannaka mail status --all --json`, compared to the table
+above by anchor membership. The np threads are matched by subject tag, because JMAP anchors are
+email ids rather than UIDs. Sync read zoho INBOX 56 + Sent 68 over IMAP, and np Inbox 2 + Sent
+Items 0 over JMAP: 126 refs, 51 threads, and every label matched exactly one thread with none left
+unlabelled.
+
+| measurement | agreement |
+|---|---|
+| **Structural** (before any close), strict 4-state | **49 / 51 = 96.1%**: passes ≥ 95% |
+| **After the pre-registered T40 close**, strict 4-state | **49 / 51 = 96.1%**: passes |
+| Open-loop view (needs_reply / waiting_on_them / not-open), both runs | 49 / 51 = 96.1% |
+
+**Disagreements (both runs), exactly the two declared in advance:**
+
+- **T19** "Your Kannaka Brain key": labelled `ignored`, status says `needs_reply` (their last
+  message is unanswered). A script sent it as nick@spacechild.love with no automation header.
+- **T20** "Ubie US HealthTech Career Opportunities": labelled `ignored`, status says
+  `needs_reply`. Recruiter cold mail from an Outlook tenant, with no automation header.
+
+Both are false *opens*: the list shows two extra items to dismiss, and no real loop is hidden.
+Neither was fixed by a rule, since that would be fitting the rules to the test set. A `close` with
+a note is the P0 tool for them, and a sender-reputation or first-contact signal is a P1 question.
+
+**The three 09-25 cases:**
+
+1. Vincent (T48, "The Agentic Arena: which activity feeds msgs_per_bot?", ours 09-25 20:42Z):
+   `waiting_on_them`, because our last message asks and is unanswered. ✓ The earlier postmortem
+   thread (T39) is `done`; his "I owe you a reply" there is a P1 commitment.
+2. Nick's "Help if possible" (T40, `t:e4c81f1ddd`): `needs_reply` → `kannaka mail close
+   t:e4c81f1ddd --note "deployed 09-23 (kax-scada-desk-run2)"` → `done (closed: deployed 09-23
+   (kax-scada-desk-run2))`. ✓ The closure is only a local row in `<data_dir>/mail/closures.jsonl`,
+   with `covers_through` 2026-09-23T03:24:45Z; a newer message in the thread would re-open it.
+3. Nick's forward of Victor Cypher's offer (T38): `done` (FYI), because Nick's own words are
+   "Fyi..". ✓ P1 adds "Victor owes a plan" as a commitment on them.
+
+**Read-only, checked against the authority.** "Help if possible" was still unread on the server
+(`\Recent`, no `\Seen`) after two full-body syncs and two live `thread` fetches. Every fetch was a
+PEEK. `refs.jsonl` (118 KB) holds no body text: grep for a known body phrase and for the `sk-` key
+prefix returns 0.
+
+**Caveat, stated before the run and restated here:** the number is in-sample. The re-check is this
+same procedure on the next 30 days of mail.
