@@ -19,7 +19,7 @@ boxes; `oracle-cluster.conf.template` in `ops/nats-cluster/` is the redacted sha
 | Identity | Daemon(s) | PUBLISH (scoped, as deployed) | Account (1c target) |
 |---|---|---|---|
 | `writer` | kannaka-memory single writer (`run-swarm.sh`) | `KANNAKA.>`, `QUEEN.>`, `queen.event.>`, `EYE.>`, `$JS.API.>`, `_INBOX.>` (the only memory/JS mutator) | INTERNAL |
-| `serve` | swarm-serve, swarm-worker, inbox | `KANNAKA.recall.>`, `inbox.audit`, `inbox.reply.>`, `KANNAKA.skills.>`, `_INBOX.>` | INTERNAL |
+| `serve` | swarm-serve, swarm-worker, inbox | `KANNAKA.recall.>`, `inbox.audit`, `inbox.reply.>`, `KANNAKA.skills.>`, `KANNAKA.events.memory.*.recall`, `_INBOX.>` | INTERNAL |
 | `radio` | kannaka-radio | `RADIO.>`, `attention.ear`, `reactions`, `consciousness`, `$JS.API.STREAM.MSG.GET/INFO.>`, `_INBOX.>` | INTERNAL |
 | `presence` | kannaka-presence (ADR-0013) | `KANNAKA.events.obc.>`, `presence.>`, `_INBOX.>` | INTERNAL |
 | `responder` | kannaka-responder (ADR-0014) | `events.obc.responder_escalation`, `recall.>` (req), `_INBOX.>` | INTERNAL |

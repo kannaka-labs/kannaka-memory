@@ -64,6 +64,8 @@ check "queen_agent publishes presence"   allow queen_agent "KANNAKA.presence.tes
 check "queen_agent directed ask OK"      allow queen_agent "KANNAKA.ask.kannaka-prime"
 check "queen_agent DENIED stream create" deny  queen_agent '$JS.API.STREAM.CREATE.SHADOW_TEST'
 check "queen_agent DENIED work queue"    deny  queen_agent "KANNAKA.work.research"
+check "serve publishes recall events"    allow serve       "KANNAKA.events.memory.kannaka-prime.recall"
+check "serve DENIED remember events"     deny  serve       "KANNAKA.events.memory.kannaka-prime.remember"
 check "anon ALLOWED retained reads"      allow anon        '$JS.API.STREAM.MSG.GET.QUEEN_PHASES'
 
 echo "== result: $pass passed, $fail failed =="
