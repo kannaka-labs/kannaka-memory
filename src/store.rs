@@ -68,6 +68,16 @@ pub struct QueryResult {
 ///
 /// The `insert()` / `search()` methods accept raw HyperMemory/vectors for
 /// compatibility with ResonanceEngine. New code should prefer `store()`/`recall()`.
+/// One recall hit with its channel — see [`MediumBackend::resonate_query_hits`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResonanceHit {
+    pub id: Uuid,
+    pub strength: f32,
+    /// True when the chiral right hemisphere surfaced this memory without a
+    /// left-hemisphere match. Always false off the chiral path.
+    pub is_intuition: bool,
+}
+
 pub trait MediumBackend: Send + Sync {
     // -- Core HRM operations --
 
@@ -90,6 +100,35 @@ pub trait MediumBackend: Send + Sync {
     fn resonate_query(&mut self, query: &str, top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {
         let _ = (query, top_k);
         Err(StoreError::Other("resonate_query not implemented".into()))
+    }
+
+    /// [`resonate_query`] with the recall channel kept (#1005).
+    ///
+    /// Same hits, same order, same observation side effects — but each hit
+    /// also says whether the chiral right hemisphere surfaced it without a
+    /// left-hemisphere match (the "intuition" channel). `resonate_query`
+    /// returns `(id, strength)` and has nowhere to put that, so callers that
+    /// want the channel use this instead.
+    ///
+    /// The default reports every hit as analytical (`is_intuition: false`),
+    /// which is the truth for any backend without a chiral medium. The HRM
+    /// backend overrides it.
+    ///
+    /// [`resonate_query`]: MediumBackend::resonate_query
+    fn resonate_query_hits(
+        &mut self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<ResonanceHit>, StoreError> {
+        Ok(self
+            .resonate_query(query, top_k)?
+            .into_iter()
+            .map(|(id, strength)| ResonanceHit {
+                id,
+                strength,
+                is_intuition: false,
+            })
+            .collect())
     }
 
     /// Backward-compatible alias for resonate_query().

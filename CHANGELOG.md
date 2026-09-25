@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Recall carries the chiral intuition flag instead of hardcoding `false` (#1005)
+
+`medium::chiral::recall` marks a right-hemisphere hit with no left-hemisphere partner as an
+intuition, and `KannakaMemorySystem::recall` threw that away: `resonate_query` returns
+`(id, strength)`, so `RecallResult::intuition` was set to `false` on every hit. A new
+`MediumBackend::resonate_query_hits` returns `ResonanceHit { id, strength, is_intuition }`
+(same hits, order and observation as `resonate_query`, which now delegates to it), and
+`recall` reads the flag from it. The default implementation reports every hit as analytical,
+which is true for any backend without a chiral medium; the beam, prefilter and flat paths
+report `false` for the same reason. `RecallResult` is still not serialized, so no CLI or JSON
+output changes. The test checks each hit's flag against the chiral medium's own answer on a
+fixture holding both channels, so hardcoding `true` fails as hardcoding `false` did.
+
 ## [0.16.12] — 2026-09-24
 
 ### Recall drops memories that expired before the instant it scores as of (#1044)

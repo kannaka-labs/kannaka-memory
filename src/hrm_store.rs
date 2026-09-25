@@ -1483,7 +1483,24 @@ impl HrmStore {
             .unwrap_or(true)
     }
 
-    fn resonate_query_inner(&mut self, query: &str, top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {
+    /// Every hit keeps its recall channel (#1005): only the chiral branch can
+    /// produce an intuition, and the beam, prefilter and flat branches report
+    /// `is_intuition: false` because none of them consults the left hemisphere.
+    fn resonate_query_inner(
+        &mut self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<crate::store::ResonanceHit>, StoreError> {
+        use crate::store::ResonanceHit;
+        let analytical = |rs: &[Resonance]| -> Vec<ResonanceHit> {
+            rs.iter()
+                .map(|r| ResonanceHit {
+                    id: r.id,
+                    strength: r.resonance_strength,
+                    is_intuition: false,
+                })
+                .collect()
+        };
         // Try cluster prefilter first (refactor #4) — only on the flat
         // (non-chiral) path for now. Loads the .clusters.json sidecar
         // written by bridge::assess, picks members of clusters whose
@@ -1500,7 +1517,7 @@ impl HrmStore {
         // sparse path at all.
         if let Some(results) = self.try_beam_recall(query, top_k) {
             self.apply_observation(&results);
-            return Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect());
+            return Ok(analytical(&results));
         }
 
         let prefilter_on = std::env::var("KANNAKA_RECALL_PREFILTER")
@@ -1513,7 +1530,7 @@ impl HrmStore {
                         Some(&candidates), query, top_k, &self.pipeline,
                     ).map_err(|e| StoreError::Other(format!("prefiltered recall failed: {e}")))?;
                     self.apply_observation(&resonances);
-                    return Ok(resonances.iter().map(|r| (r.id, r.resonance_strength)).collect());
+                    return Ok(analytical(&resonances));
                 }
             }
         }
@@ -1548,11 +1565,18 @@ impl HrmStore {
                 self.mark_dirty();
             }
 
-            Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
+            Ok(results
+                .iter()
+                .map(|r| ResonanceHit {
+                    id: r.id,
+                    strength: r.resonance_strength,
+                    is_intuition: r.is_intuition,
+                })
+                .collect())
         } else {
             // Flat medium: resonance recall (always with observation)
             let results = self.recall_resonance(query, top_k)?;
-            Ok(results.iter().map(|r| (r.id, r.resonance_strength)).collect())
+            Ok(analytical(&results))
         }
     }
 
@@ -3128,6 +3152,18 @@ impl MediumBackend for HrmStore {
     }
 
     fn resonate_query(&mut self, query: &str, top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {
+        Ok(self
+            .resonate_query_hits(query, top_k)?
+            .into_iter()
+            .map(|h| (h.id, h.strength))
+            .collect())
+    }
+
+    fn resonate_query_hits(
+        &mut self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<crate::store::ResonanceHit>, StoreError> {
         if Self::recall_include_dreams() {
             return self.resonate_query_inner(query, top_k);
         }
@@ -3138,9 +3174,15 @@ impl MediumBackend for HrmStore {
         // merely to hide the row.
         let expanded = top_k.saturating_mul(3).max(top_k.saturating_add(10));
         let raw = self.resonate_query_inner(query, expanded)?;
-        let kept: Vec<(Uuid, f32)> = raw
+        let kept: Vec<crate::store::ResonanceHit> = raw
             .into_iter()
-            .filter(|(id, _)| !self.memory_cache.get(id).map(|m| m.hallucinated).unwrap_or(false))
+            .filter(|h| {
+                !self
+                    .memory_cache
+                    .get(&h.id)
+                    .map(|m| m.hallucinated)
+                    .unwrap_or(false)
+            })
             .take(top_k)
             .collect();
         Ok(kept)

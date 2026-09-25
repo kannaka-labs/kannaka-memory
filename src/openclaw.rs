@@ -185,23 +185,15 @@ pub struct RecallResult {
     /// doesn't require a breaking API change.
     pub similarity: f32,
     pub strength: f32,
-    /// Intended: true when the chiral right hemisphere surfaced this memory
-    /// without a left-hemisphere match — the "intuition" channel from
-    /// `medium::chiral::recall`.
+    /// True when the chiral right hemisphere surfaced this memory without a
+    /// left-hemisphere match — the "intuition" channel from
+    /// `medium::chiral::recall`. Carried here through
+    /// `MediumBackend::resonate_query_hits` (#1005). Always false on paths
+    /// that never consult the left hemisphere: the attention beam, the
+    /// cluster prefilter, flat (non-chiral) stores, and `recall_with_beam`.
     ///
-    /// ⚠ ALWAYS FALSE TODAY. This doc used to claim the flag "flows through
-    /// to the CLI so callers can distinguish analytical recall (left) from
-    /// associative recall (right)", while the code thirty lines below
-    /// hardcodes `intuition: false` with a TODO saying it is NOT plumbed —
-    /// the documentation described a refactor that never landed. The value
-    /// really is computed (`hemisphere.rs`: `is_intuition: hand == Hand::Right`)
-    /// and really is dropped, at `resonate_query`, whose return type is
-    /// `Vec<(Uuid, f32)>` and has nowhere to carry it.
-    ///
-    /// Inert rather than wrong-in-the-output: `RecallResult` derives only
-    /// Debug + Clone, so this never reaches JSON or a user. Tracked as an
-    /// issue rather than left as a comment — a deferred intention that lives
-    /// only in source is one nobody finds.
+    /// Not serialized: `RecallResult` derives only Debug + Clone, so no JSON
+    /// or CLI surface shows it yet.
     pub intuition: bool,
     pub age_hours: f64,
     pub layer: u8,
@@ -1339,12 +1331,13 @@ impl KannakaMemorySystem {
         let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
         let fetch = if drop_expired { top_k.saturating_add(5).max(top_k * 2) } else { top_k };
         let as_of = crate::medium::hemisphere::recall_now();
-        let results = self.engine.store.resonate_query(query, fetch)
+        let results = self.engine.store.resonate_query_hits(query, fetch)
             .map_err(SystemError::Store)?;
         let now = Utc::now();
 
         let mut out = Vec::new();
-        for (id, resonance_strength) in results {
+        for hit in results {
+            let (id, resonance_strength) = (hit.id, hit.strength);
             if out.len() >= top_k {
                 break;
             }
@@ -1366,10 +1359,7 @@ impl KannakaMemorySystem {
                     content: m.content.clone(),
                     similarity: resonance_strength,
                     strength: resonance_strength,
-                    // TODO(refactor#5 follow-up): plumb is_intuition through
-                    // resonate_query's trait return so chiral right-hemisphere
-                    // hits surface this flag instead of always false here.
-                    intuition: false,
+                    intuition: hit.is_intuition,
                     age_hours,
                     layer: m.layer_depth,
                     times_seen: m.times_seen,
@@ -4903,5 +4893,101 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("1024") && err.contains("384"), "error names both dims: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1005: the intuition channel reaches RecallResult
+    // -----------------------------------------------------------------------
+
+    /// `medium::chiral::recall` marks a right-hemisphere hit with no
+    /// left-hemisphere partner as an intuition, and `recall` used to drop that
+    /// flag on the floor at `resonate_query` and hardcode `false`.
+    ///
+    /// Every hit's flag is checked against the chiral medium's own answer for
+    /// the same query, and the fixture must hold BOTH channels in the top k —
+    /// so hardcoding `true` fails exactly as hardcoding `false` did.
+    #[test]
+    fn recall_surfaces_the_chiral_intuition_flag() {
+        let dir = temp_dir("intuition_flag");
+        {
+            let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            // Distinct subjects, so right-hemisphere resonance actually ranks
+            // them. Near-identical rows all saturate to the same strength, the
+            // stable sort then keeps the left-paired rows first, and no
+            // intuition ever reaches the top k — a fixture that could not tell
+            // a fixed bug from a broken one.
+            const SUBJECTS: [&str; 8] = [
+                "ferry", "orchard", "glacier", "violin", "compiler", "lantern", "falcon", "quarry",
+            ];
+            const DEEDS: [&str; 5] = [
+                "crossed the bay at dawn",
+                "was repaired in winter",
+                "appeared in the census",
+                "burned during the storm",
+                "was sold to a collector",
+            ];
+            for (i, subject) in SUBJECTS.iter().enumerate() {
+                for (j, deed) in DEEDS.iter().enumerate() {
+                    sys.remember_forcing_new(
+                        &format!("the {subject} {deed} (record {})", i * DEEDS.len() + j),
+                        "semantic",
+                        0.5,
+                    )
+                    .unwrap();
+                }
+            }
+            sys.save().unwrap();
+        }
+        // Reload: a saved store comes back chiral, which is the only path that
+        // computes the channel at all.
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        const QUERY: &str = "the falcon burned during the storm";
+        const K: usize = 24;
+        // Ground truth straight from the chiral medium (read-only, so it does
+        // not perturb the recall below). `init` builds the store's pipeline
+        // and the engine's from the same `make_pipeline`, so both encode the
+        // query identically.
+        let expected: std::collections::HashMap<Uuid, bool> = {
+            let hrm = sys
+                .engine
+                .store
+                .as_any_mut()
+                .downcast_mut::<crate::hrm_store::HrmStore>()
+                .expect("store must be an HrmStore");
+            hrm.chiral_medium()
+                .expect("fixture must be chiral, or intuition cannot be computed")
+                .recall(QUERY, K, &sys.engine.pipeline)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.is_intuition))
+                .collect()
+        };
+        let want_true = expected.values().filter(|&&b| b).count();
+        assert!(
+            want_true > 0 && want_true < expected.len(),
+            "fixture must hold both channels in the top {K}: {want_true} of {} are intuitions",
+            expected.len()
+        );
+
+        let hits = sys.recall(QUERY, K).unwrap();
+        assert!(!hits.is_empty(), "recall returned nothing");
+        assert!(
+            hits.iter().any(|h| h.intuition),
+            "no recall hit carried intuition=true out of {} (#1005)",
+            hits.len()
+        );
+        for h in &hits {
+            let want = expected.get(&h.id).copied();
+            assert_eq!(
+                Some(h.intuition),
+                want,
+                "hit {:?} ({}) carries intuition={} but the chiral medium says {:?}",
+                h.id,
+                h.content,
+                h.intuition,
+                want
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
