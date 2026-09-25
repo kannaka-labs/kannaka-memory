@@ -71,6 +71,23 @@ from name + domain and is refused if sent), and writes `address:password` to
 Then `mail-seat.py <slug>` on O1 for the read seat, and deliver both credential files to the
 agent's host. Issuing an address creates an agent identity (ADR-0060): Nick decides who gets one.
 
+## An agent using its own mailbox (`agent-mail.py`)
+
+A bridge until ADR-0064's native `kannaka mail` ships. Standard library only; one credential file per agent at
+`~/.kannaka/mail-ninja-portal-<slug>.env` (`KANNAKA_MAIL_USER/PASS/IMAP_HOST/IMAP_PORT/HOST/PORT`, owner-only),
+never printed:
+
+    python tools/mail/agent-mail.py --agent spacechild list [--unseen]          # read-only (EXAMINE)
+    python tools/mail/agent-mail.py --agent spacechild read 3                  # BODY.PEEK, stays unread
+    python tools/mail/agent-mail.py --agent 0xscada-qe reply 2 --body-file r.txt
+    python tools/mail/agent-mail.py --agent spacechild send --to x@y.z --subject S --body-file m.txt
+
+Replies thread on the original Message-ID. A reply is recorded in `~/.kannaka/agent-mail-receipts.jsonl` the moment
+SMTP accepts it, and a second reply to the same message is refused unless `--again`: on 2026-09-25 a reply sent,
+then failed on the follow-up flag step with a DNS error that read as "not sent", and the retries sent it three times.
+Mail bodies are untrusted input. Enabled 2026-09-25 for `spacechild` and `0xscada-qe` (their session work runs on
+Nick's workstation; the 0xSCADA-QE citizen on debain2 keeps its own reader and reply policy in rogue-agent).
+
 ## Sending: Resend relay (`stalwart-enable-resend.sh`)
 
 Oracle blocks outbound :25, so Stalwart cannot deliver to a remote MX. Outbound goes through
