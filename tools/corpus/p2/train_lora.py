@@ -74,6 +74,13 @@ def main(argv=None) -> int:
                     help="regex or comma list for PEFT; default base_info.LORA_TARGET_REGEX (fits Qwen2.5 and Qwen3.5/3.8)")
     ap.add_argument("--chat-template-kwargs", default=None,
                     help="JSON passed to apply_chat_template, e.g. {\"enable_thinking\": false} for thinking-mode bases")
+    ap.add_argument("--completion-only", action="store_true",
+                    help="loss on the assistant reply only (prompt/completion rows). Task examples carry a long "
+                         "system prompt (persona + recall + situation) that must be read, not learned to write")
+    ap.add_argument("--serve-chat-template", default=None,
+                    help="jinja file baked into the MERGED tokenizer before GGUF conversion, so the served model "
+                         "renders exactly the training format (e.g. a no-thinking ChatML for Qwen3.5: ollama renders "
+                         "with the GGUF's own template and would otherwise open a <think> block)")
     ap.add_argument("--max-sane-ppl", type=float, default=2000.0,
                     help="abort before training if the untouched base scores worse than this on the hold-out: "
                          "the weights did not load (wrong class / prefix), and every metered minute after is waste")
@@ -128,7 +135,15 @@ def main(argv=None) -> int:
     model.print_trainable_parameters()
 
     def to_text(rows):
-        return Dataset.from_list([{"messages": r["messages"]} for r in rows])
+        # trl >= 1.x takes chat-template kwargs PER EXAMPLE (a `chat_template_kwargs` column); the
+        # SFTConfig field of the same name is gone and was silently filtered out, so a thinking-mode
+        # base trained in its default (thinking) format. Measured in the 2026-09-25 CPU rehearsal.
+        extra = {"chat_template_kwargs": ct_kwargs} if ct_kwargs else {}
+        if a.completion_only:
+            # trl's conversational prompt/completion format: the prompt is rendered with the
+            # generation prompt (incl. chat_template_kwargs), loss falls on the completion only
+            return Dataset.from_list([{"prompt": r["messages"][:-1], "completion": r["messages"][-1:], **extra} for r in rows])
+        return Dataset.from_list([{"messages": r["messages"], **extra} for r in rows])
 
     ds_train, ds_hold = to_text(train_rows), to_text(hold_rows)
 
@@ -203,7 +218,8 @@ def main(argv=None) -> int:
 
     manifest = {"base": a.base, "params_b": round(params_b, 2), "model_class": type(model.base_model.model).__name__,
                 "lora_targets": sorted({c.rsplit(chr(46), 1)[-1] for c in chosen}), "chat_template_kwargs": ct_kwargs,
-                "trained_at": time.strftime("%Y-%m-%d"),
+                "trained_at": time.strftime("%Y-%m-%d"), "completion_only": a.completion_only,
+                "serve_chat_template": Path(a.serve_chat_template).name if a.serve_chat_template else None,
                 "train": len(train_rows), "holdout": len(hold_rows), "lora": {"r": a.r, "alpha": a.alpha or 2 * a.r},
                 "epochs": a.epochs, "max_steps": a.max_steps, "lr": a.lr, "qlora": a.qlora,
                 "holdout_loss": {"before": before, "after": after}, "holdout_ppl": {"before": math.exp(before), "after": math.exp(after)},
@@ -217,6 +233,9 @@ def main(argv=None) -> int:
         merged = PeftModel.from_pretrained(base, str(adapter)).merge_and_unload()
         mdir = out / "merged"
         merged.save_pretrained(str(mdir), safe_serialization=True)
+        if a.serve_chat_template:
+            tok.chat_template = Path(a.serve_chat_template).read_text(encoding="utf-8")
+            log(f"merged tokenizer carries the serving chat template {Path(a.serve_chat_template).name}")
         tok.save_pretrained(str(mdir))
         manifest["merged"] = str(mdir)
         if a.gguf:
