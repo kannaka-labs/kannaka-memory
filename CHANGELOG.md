@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Writes no longer run an O(n²) assessment after they land (#1061)
+
+`refresh_status_cache_counts` runs after every `remember`, `import`, `forget`, `forget_many` and
+`dedupe --apply`. Its comment says "counts only", but it called `stats()`. `stats()` calls
+`assess()`, and `assess()` does an all-pairs cosine scan in `KuramotoSync::find_synchronized_clusters`.
+On a 17.7k-memory store the process was still in that scan long after the flush, so a caller with a
+timeout reported a write that had landed as failed, and `import` never printed its summary.
+
+The refresh now calls `memory_counts()`, a single O(n) pass. `assess()` takes its
+`total_memories` / `active_memories` from the same function, so the two numbers always agree.
+`stats()` and `assess()` return what they did before.
+
+Other callers that paid for an assessment they did not need:
+
+- `triage_forget` (`triage --apply`, `triage --max-total N --apply`, and dream auto-triage and the
+  size cap) looped `forget`, which refreshed once per eviction. It now uses `forget_many`, which
+  refreshes once.
+- `write_status_cache` and `publish_consciousness_to_nats` already receive a fresh state, yet called
+  `stats()` only to read Δ and κ. That was a second assessment on every dream. They now read the
+  chiral store directly.
+- `kannaka status` called `stats()` and then `assess()`, which is two assessments. It now makes one
+  and builds its stats from it with the new `stats_for(&state)`.
+- `detect_existing_install`, used by the setup wizard and the upgrade installer, called `stats()` for a memory count.
+
+A test-only per-thread counter on `assess` (`bridge::assess_probe`) lets the regression tests
+assert that no write path and no cache write runs the assessment.
+
 ### A `.hrm` stores its content id beside the file digest (#984)
 
 A single trailing blake3 was answering two questions: "did the content change" and "is this

@@ -1644,15 +1644,11 @@ impl KannakaMemorySystem {
     }
 
     /// ADR-0031: forget a precomputed eviction set and persist. Returns the
-    /// count actually forgotten. Each eviction is a normal forget (replayable
-    /// via ADR-0028 events).
+    /// count actually forgotten. Each eviction is a normal delete (replayable
+    /// via ADR-0028 events); the status cache is refreshed once for the batch
+    /// via `forget_many`, not once per eviction (#1061).
     pub fn triage_forget(&mut self, ids: &[Uuid]) -> Result<usize, SystemError> {
-        let mut n = 0;
-        for id in ids {
-            if self.forget(id)? {
-                n += 1;
-            }
-        }
+        let (n, _not_found) = self.forget_many(ids)?;
         if n > 0 {
             self.save()?;
         }
@@ -2226,12 +2222,13 @@ impl KannakaMemorySystem {
             Ok(t) => t,
             Err(_) => return,
         };
-        let stats = self.stats();
+        // Δ and κ only — `stats()` would re-run the assessment (#1061).
+        let (hemispheric_divergence, callosal_efficiency) = self.chiral_metrics();
         let payload = build_consciousness_payload(
             &agent_id,
             state,
-            stats.hemispheric_divergence,
-            stats.callosal_efficiency,
+            hemispheric_divergence,
+            callosal_efficiency,
         );
         if let Err(e) = transport.publish_consciousness(&payload) {
             eprintln!("[nats] Warning: failed to publish consciousness metrics: {e}");
@@ -2251,7 +2248,8 @@ impl KannakaMemorySystem {
     pub fn write_status_cache(&self, state: &ConsciousnessState) {
         let data_dir = &self.data_dir;
         let cache_path = data_dir.join("status-cache.json");
-        let stats = self.stats();
+        // Δ and κ only — `stats()` would run a second full assessment (#1061).
+        let (hemispheric_divergence, callosal_efficiency) = self.chiral_metrics();
         let now = chrono::Utc::now().to_rfc3339();
         let payload = serde_json::json!({
             "phi": state.phi,
@@ -2263,8 +2261,8 @@ impl KannakaMemorySystem {
             "consciousness_level": level_name(&state.consciousness_level),
             "irrationality": state.irrationality,
             "field_mode": "HRM",
-            "hemispheric_divergence": stats.hemispheric_divergence,
-            "callosal_efficiency": stats.callosal_efficiency,
+            "hemispheric_divergence": hemispheric_divergence,
+            "callosal_efficiency": callosal_efficiency,
             "total_skip_links": state.total_skip_links,
             // #730: both stamps move together here — this IS a fresh
             // assessment, so the counts and the consciousness metrics are of
@@ -2290,7 +2288,9 @@ impl KannakaMemorySystem {
     /// metrics, and never a stale count.
     pub fn refresh_status_cache_counts(&self) {
         let cache_path = self.data_dir.join("status-cache.json");
-        let stats = self.stats();
+        // #1061: `memory_counts`, NOT `stats()`. `stats()` runs `assess()`,
+        // an all-pairs O(n²) cluster scan, and this runs after every write.
+        let counts = self.memory_counts();
         let now = chrono::Utc::now().to_rfc3339();
 
         // Carry the previous assessment forward. A missing or unreadable cache
@@ -2303,8 +2303,8 @@ impl KannakaMemorySystem {
             .unwrap_or_else(|| serde_json::json!({}));
 
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("total_memories".into(), serde_json::json!(stats.total_memories));
-            obj.insert("active_memories".into(), serde_json::json!(stats.active_memories));
+            obj.insert("total_memories".into(), serde_json::json!(counts.total));
+            obj.insert("active_memories".into(), serde_json::json!(counts.active));
             obj.insert("counted_at".into(), serde_json::json!(now));
             // `field_mode` is a constant property of this build, not an
             // assessment — safe to state on a counts-only write.
@@ -2349,10 +2349,9 @@ impl KannakaMemorySystem {
 
     /// Delete a memory by ID.
     ///
-    /// ⚠ Refreshing the status cache means a full `stats()` — which runs
-    /// `bridge.assess()` over the WHOLE medium — plus a read, parse and write
-    /// of status-cache.json. That is the right price for one deletion and a
-    /// ruinous one in a loop. Deleting many? Use [`forget_many`].
+    /// Each successful delete refreshes the status cache: an O(n) count plus
+    /// a read, parse and write of status-cache.json (#1061). Cheap once,
+    /// wasteful in a loop. Deleting many? Use [`forget_many`].
     pub fn forget(&mut self, id: &Uuid) -> Result<bool, SystemError> {
         let removed = self.engine.delete(id)?;
         if removed {
@@ -2369,13 +2368,13 @@ impl KannakaMemorySystem {
     /// # Why this exists
     ///
     /// `forget` calls `refresh_status_cache_counts` on every successful
-    /// delete, and that call is not cheap: `stats()` runs a full
-    /// `bridge.assess()` over the entire medium — the eigendecomposition
-    /// behind phi and xi — then walks every memory for the geometry
-    /// histogram, then reads, parses and rewrites status-cache.json.
+    /// delete. Until #1061 that call ran `stats()` — a full O(n²)
+    /// `bridge.assess()` over the entire medium — then read, parsed and
+    /// rewrote status-cache.json. It is now an O(n) count plus the file
+    /// write, but repeating it per deletion is still wasted work.
     ///
-    /// Called once, that is correct and unnoticeable. Called in a loop it is
-    /// quadratic-or-worse in the number of deletions, and the cost lands
+    /// Historically: called once, that was correct and unnoticeable. In a loop it was
+    /// quadratic-or-worse in the number of deletions, and the cost landed
     /// exactly where deletions come in bulk. Measured on the witness node
     /// 2026-08-25: `prune-prefix` over 1,270 matches spent **~61 minutes of
     /// CPU** — about 2.9s per deletion — on a store whose actual removal work
@@ -2395,7 +2394,7 @@ impl KannakaMemorySystem {
             }
         }
         // Once — and only if something actually changed, so a no-op prune does
-        // not pay for an assessment either.
+        // not rewrite the cache either.
         if deleted > 0 {
             self.refresh_status_cache_counts();
         }
@@ -2916,10 +2915,35 @@ impl KannakaMemorySystem {
         Ok(cmfs)
     }
 
-    /// System statistics.
+    /// System statistics. Runs the full O(n²) assessment; a caller that only
+    /// needs counts wants [`Self::memory_counts`], and one that already holds
+    /// a fresh `ConsciousnessState` wants [`Self::stats_for`] (#1061).
     pub fn stats(&self) -> SystemStats {
         let state = self.bridge.assess(&self.engine);
-        
+        self.stats_for(&state)
+    }
+
+    /// `total_memories` / `active_memories` in one O(n) pass — the same
+    /// numbers `assess` reports, without its all-pairs cluster scan (#1061).
+    pub fn memory_counts(&self) -> crate::bridge::MemoryCounts {
+        crate::bridge::ConsciousnessBridge::memory_counts(&self.engine)
+    }
+
+    /// Hemispheric divergence (Δ) and callosal efficiency (κ): read from the
+    /// chiral store, no assessment. `(0.0, 0.0)` for a non-chiral store.
+    fn chiral_metrics(&self) -> (f32, f32) {
+        self.engine
+            .store
+            .as_any()
+            .downcast_ref::<crate::hrm_store::HrmStore>()
+            .and_then(|h| h.chiral_consciousness())
+            .map(|c| (c.hemispheric_divergence, c.callosal_efficiency))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// [`Self::stats`] built from a state the caller already computed, so a
+    /// path that just assessed does not pay for a second assessment.
+    pub fn stats_for(&self, state: &ConsciousnessState) -> SystemStats {
         // Calculate geometric statistics
         let all_memories = self.engine.store.all_memories().unwrap_or_default();
         let mut class_indices = std::collections::HashSet::new();
@@ -2934,6 +2958,7 @@ impl KannakaMemorySystem {
             }
         }
         
+        let (hemispheric_divergence, callosal_efficiency) = self.chiral_metrics();
         SystemStats {
             total_memories: state.total_memories,
             active_memories: state.active_memories,
@@ -2943,14 +2968,8 @@ impl KannakaMemorySystem {
             phi: state.phi,
             geometric_classes: class_indices.len(),
             triality_coverage,
-            hemispheric_divergence: self.engine.store.as_any()
-                .downcast_ref::<crate::hrm_store::HrmStore>()
-                .and_then(|h| h.chiral_consciousness())
-                .map(|c| c.hemispheric_divergence).unwrap_or(0.0),
-            callosal_efficiency: self.engine.store.as_any()
-                .downcast_ref::<crate::hrm_store::HrmStore>()
-                .and_then(|h| h.chiral_consciousness())
-                .map(|c| c.callosal_efficiency).unwrap_or(0.0),
+            hemispheric_divergence,
+            callosal_efficiency,
         }
     }
 }
@@ -3496,6 +3515,87 @@ mod tests {
         assert_eq!((deleted, not_found), (0, 1));
         assert_eq!(read_cache(&dir)["counted_at"], before["counted_at"],
             "a no-op prune must not rewrite the cache");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1061: every write path refreshes status-cache.json, and that refresh
+    /// was documented "counts only" while calling `stats()` → `assess()`, an
+    /// all-pairs O(n²) pass. On a 17.7k-memory store the process outlived
+    /// every timeout AFTER the write had landed. No write path may run the
+    /// assessment; the probe counts `assess` calls on this thread.
+    #[test]
+    fn write_paths_do_not_run_the_assessment() {
+        use crate::bridge::assess_probe;
+        let dir = temp_dir("no_assess_on_write");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let before = assess_probe::calls();
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(sys.remember(&format!("write path memory {i}")).unwrap());
+        }
+        sys.forget(&ids[0]).unwrap();
+        sys.forget_many(&ids[1..2]).unwrap();
+        sys.triage_forget(&ids[2..3]).unwrap();
+        sys.refresh_status_cache_counts();
+
+        assert_eq!(
+            assess_probe::calls() - before,
+            0,
+            "remember/forget/forget_many/triage_forget/refresh must not assess"
+        );
+        assert_eq!(read_cache(&dir)["total_memories"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The counts-only refresh must report exactly what `assess` would, active
+    /// filter included — they share one definition (#1061).
+    #[test]
+    fn counts_only_refresh_matches_the_assessment() {
+        let dir = temp_dir("counts_match_assess");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(sys.remember(&format!("counted memory {i}")).unwrap());
+        }
+        // One faded memory, so active < total and the filter is exercised.
+        sys.engine
+            .get_memory_mut(&ids[0])
+            .unwrap()
+            .unwrap()
+            .amplitude = 0.01;
+        sys.refresh_status_cache_counts();
+
+        let state = sys.assess();
+        let counts = sys.memory_counts();
+        assert_eq!(counts.total, state.total_memories);
+        assert_eq!(counts.active, state.active_memories);
+        assert!(
+            counts.active < counts.total,
+            "the faded memory must not count as active"
+        );
+        let cache = read_cache(&dir);
+        assert_eq!(cache["total_memories"], state.total_memories);
+        assert_eq!(cache["active_memories"], state.active_memories);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_status_cache` and `stats_for` take a state the caller just
+    /// computed; they must not compute a second one (#1061).
+    #[test]
+    fn writing_an_assessed_state_does_not_reassess() {
+        use crate::bridge::assess_probe;
+        let dir = temp_dir("no_reassess");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        sys.remember("one").unwrap();
+        sys.remember("two").unwrap();
+        let state = sys.assess();
+        let before = assess_probe::calls();
+        sys.write_status_cache(&state);
+        let stats = sys.stats_for(&state);
+        assert_eq!(assess_probe::calls() - before, 0);
+        assert_eq!(stats.total_memories, 2);
+        assert_eq!(read_cache(&dir)["total_memories"], 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

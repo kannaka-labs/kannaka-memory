@@ -4160,7 +4160,8 @@ pub fn detect_existing_install() -> ExistingInstallInfo {
     // Try to get memory count from existing HRM
     let hrm_memory_count = if hrm_exists {
         match crate::openclaw::KannakaMemorySystem::init(data_dir.clone()) {
-            Ok(sys) => sys.stats().total_memories,
+            // Count only — `stats()` would run the O(n²) assessment (#1061).
+            Ok(sys) => sys.memory_counts().total,
             Err(_) => 0,
         }
     } else {
