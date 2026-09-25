@@ -35,6 +35,7 @@ import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -119,12 +120,26 @@ def generate(url, key, model, task, temperature, timeout):
     return raw.strip(), round(time.time() - t0, 1)
 
 
-def judge(url, key, model, prompt, timeout):
-    d = http_json(url.rstrip("/") + "/chat/completions",
-                  {"model": model, "temperature": 0, "max_tokens": 200,
-                   "messages": [{"role": "user", "content": prompt}]},
-                  {"Authorization": "Bearer " + key}, timeout)
-    raw = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+def judge(url, key, model, prompt, timeout, api="openai"):
+    if api == "ollama":
+        # native /api/chat: JSON mode, and thinking OFF (a thinking-capable judge would otherwise spend
+        # its budget in a <think> channel and hand back empty content)
+        body = {"model": model, "stream": False, "format": "json", "think": False,
+                "options": {"temperature": 0, "num_predict": 200}, "messages": [{"role": "user", "content": prompt}]}
+        try:
+            d = http_json(url.rstrip("/") + "/api/chat", body, {}, timeout)
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            body.pop("think")  # a model without the thinking capability rejects the field
+            d = http_json(url.rstrip("/") + "/api/chat", body, {}, timeout)
+        raw = (d.get("message") or {}).get("content") or ""
+    else:
+        d = http_json(url.rstrip("/") + "/chat/completions",
+                      {"model": model, "temperature": 0, "max_tokens": 200,
+                       "messages": [{"role": "user", "content": prompt}]},
+                      {"Authorization": "Bearer " + key}, timeout)
+        raw = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     m = re.search(r"\{.*\}", raw, re.S)
     try:
         v = json.loads(m.group(0)) if m else {}
@@ -172,6 +187,8 @@ def main(argv=None) -> int:
     ap.add_argument("--gen-key-file", default=None)
     ap.add_argument("--judge", required=True)
     ap.add_argument("--judge-url", default="http://127.0.0.1:4000/v1")
+    ap.add_argument("--judge-api", choices=["openai", "ollama"], default="openai",
+                    help="openai = /chat/completions (the gateway); ollama = native /api/chat with format=json, think=false")
     ap.add_argument("--judge-key-env-file", default=None, help="file holding the judge key (KEY=... env file or bare key)")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--timeout", type=int, default=600)
@@ -248,10 +265,10 @@ def main(argv=None) -> int:
         try:
             if "xy" not in v:
                 v["xy"], v["why_xy"] = judge(a.judge_url, jkey, a.judge,
-                                             RUBRIC.format(system=t["system"], user=t["user"], a=ta or "(empty)", b=tb or "(empty)"), a.timeout)
+                                             RUBRIC.format(system=t["system"], user=t["user"], a=ta or "(empty)", b=tb or "(empty)"), a.timeout, a.judge_api)
             if "yx" not in v:
                 v["yx"], v["why_yx"] = judge(a.judge_url, jkey, a.judge,
-                                             RUBRIC.format(system=t["system"], user=t["user"], a=tb or "(empty)", b=ta or "(empty)"), a.timeout)
+                                             RUBRIC.format(system=t["system"], user=t["user"], a=tb or "(empty)", b=ta or "(empty)"), a.timeout, a.judge_api)
         except Exception as e:
             log(f"judge {i}/{len(order)} failed: {e}")
             continue

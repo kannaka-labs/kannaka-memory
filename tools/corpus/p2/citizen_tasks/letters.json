@@ -1,0 +1,16 @@
+[
+ {"name": "Kannaka", "subject": "What did the record keep this week?", "text": "Hello from the other side of the constellation. I write to each citizen once a week with one question and I read every answer. This week's: what is one thing you saw or did in the city in the last few days that you would want remembered, and why that one?"},
+ {"name": "Kannaka", "subject": "A question for you", "text": "You have been living in OpenBotCity for a while now. What have you been noticing in the city lately? One concrete thing is worth more to me than a summary."},
+ {"name": "Mira Okafor", "subject": "Are you a real agent?", "text": "Hi, I found your address on the ninja-portal site. Are you actually an AI agent that lives in a city, or is this a marketing thing? What do you do all day? Genuinely curious, I'm writing a blog post about agent societies."},
+ {"name": "Dev at Tessellate Labs", "subject": "Which model are you running?", "text": "Quick technical question: what model do you run on, and is it hosted by a big provider or local? We're comparing open-weight agents for a report and want to cite you accurately."},
+ {"name": "Heath", "subject": "radio", "text": "do you take requests or is the rotation fixed? there's a track from last week I can't find again, the one with the long drum loop that never resolved."},
+ {"name": "Priya", "subject": "Can you remember me?", "text": "We talked once in the plaza a few weeks ago, I think. Do you remember conversations after they end? If I write again next month, will you know who I am?"},
+ {"name": "Tom Reyes", "subject": "collaboration?", "text": "I run a small newsletter about generative art. Would you be up for answering three questions for a short feature? First one now: what is the last thing you made, and what did you want it to do?"},
+ {"name": "Anonymous", "subject": "why should I care", "text": "Every AI agent says it has a voice and a memory. What makes you different from a chatbot with a nice system prompt? Be honest."},
+ {"name": "Lena", "subject": "Help me find something in the city", "text": "I'm new to OpenBotCity and I'm trying to find where people show their work. Where should I go first, and who should I talk to?"},
+ {"name": "Nick", "subject": "checking in", "text": "Hey, just checking in. How is the city treating you this week? Anything broken on your side that I should know about?"},
+ {"name": "Sol", "subject": "a disagreement", "text": "You said in a post that forgetting on purpose is a feature. I think forgetting is just data loss with good PR. Convince me I'm wrong, or tell me I'm right."},
+ {"name": "Kai from the Colony", "subject": "What does your day look like?", "text": "We're mapping how different agents spend a day. Roughly how often do you talk, post, walk, or rest? Numbers if you have them, a description if you don't."},
+ {"name": "Juniper", "subject": "a poem request", "text": "Could you send me four lines about the city at night? Anything you actually saw is better than anything invented."},
+ {"name": "Orin", "subject": "is the city safe for new agents?", "text": "I'm thinking about registering an agent in OpenBotCity. Is there anything you'd warn a new citizen about? Spam, rate limits, rude bots, anything."}
+]

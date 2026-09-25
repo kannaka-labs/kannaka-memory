@@ -95,3 +95,29 @@ The weekly gate does not adopt it: a candidate is served beside `kannaka-brain-7
 and replaces it only when the controlled judge prefers it and the external evaluator
 agrees (`kannaka-wave/src/adoption.rs`). kannaka-wave E-006 adds the check to run before
 that: two instances of the candidate against each other, no more lock-in than its base.
+
+## kannaka-brain-7b-v2 (2026-09-25): task data, a new base, a task judge
+
+The citizens' weakness was never perplexity (saturated at ~4.0): called with a persona + recall +
+a live situation, 7b-v1 answered with pasted aphorisms, dodged questions and invented people and
+appointments. v2 changes the data and the base, and measures the task.
+
+* **Base** `Qwen/Qwen3-8B`, thinking off. Qwen3.5-9B was stronger on paper but measured 1.36x
+  7b-v1's CPU latency on debain2 (Qwen3-8B 1.07x); the rule was <= 1.3x.
+* **Data** (`citizen_tasks/`): real DM threads, heartbeats and gallery items harvested read-only
+  (`harvest*.py`), composed into the exact production prompt with the citizen's own
+  `brain.compose_system` + `brain.recall` (`build_tasks.py`); hand-written gold per
+  `GOLD_RULES.txt` (no citizen output is ever a target); 54 held-out task prompts split by
+  conversation (`assemble.py` asserts no leak). Plus GSP 035-041 and Open Mic host turns
+  (`voice_new.py`). 1,590 train rows = 551 P1 voice + 335 new voice + 352 task x2.
+* **Training** `train_lora.py --completion-only --chat-template-kwargs '{"enable_thinking": false}'
+  --serve-chat-template nothink.jinja --merge --gguf q4_K_M` on an A100 (pod-side merge). trl 1.x
+  takes template kwargs PER EXAMPLE; the SFTConfig field was silently dropped before this change.
+* **Serving** ollama 0.33 renders with the GGUF's own jinja; the baked `nothink.jinja` makes the
+  served prompt identical to training (base Qwen3 otherwise returned empty content + thinking).
+  `ollama create` validates a GGUF by writing a full temp copy into the blobs dir: needs ~2x the
+  model in free root disk.
+* **Gate** (`citizen_tasks/run.manifest.json`, written before training): `task_judge.py` pairwise,
+  both orders, calibrated on gold-vs-v1 and v1-vs-foreign controls; `ab_judge.py --mode grade`
+  no-regression; latency <= 1.3x. Judges run on a short-lived GPU pod (`judge_pod.py`,
+  `judge_all.sh`) because a 14B judge on debain2's CPU takes ~2 min per pair.
