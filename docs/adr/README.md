@@ -90,3 +90,5 @@ unused.
 | [0060](ADR-0060-per-agent-email-identity.md) | One address per agent: email as the root of agent identity | Accepted | 2026-09-13 |
 | [0061](ADR-0061-declared-faculties.md) | Declared faculties — agents are a cast, not a fleet: named capabilities, operator-declared and defaulting off, so the roster can say what each agent alone can do | Proposed | 2026-09-14 |
 | [0062](ADR-0062-mail-membrane.md) | The mail membrane — the constellation receives its own mail, relays what it sends, and is never a relay for anyone else | Proposed | 2026-09-15 |
+| [0063](ADR-0063-referential-memory.md) | Referential memory — a fact that has an authority must not be held as a wave | Proposed | 2026-09-15 |
+| [0064](ADR-0064-native-mail.md) | Native mail — the mailbox is the record, memory holds the meaning | Proposed | 2026-09-25 |
