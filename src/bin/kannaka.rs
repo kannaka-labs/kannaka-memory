@@ -95,6 +95,15 @@ use handlers_nostr::handle_nostr;
 // ledger (`kannaka reputation show|list|hard-reject`). The seed/vouch/revoke
 // *write* verbs live under `kannaka identity` (handlers_identity) since they
 // manage the node's cryptographic swarm identity + trust root.
+// ADR-0064 P0 — native mail, read-only (`kannaka mail accounts|sync|status|
+// thread|close`). The mailbox is the record; the only local state is the
+// <data_dir>/mail/ sidecar. Never loads the HRM.
+#[cfg(feature = "mail")]
+#[path = "handlers/mail.rs"]
+mod handlers_mail;
+#[cfg(feature = "mail")]
+use handlers_mail::handle_mail;
+
 #[path = "handlers/reputation.rs"]
 mod handlers_reputation;
 use handlers_reputation::handle_reputation;
@@ -1196,6 +1205,8 @@ fn is_builtin_subcommand(verb: &str) -> bool {
         | "swarm" | "events" | "substrate" | "attention" | "inbox"
         // identity (SpaceChild SSO + inc-1 crypto identity / trust root)
         | "identity"
+        // ADR-0064 native mail (read-only P0)
+        | "mail"
         // KAX Compute District (signed wakes/grants, roster, events)
         | "compute"
         // inc-1 corroboration trust model — reputation-ledger inspection
@@ -1649,6 +1660,19 @@ fn main() {
         // still honors config.toml.
         let cfg = KannakaConfig::load();
         handle_swarm_tail(&cfg, &args[command_start..]);
+        return;
+    }
+
+    // ADR-0064 P0: `kannaka mail` touches only the mail servers (read-only)
+    // and the <data_dir>/mail/ sidecar — never the HRM, never config.toml.
+    if args[command_start] == "mail" {
+        #[cfg(feature = "mail")]
+        handle_mail(&data_dir(), &args[command_start..]);
+        #[cfg(not(feature = "mail"))]
+        {
+            eprintln!("kannaka mail requires the `mail` feature");
+            process::exit(1);
+        }
         return;
     }
 

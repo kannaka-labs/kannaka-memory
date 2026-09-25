@@ -49,6 +49,10 @@ pub mod nats;
 #[cfg(feature = "nostr")]
 pub mod nostr;
 
+// ADR-0064 P0: native mail, read-only (MailRefs sidecar + open-loop rules).
+#[cfg(feature = "mail")]
+pub mod mail;
+
 pub mod collective;
 pub mod sensemaking;
 pub mod immune;

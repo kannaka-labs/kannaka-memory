@@ -988,6 +988,7 @@ dependencies = [
  "rayon",
  "rubato",
  "rustfft",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -998,6 +999,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "uuid",
+ "webpki-roots 0.26.11",
  "which",
 ]
 

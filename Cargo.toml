@@ -64,6 +64,12 @@ chacha20 = { version = "0.9", optional = true }
 base64 = { version = "0.22", optional = true }
 # rusqlite removed — sqlite-migrate paradigm deleted
 ureq = { version = "2", features = ["json"] }
+# ADR-0064 native mail (P0, read-only): IMAP over TLS needs a raw TLS stream,
+# so rustls + webpki-roots are named directly -- both are ALREADY in the tree
+# through ureq (same versions, same `ring` provider), so this adds no crates.
+# JMAP rides on ureq. Gated behind the `mail` feature.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 toml = "0.8"
 # ratatui + crossterm removed in v0.5.13 — the TUI was peeled out to
 # its own repo kannaka-labs/kannaka-tui. The new crate is the canonical
@@ -101,8 +107,11 @@ flate2 = "1"
 # glyph is now default: the SGA glyph path (fano_line_of, classify, glyph-
 # gravity recall) is load-bearing for attention-as-gravity. Keeping it in
 # default means every build — including the autoresearch cron — ships it.
-default = ["hrm", "nats", "glyph", "video", "nostr"]
+default = ["hrm", "nats", "glyph", "video", "nostr", "mail"]
 nats = []
+# ADR-0064 P0: `kannaka mail` (accounts/sync/status/thread/close), read-only.
+# In default so the CI build covers it; adds no crates (see rustls above).
+mail = ["rustls", "webpki-roots", "base64"]
 # ADR-0043: NIP-01 sign/verify + nsec/npub encoding for the Nostr membrane.
 nostr = ["k256", "bech32", "hmac", "chacha20", "base64"]
 # ADR-0043 Phase 1: the kannaka-nostr-bridge daemon (relay ws + NATS routing).

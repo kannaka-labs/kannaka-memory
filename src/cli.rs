@@ -446,6 +446,29 @@ EXAMPLE:
                 )
                 .arg(Arg::new("args").trailing_var_arg(true).allow_hyphen_values(true).num_args(0..)),
         )
+        // ── Mail (ADR-0064 P0, read-only) ─────────────────────────────
+        .subcommand(
+            Command::new("mail")
+                .about("Native mail, read-only (ADR-0064 P0): accounts, sync, status, thread, close")
+                .long_about(
+                    "kannaka mail — the mailbox is the record; kannaka holds references into it.
+
+                     accounts [--json]                         the agent's addresses (never credentials)
+                       sync [--days N] [--account NAME]          pull headers + flags (default 30 days) from each
+                                                                 account's authority (IMAP / JMAP) into
+                                                                 <data_dir>/mail/refs.jsonl — no bodies
+                       status [--account NAME] [--all] [--json]  open loops per thread: needs_reply,
+                                                                 waiting_on_them, done, ignored (+ age)
+                       thread <ref> [--bodies]                   a thread fetched live from the server by reference
+                       close <ref> --note \"...\"                  record that an open loop was resolved elsewhere
+
+                     <ref>: a thread id (t:3fa9c1d2e0 or a 4+ hex prefix), an anchor (zoho:INBOX:49),
+                     or a Message-ID. Accounts: <data_dir>/mail/accounts.toml, else discovered from
+                     ~/.kannaka-mail*.env. Strictly read-only: IMAP EXAMINE + BODY.PEEK, JMAP get/query;
+                     nothing is ever flagged, moved, sent or deleted.",
+                )
+                .arg(Arg::new("args").trailing_var_arg(true).allow_hyphen_values(true).num_args(0..)),
+        )
         // ── Identity (SpaceChild SSO) ──────────────────────────────────
         // Step 1 of cryptographic swarm-agent identity: register/login
         // against spacechild-auth, tokens stored in <data_dir>/identity.json.
