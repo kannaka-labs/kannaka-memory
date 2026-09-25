@@ -164,7 +164,8 @@ V1_MAN = {"base": "Qwen/Qwen2.5-7B-Instruct", "params_b": 7.62, "train": 551, "h
 COMPOSITION = {"parts": [{"rows": 886, "what": "Voice lines she wrote.", "targets": "her own writing"},
                          {"rows": 704, "what": "City task prompts, each used twice.",
                           "targets": "written for this training by Claude-based subagents"}],
-               "holdout": "111 held-out rows (57 voice lines + 54 task prompts)"}
+               "holdout": "111 held-out rows (57 voice lines + 54 task prompts)",
+               "provenance": "Voice rows from export_corpus.py; task rows from citizen_tasks/assemble.py."}
 
 
 def test_publish_refuses_to_guess_the_corpus():
@@ -190,6 +191,17 @@ def test_publish_renders_composition_and_eval():
             assert "57 voice lines + 54 task prompts" in card
         assert "Claude-based subagents" in lo and "1,590 training rows" in lo
         assert "1590 examples** of her own writing" not in lo
+        assert "citizen_tasks/assemble.py" in lo and "identity docs she\nwrote" not in lo
+
+
+def test_publish_composition_needs_provenance():
+    with tempfile.TemporaryDirectory() as td:
+        run = _run(td, V2_MAN)
+        comp = {k: v for k, v in COMPOSITION.items() if k != "provenance"}
+        (run / "comp.json").write_text(json.dumps(comp))
+        (run / "served.Modelfile").write_text(SERVED_MF)
+        assert ph.main(["--run", str(run), "--version", "7b-v2", "--stage-only", "--composition", str(run / "comp.json"),
+                        "--modelfile", str(run / "served.Modelfile")]) == 2
 
 
 def test_publish_composition_must_add_up():

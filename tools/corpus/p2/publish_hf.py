@@ -25,7 +25,8 @@ targets written by Claude-based subagents, and its Modelfile could not reproduce
 the served template. So:
 
   --composition FILE  JSON {"parts": [{"rows": N, "what": "...", "targets": "..."}],
-                      "holdout": "57 voice lines + 54 task prompts"}, rendered on
+                      "holdout": "57 voice lines + 54 task prompts",
+                      "provenance": "how the rows were built"}, rendered on
                       the card as the corpus. Without it the card may only use the
                       historical wording if you assert --voice-only (every training
                       row's target is her own writing); otherwise it refuses.
@@ -106,9 +107,7 @@ For ollama, use the GGUF repo: `{ns}/kannaka-brain-{version}-GGUF`.
 
 ## Provenance
 
-Corpus built by `kannaka-memory/tools/corpus/export_corpus.py` from sources
-whose authorship is known by construction (scripts, lyrics, identity docs she
-wrote). Inbound text (DMs, feed posts, swarm messages) is context at most,
+{provenance} Inbound text (DMs, feed posts, swarm messages) is context at most,
 never a target — the rule is enforced in code and pinned by tests. The corpus
 itself is not released. Design: ADR-0057 in {adr}.
 
@@ -156,6 +155,10 @@ SYSTEM """{system}"""
 '''
 
 
+VOICE_ONLY_PROVENANCE = ("Corpus built by `kannaka-memory/tools/corpus/export_corpus.py` from sources\n"
+                         "whose authorship is known by construction (scripts, lyrics, identity docs she\n"
+                         "wrote).")
+
 VOICE_ONLY_CORPUS = ("**{n_train} examples** of her own writing — Ghost Signals lines paired with\n"
                      "the preceding Flaukowski line, album lyrics, identity documents. Nothing that\n"
                      "arrived over a wire was ever a training target (see *Provenance*).")
@@ -177,6 +180,9 @@ def corpus_text(n_train: int, composition: dict | None, voice_only: bool) -> tup
         lines = [f"**{int(n_train):,} training rows**:", ""]
         for p in parts:
             lines.append(f"- **{int(p['rows']):,} rows:** {p['what']} Targets: {p['targets']}.")
+        if not (composition.get("provenance") or "").strip():
+            raise CardRefused("--composition needs a \"provenance\" sentence: how the rows were built. The default "
+                              "(export_corpus.py, her own writing) is only true of a voice-only corpus")
         lines += ["", "Inbound text (DMs, posts, chat) is context at most, never a target (see *Provenance*)."]
         return "\n".join(lines), composition.get("holdout")
     if voice_only:
@@ -231,6 +237,7 @@ def card_fields(man: dict, *, ns: str, version: str, n_albums: int, gguf_name: s
         targets=", ".join(targets), ppl_before=ppl["before"], ppl_after=ppl["after"],
         quant=quant, gguf_gb=gguf_gb, gguf_name=gguf_name, system=SYSTEM, adr=ADR, template_note=template_note,
         corpus=corpus, holdout_desc=holdout or f"{man['holdout']} fixed Kannaka lines",
+        provenance=((composition or {}).get("provenance") or "").strip() or VOICE_ONLY_PROVENANCE,
         eval=("\n## Evaluation\n\n" + eval_md.strip() + "\n") if eval_md.strip() else "",
         modelfile_desc=modelfile_desc,
     )
