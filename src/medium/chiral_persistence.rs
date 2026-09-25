@@ -317,50 +317,49 @@ pub(crate) fn verify_blake3_trailing<P: AsRef<Path>>(path: P) -> Result<(), Medi
 /// `timestamp_millis`(8) — so one window covers both.
 const HRM_TIMESTAMP_RANGE: std::ops::Range<u64> = 8..16;
 
-/// A digest of what a .hrm file MEANS, ignoring when it was written.
+/// Marks a v2 file that stores its `content_id` (#984). Sits between the
+/// content_id and the trailing file digest:
 ///
-/// `blake3` over the whole file answers "are these the same bytes", which is
-/// not the question an operator asks. Every save stamps `Utc::now()` into the
-/// header and the trailing checksum covers it, so two saves of identical
-/// content a millisecond apart differ — same length, different checksum,
-/// identical meaning. #952 fixed the other half of this (HashMaps serialized
-/// in iteration order) and noted that sorting alone does not make saves
-/// byte-identical; this is that remainder.
+/// ```text
+/// [v2 body][content_id: 32][CONTENT_ID_TAG: 8][file digest: 32]
+/// ```
 ///
-/// Skips the timestamp window and the trailing 32-byte checksum (which is a
-/// function of both). Two saves of an unchanged medium produce the same
-/// digest; any change to hemispheres, callosum or scales changes it.
-///
-/// This does NOT make the FILES byte-identical, and deliberately so: the
-/// save timestamp is real information. It makes the QUESTION answerable
-/// without destroying it.
-pub fn content_digest<P: AsRef<Path>>(path: P) -> Result<String, MediumError> {
-    let path = path.as_ref();
-    let size = std::fs::metadata(path)?.len();
-    let end = HRM_TIMESTAMP_RANGE.end;
-    if size < 32 + end {
-        // Too small to hold a header and a checksum. Digest what is there
-        // rather than inventing a window past the end of the file.
-        let bytes = std::fs::read(path)?;
-        return Ok(blake3::hash(&bytes).to_hex().to_string());
-    }
-    let body_len = size - 32;
-    let mut f = File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
+/// The file digest is still `blake3(everything before it)` — the rule every
+/// reader already checks — so it now seals the content_id and the tag as well
+/// as the save timestamp. Readers built before #984 verify that digest, parse
+/// the v2 sections and stop, never looking at the 40 bytes in between; so the
+/// trailer is invisible to them and a new file still loads on an old binary.
+/// A pre-#984 file has no tag, and `content_digest` computes what the tag
+/// would have held.
+const CONTENT_ID_TAG: [u8; 8] = *b"HRMCID01";
+/// content_id (32) + tag (8).
+const CONTENT_ID_TRAILER_LEN: u64 = 32 + CONTENT_ID_TAG.len() as u64;
+/// The trailing blake3 file digest every .hrm ends with.
+const FILE_DIGEST_LEN: u64 = 32;
+
+/// Feed `r`'s next `len` bytes — which start at file offset 0 — to `hasher`,
+/// skipping the header timestamp window.
+fn hash_skipping_timestamp<R: Read>(
+    r: &mut R,
+    len: u64,
+    hasher: &mut blake3::Hasher,
+) -> std::io::Result<()> {
+    let ts = HRM_TIMESTAMP_RANGE;
     let mut buf = [0u8; 65536];
     let mut pos = 0u64;
-    while pos < body_len {
-        let want = (body_len - pos).min(buf.len() as u64) as usize;
-        let n = std::io::Read::read(&mut f, &mut buf[..want])?;
-        if n == 0 { break; }
-        // Feed only the bytes outside the timestamp window. The window is
-        // 8 bytes at a fixed offset, so it falls inside the first chunk in
-        // practice — but slicing per chunk keeps this correct for any
-        // buffer size rather than relying on that.
+    while pos < len {
+        let want = (len - pos).min(buf.len() as u64) as usize;
+        let n = r.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        // The window is 8 bytes at a fixed offset, so it falls inside the
+        // first chunk in practice — but slicing per chunk keeps this correct
+        // for any buffer size rather than relying on that.
         let chunk_start = pos;
         let chunk_end = pos + n as u64;
-        let skip_start = HRM_TIMESTAMP_RANGE.start.max(chunk_start);
-        let skip_end = end.min(chunk_end);
+        let skip_start = ts.start.max(chunk_start);
+        let skip_end = ts.end.min(chunk_end);
         if skip_start >= skip_end {
             hasher.update(&buf[..n]);
         } else {
@@ -371,6 +370,111 @@ pub fn content_digest<P: AsRef<Path>>(path: P) -> Result<String, MediumError> {
         }
         pos = chunk_end;
     }
+    Ok(())
+}
+
+/// The `content_id` a v2 file stores, as hex — `None` when it predates #984
+/// (or is v1) and carries none. Reads 72 bytes; does not verify the file
+/// digest, which `ChiralMedium::load` does.
+pub fn stored_content_id<P: AsRef<Path>>(path: P) -> Result<Option<String>, MediumError> {
+    let path = path.as_ref();
+    let size = std::fs::metadata(path)?.len();
+    if size < HRM_TIMESTAMP_RANGE.end + CONTENT_ID_TRAILER_LEN + FILE_DIGEST_LEN {
+        return Ok(None);
+    }
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    if magic != HRM_MAGIC_V2 {
+        return Ok(None);
+    }
+    use std::io::{Seek, SeekFrom};
+    f.seek(SeekFrom::Start(
+        size - FILE_DIGEST_LEN - CONTENT_ID_TRAILER_LEN,
+    ))?;
+    let mut trailer = [0u8; CONTENT_ID_TRAILER_LEN as usize];
+    f.read_exact(&mut trailer)?;
+    if trailer[32..] != CONTENT_ID_TAG {
+        return Ok(None);
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&trailer[..32]);
+    Ok(Some(blake3::Hash::from(id).to_hex().to_string()))
+}
+
+/// Where a flat v1 file's content ends: after the metadata section, before
+/// the consciousness block. `None` if the header does not describe a layout
+/// that fits in `body_len` bytes.
+fn v1_content_end(path: &Path, body_len: u64) -> Result<Option<u64>, MediumError> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = File::open(path)?;
+    let mut hdr = [0u8; 24];
+    if body_len < 24 {
+        return Ok(None);
+    }
+    f.read_exact(&mut hdr)?;
+    let n = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as u64;
+    let d = u32::from_le_bytes(hdr[20..24].try_into().unwrap()) as u64;
+    // wavefronts (n*d f32) + energy/frequency/phase (3n f32) + timestamps (n i64)
+    let meta_len_at = n
+        .checked_mul(d)
+        .and_then(|nd| nd.checked_mul(4))
+        .and_then(|w| w.checked_add(n.checked_mul(3 * 4 + 8)?))
+        .and_then(|x| x.checked_add(24));
+    let Some(meta_len_at) = meta_len_at else {
+        return Ok(None);
+    };
+    if meta_len_at + 4 > body_len {
+        return Ok(None);
+    }
+    f.seek(SeekFrom::Start(meta_len_at))?;
+    let mut len_bytes = [0u8; 4];
+    f.read_exact(&mut len_bytes)?;
+    let end = meta_len_at + 4 + u32::from_le_bytes(len_bytes) as u64;
+    Ok((end <= body_len).then_some(end))
+}
+
+/// A digest of what a .hrm file MEANS, ignoring when it was written.
+///
+/// `blake3` over the whole file answers "are these the same bytes", which is
+/// not the question an operator asks: every save stamps `Utc::now()` into the
+/// header, and the trailing digest seals it, so two saves of identical content
+/// a millisecond apart differ. This answers "did the content change" instead.
+///
+/// - **v2 since #984** stores it (see `CONTENT_ID_TAG`); this returns the
+///   stored value without re-hashing the file.
+/// - **v2 before #984**: computed — blake3 over the file minus the timestamp
+///   window and the trailing digest. That is the exact definition a new save
+///   stores, so re-saving an old store under a new build keeps its identity.
+/// - **v1 (flat)**: computed over magic, version and everything up to the end
+///   of the metadata section. The consciousness block after it is derived
+///   (phi/xi/order recomputed at every save) and carries a second wall clock,
+///   `computed_at`, so it is not content.
+///
+/// Deliberately not "make the files byte-identical": the save timestamp is
+/// real information and stays in the file, authenticated.
+pub fn content_digest<P: AsRef<Path>>(path: P) -> Result<String, MediumError> {
+    let path = path.as_ref();
+    if let Some(stored) = stored_content_id(path)? {
+        return Ok(stored);
+    }
+    let size = std::fs::metadata(path)?.len();
+    if size < FILE_DIGEST_LEN + HRM_TIMESTAMP_RANGE.end {
+        // Too small to hold a header and a checksum. Digest what is there
+        // rather than inventing a window past the end of the file.
+        let bytes = std::fs::read(path)?;
+        return Ok(blake3::hash(&bytes).to_hex().to_string());
+    }
+    let body_len = size - FILE_DIGEST_LEN;
+    let mut magic = [0u8; 4];
+    File::open(path)?.read_exact(&mut magic)?;
+    let content_end = if magic == HRM_MAGIC {
+        v1_content_end(path, body_len)?.unwrap_or(body_len)
+    } else {
+        body_len
+    };
+    let mut hasher = blake3::Hasher::new();
+    hash_skipping_timestamp(&mut File::open(path)?, content_end, &mut hasher)?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -444,17 +548,42 @@ impl ChiralMedium {
         w.write_all(&(lr_bytes.len() as u32).to_le_bytes())?;
         w.write_all(&lr_bytes)?;
 
-        // Flush and compute checksum
         w.flush()?;
         drop(w);
 
-        let mut file = File::open(&tmp_path)?;
-        let mut hasher = blake3::Hasher::new();
-        std::io::copy(&mut file, &mut hasher)?;
-        let checksum = hasher.finalize();
-        drop(file);
+        // Two hashes, one pass (#984). `content_id` skips the header
+        // timestamp, so two saves of the same content store the same one; the
+        // file digest covers every byte before it — timestamp, content_id and
+        // tag included — so the save time stays authenticated.
+        let body_len = std::fs::metadata(&tmp_path)?.len();
+        let mut content = blake3::Hasher::new();
+        let mut whole = blake3::Hasher::new();
+        {
+            struct Tee<'a, R: Read> {
+                inner: R,
+                whole: &'a mut blake3::Hasher,
+            }
+            impl<R: Read> Read for Tee<'_, R> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    let n = self.inner.read(buf)?;
+                    self.whole.update(&buf[..n]);
+                    Ok(n)
+                }
+            }
+            let mut tee = Tee {
+                inner: File::open(&tmp_path)?,
+                whole: &mut whole,
+            };
+            hash_skipping_timestamp(&mut tee, body_len, &mut content)?;
+        }
+        let content_id = content.finalize();
+        whole.update(content_id.as_bytes());
+        whole.update(&CONTENT_ID_TAG);
+        let checksum = whole.finalize();
 
         let mut file = std::fs::OpenOptions::new().append(true).open(&tmp_path)?;
+        file.write_all(content_id.as_bytes())?;
+        file.write_all(&CONTENT_ID_TAG)?;
         file.write_all(checksum.as_bytes())?;
         file.flush()?;
         file.sync_all()?;
@@ -1284,6 +1413,186 @@ mod tests {
 
         let _ = std::fs::remove_file(&first);
         let _ = std::fs::remove_file(&second);
+    }
+
+    // ─── #984: the save timestamp and the content get separate hashes ───────
+    //
+    // One trailing blake3 was asked to answer two questions — "did the content
+    // change" and "is this file intact, save-time included" — and could only
+    // answer the second, because the header timestamp legitimately differs
+    // between two saves of the same content. The fix splits them: a stored
+    // `content_id` (timestamp excluded) sits in front of the unchanged trailing
+    // file digest (timestamp included). These tests pin the on-disk layout:
+    //
+    //   [body][content_id: 32][b"HRMCID01": 8][file digest: 32]
+
+    /// Tag bytes, spelled out here rather than imported so a silent change to
+    /// the production constant cannot drag the test along with it.
+    const TAG: &[u8; 8] = b"HRMCID01";
+
+    /// (stored content_id, file bytes) — panics if the file carries none.
+    fn stored_id(path: &PathBuf) -> ([u8; 32], Vec<u8>) {
+        let raw = std::fs::read(path).unwrap();
+        let n = raw.len();
+        assert!(n > 16 + 72, "file too short to carry a content_id trailer");
+        assert_eq!(
+            &raw[n - 40..n - 32],
+            TAG,
+            "no content_id trailer in front of the file digest (#984)"
+        );
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&raw[n - 72..n - 40]);
+        (id, raw)
+    }
+
+    /// The headline: two saves of the same content (one straight, one after a
+    /// load, i.e. fresh HashMaps) carry the SAME stored content_id, and that
+    /// id is exactly what `content_digest` reports. The files still differ —
+    /// only in the 8 timestamp bytes and the 32-byte file digest, nowhere else.
+    #[test]
+    fn saves_of_unchanged_content_store_the_same_content_id() {
+        let pipeline = test_pipeline();
+        let mut cm = ChiralMedium::new();
+        for i in 0..16 {
+            cm.store(&format!("content id subject {i}"), 0.5, &pipeline)
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.hrm");
+        let b = dir.path().join("b.hrm");
+        let c = dir.path().join("c.hrm");
+        cm.save(&a).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ChiralMedium::load(&a).unwrap().save(&b).unwrap();
+
+        let (id_a, raw_a) = stored_id(&a);
+        let (id_b, raw_b) = stored_id(&b);
+        assert_eq!(id_a, id_b, "same content, different stored content_id");
+        assert_eq!(
+            content_digest(&a).unwrap(),
+            blake3::Hash::from(id_a).to_hex().to_string(),
+            "content_digest must report the stored content_id"
+        );
+
+        // Byte-comparable everywhere except the two fields that are MEANT to
+        // move: the save time and the digest that seals it.
+        let n = raw_a.len();
+        assert_eq!(n, raw_b.len());
+        assert_ne!(
+            raw_a[8..16],
+            raw_b[8..16],
+            "fixture: the saves must be a different millisecond"
+        );
+        assert_eq!(raw_a[..8], raw_b[..8]);
+        assert_eq!(raw_a[16..n - 32], raw_b[16..n - 32]);
+
+        // A real change moves it.
+        cm.store(
+            "one more memory, so the content genuinely differs",
+            0.5,
+            &pipeline,
+        )
+        .unwrap();
+        cm.save(&c).unwrap();
+        assert_ne!(
+            stored_id(&c).0,
+            id_a,
+            "a real change must move the content_id"
+        );
+    }
+
+    /// The trailing digest still authenticates the save time: splitting the
+    /// hashes must not turn the timestamp into unsigned metadata (the rollback
+    /// hole the issue thread named).
+    #[test]
+    fn the_file_digest_still_covers_the_save_timestamp() {
+        let pipeline = test_pipeline();
+        let mut cm = ChiralMedium::new();
+        cm.store("a memory whose save time must stay sealed", 0.5, &pipeline)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.hrm");
+        cm.save(&path).unwrap();
+        stored_id(&path); // the new layout, or this test proves nothing
+
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[8] ^= 0x01; // nudge the header timestamp
+        std::fs::write(&path, &raw).unwrap();
+        assert!(
+            matches!(
+                ChiralMedium::load(&path),
+                Err(MediumError::ChecksumMismatch)
+            ),
+            "an edited save timestamp must fail the file digest"
+        );
+    }
+
+    /// Backward compatibility: a v2 file written before #984 (no trailer, one
+    /// 32-byte digest) still loads, and its computed content digest equals the
+    /// content_id a new save of the same content stores — so a store's
+    /// identity does not change just because it was re-saved by a newer build.
+    #[test]
+    fn pre_984_files_load_and_digest_to_the_same_content_id() {
+        let pipeline = test_pipeline();
+        let mut cm = ChiralMedium::new();
+        for i in 0..8 {
+            cm.store(&format!("legacy layout subject {i}"), 0.5, &pipeline)
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = dir.path().join("new.hrm");
+        let old_path = dir.path().join("old.hrm");
+        cm.save(&new_path).unwrap();
+        let (id, raw) = stored_id(&new_path);
+
+        // Rebuild exactly what the pre-#984 writer produced: the body, then
+        // blake3 of the body.
+        let n = raw.len();
+        let body = &raw[..n - 72];
+        let mut legacy = body.to_vec();
+        legacy.extend_from_slice(blake3::hash(body).as_bytes());
+        std::fs::write(&old_path, &legacy).unwrap();
+
+        let loaded = ChiralMedium::load(&old_path).expect("a pre-#984 v2 file must still load");
+        assert_eq!(loaded.right.count(), cm.right.count());
+        assert_eq!(loaded.left.count(), cm.left.count());
+        assert_eq!(
+            content_digest(&old_path).unwrap(),
+            blake3::Hash::from(id).to_hex().to_string(),
+            "legacy and new files of the same content must share one content digest"
+        );
+    }
+
+    /// The flat v1 format carries a second clock: `compute_consciousness()`
+    /// stamps `computed_at: Utc::now()` into the consciousness block, AFTER
+    /// the header. `content_digest` skipped only the header window, so two
+    /// v1 saves of unchanged content still digested differently.
+    #[test]
+    fn content_digest_of_a_flat_v1_file_ignores_the_consciousness_clock() {
+        let pipeline = test_pipeline();
+        let mut m = Medium::new();
+        for i in 0..4 {
+            m.store(&format!("flat subject {i}"), 0.5, &pipeline)
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.hrm");
+        let b = dir.path().join("b.hrm");
+        let c = dir.path().join("c.hrm");
+        m.save(&a).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        m.save(&b).unwrap();
+        assert_eq!(
+            content_digest(&a).unwrap(),
+            content_digest(&b).unwrap(),
+            "two v1 saves of unchanged content digest differently (#984)"
+        );
+        m.store("a genuinely new flat memory", 0.5, &pipeline)
+            .unwrap();
+        m.save(&c).unwrap();
+        assert_ne!(content_digest(&a).unwrap(), content_digest(&c).unwrap());
+        // And the v1 layout is untouched: older binaries still read it.
+        Medium::load(&a).expect("v1 file must still load");
     }
 
     fn test_pipeline() -> EncodingPipeline {

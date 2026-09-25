@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### A `.hrm` stores its content id beside the file digest (#984)
+
+A single trailing blake3 was answering two questions: "did the content change" and "is this
+file intact, including its save time". It could only answer the second, because every save
+stamps `Utc::now()` into the header. v2 saves now write a trailer
+`[content_id: 32][b"HRMCID01": 8]` in front of the unchanged trailing digest. `content_id` is
+blake3 over the file with the header timestamp excluded, so two saves of the same content store
+the same id. The file digest still covers every byte before it, including the timestamp, so a
+backdated or forward-dated header still fails `load` with a checksum mismatch.
+
+No version bump, and nothing breaks in either direction. Older binaries verify the same trailing
+digest, parse the v2 sections and never read the 40 bytes in between. Pre-#984 files still load,
+and `content_digest` computes the value the trailer would have held. A store therefore keeps its
+content id when a newer build re-saves it. New: `stored_content_id(path)`, which reads 72 bytes.
+
+`content_digest` on a flat v1 file also covered a second wall clock: the consciousness block's
+`computed_at: Utc::now()`, written after the header. Two v1 saves of unchanged content therefore
+digested differently. The digest now stops at the end of the metadata section. The v1 layout is
+unchanged, because older v1 readers take the 32 bytes after that block as the checksum.
+
 ### Recall carries the chiral intuition flag instead of hardcoding `false` (#1005)
 
 `medium::chiral::recall` marks a right-hemisphere hit with no left-hemisphere partner as an
