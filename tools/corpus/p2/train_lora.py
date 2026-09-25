@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from base_info import LORA_TARGET_REGEX, lora_targets  # noqa: E402
+from base_info import LORA_TARGET_REGEX, count_params, lora_targets  # noqa: E402
 
 
 def log(msg):
@@ -118,7 +118,7 @@ def main(argv=None) -> int:
     if a.qlora:
         from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model)
-    params_b = sum(p.numel() for p in model.parameters()) / 1e9
+    params_b = count_params(model.parameters()) / 1e9   # 4-bit weights counted unpacked
     if a.target_modules and "," in a.target_modules:
         targets = [t.strip() for t in a.target_modules.split(",") if t.strip()]
     else:

@@ -32,13 +32,45 @@ def lora_targets(module_names) -> list[str]:
     return [n for n in module_names if rx.match(n)]
 
 
+def _id_size(base: str) -> float | None:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])", base)
+    return float(m.group(1)) if m else None
+
+
 def size_label(base: str, params_b: float | None = None) -> str:
     """'7B', '14B', '27B' — from the measured parameter count when the manifest has one,
-    else from the base id. The card must never say 14B because the template did."""
-    if params_b:
+    else from the base id. The card must never say 14B because the template did.
+
+    A measured count that disagrees with the size in the base id by more than 25% is not
+    trusted: it is almost always a QLoRA manifest that summed `numel()` over 4-bit weights,
+    which bitsandbytes stores two to a byte (kannaka-brain-7b-v2: Qwen3-8B measured 4.72B,
+    and the card said "(5B)"). The id's number wins in that case."""
+    from_id = _id_size(base)
+    if params_b and (from_id is None or abs(params_b - from_id) <= 0.25 * from_id):
         return f"{round(params_b):d}B"
-    m = re.search(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])", base)
-    return f"{m.group(1)}B" if m else "?B"
+    if from_id is not None:
+        return f"{from_id:g}B"
+    return f"{round(params_b):d}B" if params_b else "?B"
+
+
+def count_params(params) -> int:
+    """Parameter count that sees through 4-bit packing.
+
+    bitsandbytes `Params4bit` stores two weights per element, so `p.numel()` reports about
+    half the real count; its `quant_state.shape` is the unpacked shape. Duck-typed so this
+    module stays importable without torch."""
+    total = 0
+    for p in params:
+        qs = getattr(p, "quant_state", None)
+        shape = getattr(qs, "shape", None) if qs is not None else None
+        if shape is not None:
+            n = 1
+            for d in shape:
+                n *= int(d)
+            total += n
+        else:
+            total += int(p.numel())
+    return total
 
 
 def base_short(base: str) -> str:

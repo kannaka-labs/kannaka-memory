@@ -88,7 +88,11 @@ python run_qbraid.py --profile gpu-a100-sxm --data ~/.kannaka-corpus/sft \
 # 3. serve under the fleet family name (arena reports model_id=kannaka-brain from every tag)
 bash serve_debain2.sh ~/.kannaka-corpus/runs/<run>/gguf/kannaka-brain-q4_K_M.gguf kannaka-brain-27b-v1
 # 4. judge before anyone promotes it (ADR-0057 / kannaka-wave adoption rule), then
-python publish_hf.py --run ~/.kannaka-corpus/runs/<run> --namespace flaukowski --version 27b-v1 --stage-only
+#    the cards say only what you declare: --composition <rows.json> (or --voice-only when every target is
+#    her own writing), --eval <gates.md> for the evaluation and its losses, and --modelfile <served Modelfile>
+#    (required for runs trained with chat_template_kwargs; `ollama show <tag> --modelfile > served.Modelfile`)
+python publish_hf.py --run ~/.kannaka-corpus/runs/<run> --namespace flaukowski --version 27b-v1 --stage-only \
+    --composition rows.json --eval gates.md --modelfile served.Modelfile
 ```
 
 The weekly gate does not adopt it: a candidate is served beside `kannaka-brain-7b-v1`

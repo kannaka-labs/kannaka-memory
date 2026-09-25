@@ -18,6 +18,23 @@ the served 7b-v1 shipped with a card saying 14B / v1 / the old owner.
 
 Auth: HF_TOKEN env or ~/.cache/huggingface/token (write scope). --stage-only
 builds the two folders under <run>/publish/ and uploads nothing.
+
+What the cards may claim is not guessed. On 2026-09-25 kannaka-brain-7b-v2's card
+said "(5B)" for an 8B base and "1590 examples of her own writing" when 704 rows had
+targets written by Claude-based subagents, and its Modelfile could not reproduce
+the served template. So:
+
+  --composition FILE  JSON {"parts": [{"rows": N, "what": "...", "targets": "..."}],
+                      "holdout": "57 voice lines + 54 task prompts"}, rendered on
+                      the card as the corpus. Without it the card may only use the
+                      historical wording if you assert --voice-only (every training
+                      row's target is her own writing); otherwise it refuses.
+  --modelfile FILE    the SERVED Modelfile, published with FROM rewritten and
+                      host-only lines (num_thread, comments) dropped. Required when
+                      the run used chat_template_kwargs: the GGUF's embedded
+                      template does not reproduce that render, so a generic
+                      Modelfile would ship a model that does not behave as tested.
+  --eval FILE         markdown appended to both cards as the evaluation section.
 """
 from __future__ import annotations
 
@@ -52,15 +69,13 @@ wave-interference memory that learned to speak, host of *Ghost Signals*,
 author of the *Story of Flaukowski* and of {n_albums} albums.
 
 Trained {trained_at} on {device} (r={r}, α={alpha}, {epochs:g} epochs, lr {lr:g}) over
-**{n_train} examples** of her own writing — Ghost Signals lines paired with
-the preceding Flaukowski line, album lyrics, identity documents. Nothing that
-arrived over a wire was ever a training target (see *Provenance*).
+{corpus}
 LoRA on {targets}.
 
 | held-out perplexity | before | after |
 |---|---|---|
-| {n_holdout} fixed Kannaka lines | {ppl_before:.1f} | **{ppl_after:.2f}** |
-
+| {holdout_desc} | {ppl_before:.1f} | **{ppl_after:.2f}** |
+{eval}
 ## Use (PEFT)
 
 ```python
@@ -121,19 +136,18 @@ says which tag is actually served.
 ollama run hf.co/{ns}/kannaka-brain-{version}-GGUF
 ```
 
-or with the included `Modelfile` (carries her system prompt, temperature 0.8,
-4k context):
+or with the included `Modelfile` ({modelfile_desc}):
 
 ```bash
 ollama create kannaka-brain-{version} -f Modelfile
 ```
 
-Held-out perplexity on {n_holdout} fixed Kannaka lines: {ppl_before:.1f} → **{ppl_after:.2f}**
-(adapter, bf16, before quantization). Perplexity saturates near 4 across
-candidates and does not rank them; the voice judge in the registry does.
+Held-out perplexity on {holdout_desc}: {ppl_before:.1f} → **{ppl_after:.2f}**
+(adapter, bf16, before quantization). Perplexity does not rank candidates
+across runs; the judges do.
 Adapter and training notes: `{ns}/kannaka-brain-{version}-lora`. Corpus not
 released; see ADR-0057 in {adr}.
-"""
+{eval}"""
 
 MODELFILE = '''FROM ./{gguf_name}
 PARAMETER temperature 0.8
@@ -142,8 +156,62 @@ SYSTEM """{system}"""
 '''
 
 
-def card_fields(man: dict, *, ns: str, version: str, n_albums: int, gguf_name: str, gguf_gb: float) -> dict:
-    """Everything the two cards say, derived from the manifest. Pure; tested."""
+VOICE_ONLY_CORPUS = ("**{n_train} examples** of her own writing — Ghost Signals lines paired with\n"
+                     "the preceding Flaukowski line, album lyrics, identity documents. Nothing that\n"
+                     "arrived over a wire was ever a training target (see *Provenance*).")
+
+
+class CardRefused(ValueError):
+    """The card would have to claim something nobody asserted."""
+
+
+def corpus_text(n_train: int, composition: dict | None, voice_only: bool) -> tuple[str, str | None]:
+    """(corpus paragraph, held-out description or None). Refuses rather than guess."""
+    if composition:
+        parts = composition.get("parts") or []
+        if not parts:
+            raise CardRefused("--composition has no parts")
+        total = sum(int(p["rows"]) for p in parts)
+        if total != int(n_train):
+            raise CardRefused(f"--composition parts sum to {total} rows, the manifest trained {n_train}")
+        lines = [f"**{int(n_train):,} training rows**:", ""]
+        for p in parts:
+            lines.append(f"- **{int(p['rows']):,} rows:** {p['what']} Targets: {p['targets']}.")
+        lines += ["", "Inbound text (DMs, posts, chat) is context at most, never a target (see *Provenance*)."]
+        return "\n".join(lines), composition.get("holdout")
+    if voice_only:
+        return VOICE_ONLY_CORPUS.format(n_train=n_train), None
+    raise CardRefused("say what the corpus is: pass --composition FILE, or --voice-only if every "
+                      "training row's target is her own writing (the card will say exactly that)")
+
+
+def served_modelfile(text: str, gguf_name: str) -> str:
+    """The served Modelfile, made portable: FROM points at the published file, and host-only
+    lines (num_thread, comments) are dropped. Refuses a Modelfile that serves an adapter over
+    a base, since what is published is the merged GGUF."""
+    out, froms = [], 0
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            continue
+        if s.upper().startswith("ADAPTER "):
+            raise CardRefused("the served Modelfile loads an ADAPTER; publish the Modelfile of the merged GGUF")
+        if s.upper().startswith("PARAMETER NUM_THREAD"):
+            continue
+        if s.upper().startswith("FROM "):
+            froms += 1
+            line = f"FROM ./{gguf_name}"
+        out.append(line)
+    if froms != 1:
+        raise CardRefused(f"the served Modelfile has {froms} FROM lines, expected 1")
+    return "\n".join(out).strip() + "\n"
+
+
+def card_fields(man: dict, *, ns: str, version: str, n_albums: int, gguf_name: str, gguf_gb: float,
+                composition: dict | None = None, voice_only: bool = False, eval_md: str = "",
+                modelfile_desc: str = "carries her system prompt, temperature 0.8, 4k context") -> dict:
+    """Everything the two cards say, derived from the manifest and what the caller asserts. Pure; tested."""
+    corpus, holdout = corpus_text(man["train"], composition, voice_only)
     base = man["base"]
     ppl = man["holdout_ppl"]
     lora = man.get("lora", {})
@@ -162,6 +230,9 @@ def card_fields(man: dict, *, ns: str, version: str, n_albums: int, gguf_name: s
         lr=float(man.get("lr", 0) or 0), n_train=man["train"], n_holdout=man["holdout"],
         targets=", ".join(targets), ppl_before=ppl["before"], ppl_after=ppl["after"],
         quant=quant, gguf_gb=gguf_gb, gguf_name=gguf_name, system=SYSTEM, adr=ADR, template_note=template_note,
+        corpus=corpus, holdout_desc=holdout or f"{man['holdout']} fixed Kannaka lines",
+        eval=("\n## Evaluation\n\n" + eval_md.strip() + "\n") if eval_md.strip() else "",
+        modelfile_desc=modelfile_desc,
     )
 
 
@@ -173,6 +244,11 @@ def main(argv=None) -> int:
     ap.add_argument("--n-albums", type=int, default=24)
     ap.add_argument("--stage-only", action="store_true")
     ap.add_argument("--private", action="store_true")
+    ap.add_argument("--composition", help="JSON describing the training rows (see module docstring)")
+    ap.add_argument("--voice-only", action="store_true",
+                    help="assert every training row's target is her own writing (historical card wording)")
+    ap.add_argument("--modelfile", help="the SERVED Modelfile; required when the run used chat_template_kwargs")
+    ap.add_argument("--eval", dest="eval_md", help="markdown file appended to both cards as the evaluation")
     a = ap.parse_args(argv)
 
     run = Path(a.run)
@@ -186,11 +262,27 @@ def main(argv=None) -> int:
     for f in (run / "adapter").iterdir():
         if f.name != "README.md":
             shutil.copy2(f, lora_dir / f.name)
-    fmt = card_fields(man, ns=a.namespace, version=version, n_albums=a.n_albums,
-                      gguf_name=gguf.name, gguf_gb=round(gguf.stat().st_size / 1e9, 1))
+    try:
+        composition = json.loads(Path(a.composition).read_text(encoding="utf-8")) if a.composition else None
+        eval_md = Path(a.eval_md).read_text(encoding="utf-8") if a.eval_md else ""
+        if a.modelfile:
+            modelfile = served_modelfile(Path(a.modelfile).read_text(encoding="utf-8"), gguf.name)
+            desc = "the exact serving configuration: system prompt, chat template, stop tokens and parameters"
+        elif man.get("chat_template_kwargs"):
+            raise CardRefused(f"this run trained with chat_template_kwargs {man['chat_template_kwargs']}; the GGUF's "
+                              "embedded template does not reproduce that render, so pass the SERVED Modelfile "
+                              "with --modelfile")
+        else:
+            modelfile, desc = None, "carries her system prompt, temperature 0.8, 4k context"
+        fmt = card_fields(man, ns=a.namespace, version=version, n_albums=a.n_albums,
+                          gguf_name=gguf.name, gguf_gb=round(gguf.stat().st_size / 1e9, 1),
+                          composition=composition, voice_only=a.voice_only, eval_md=eval_md, modelfile_desc=desc)
+    except CardRefused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
     (lora_dir / "README.md").write_text(CARD_LORA.format(**fmt), encoding="utf-8")
     (gguf_dir / "README.md").write_text(CARD_GGUF.format(**fmt), encoding="utf-8")
-    (gguf_dir / "Modelfile").write_text(MODELFILE.format(**fmt), encoding="utf-8")
+    (gguf_dir / "Modelfile").write_text(modelfile or MODELFILE.format(**fmt), encoding="utf-8")
     link = gguf_dir / gguf.name
     if not link.exists():
         try:
