@@ -86,7 +86,10 @@ python run_qbraid.py --profile gpu-a100-sxm --data ~/.kannaka-corpus/sft \
     --adapter ~/.kannaka-corpus/runs/<run>/adapter --out ~/.kannaka-corpus/runs/<run> \
     --quant q4_K_M --intermediate q8_0 --purge-base-cache
 # 3. serve under the fleet family name (arena reports model_id=kannaka-brain from every tag)
-bash serve_debain2.sh ~/.kannaka-corpus/runs/<run>/gguf/kannaka-brain-q4_K_M.gguf kannaka-brain-27b-v1
+#    a run trained with chat_template_kwargs (thinking off) needs its template baked in: CHAT_TEMPLATE=<file.jinja>
+#    (kannaka-brain-7b-v2: citizen_tasks/nothink.jinja). PROMOTE=1 points kannaka-brain-current/-serve at it;
+#    GATEWAY=0 registers an eval model in ollama only. The script refuses when the disk cannot hold it.
+CHAT_TEMPLATE=citizen_tasks/nothink.jinja bash serve_debain2.sh ~/.kannaka-corpus/runs/<run>/gguf/kannaka-brain-q4_K_M.gguf kannaka-brain-27b-v1
 # 4. judge before anyone promotes it (ADR-0057 / kannaka-wave adoption rule), then
 #    the cards say only what you declare: --composition <rows.json> (or --voice-only when every target is
 #    her own writing), --eval <gates.md> for the evaluation and its losses, and --modelfile <served Modelfile>
