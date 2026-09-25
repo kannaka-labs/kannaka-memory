@@ -3041,8 +3041,9 @@ fn main() {
             }
         }
         "status" => {
-            let stats = sys.stats();
+            // One assessment, not two: `stats()` would run its own (#1061).
             let state = sys.assess();
+            let stats = sys.stats_for(&state);
             // Count memories without embeddings
             let all_mems = sys.engine.store.all_memories().unwrap_or_default();
             let memories_without_embeddings =

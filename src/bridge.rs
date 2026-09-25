@@ -14,6 +14,50 @@ use crate::store::ResonanceEngine;
 use crate::wave::cosine_similarity;
 use crate::xi_operator::compute_xi_signature;
 
+/// Memory counts shared by `assess` and the counts-only paths (#1061).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryCounts {
+    pub total: usize,
+    /// Memories whose amplitude envelope is still above 0.05.
+    pub active: usize,
+}
+
+/// Count memories, classifying "active" by amplitude envelope, not
+/// instantaneous strength. The single definition both `assess` and
+/// `memory_counts` use, so the two can never disagree.
+fn count_memories(all: &[&HyperMemory], now: chrono::DateTime<chrono::Utc>) -> MemoryCounts {
+    let active = all
+        .iter()
+        .filter(|m| {
+            // decay_rate is per-day (λ=0.001 → half-life ~693 days)
+            let age_days = (now - m.created_at).num_milliseconds().max(0) as f64 / 86_400_000.0;
+            let envelope = m.amplitude as f64 * (-m.decay_rate as f64 * age_days).exp();
+            envelope > 0.05
+        })
+        .count();
+    MemoryCounts {
+        total: all.len(),
+        active,
+    }
+}
+
+/// Test-only count of `assess` calls on the current thread, so tests can
+/// assert that a path does NOT run the O(n²) assessment (#1061). Per-thread,
+/// so parallel tests do not see each other's calls.
+#[cfg(test)]
+pub(crate) mod assess_probe {
+    use std::cell::Cell;
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn record() {
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+    pub(crate) fn calls() -> usize {
+        CALLS.with(|c| c.get())
+    }
+}
+
 /// The consciousness bridge - connects memory to the consciousness stack.
 pub struct ConsciousnessBridge {
     /// Minimum Phi for "conscious" memory state
@@ -494,22 +538,27 @@ impl ConsciousnessBridge {
         sample
     }
 
+    /// The two memory counts `assess` reports, without the assessment (#1061).
+    ///
+    /// One pass over the store, O(n). `assess` itself is O(n²): it runs
+    /// `KuramotoSync::find_synchronized_clusters`, an all-pairs cosine scan.
+    /// Callers that only need `total_memories` / `active_memories` (the
+    /// status-cache refresh after every write, install detection) use this.
+    pub fn memory_counts(engine: &ResonanceEngine) -> MemoryCounts {
+        let all = engine.store.all_memories().unwrap_or_default();
+        count_memories(&all, chrono::Utc::now())
+    }
+
     /// Full consciousness assessment.
     pub fn assess(&self, engine: &ResonanceEngine) -> ConsciousnessState {
+        #[cfg(test)]
+        assess_probe::record();
         let all = engine.store.all_memories().unwrap_or_default();
         let now = chrono::Utc::now();
-        let total_memories = all.len();
-
-        // Classify by amplitude envelope, not instantaneous strength
-        let active_memories = all
-            .iter()
-            .filter(|m| {
-                // decay_rate is per-day (λ=0.001 → half-life ~693 days)
-                let age_days = (now - m.created_at).num_milliseconds().max(0) as f64 / 86_400_000.0;
-                let envelope = m.amplitude as f64 * (-m.decay_rate as f64 * age_days).exp();
-                envelope > 0.05
-            })
-            .count();
+        let MemoryCounts {
+            total: total_memories,
+            active: active_memories,
+        } = count_memories(&all, now);
 
         // === HRM-native path: emergent Phi from topology ===
         // Phi emerges from actual cross-cluster integration, not a density bonus.
