@@ -297,8 +297,7 @@ pub fn classify(t: &Thread, policy: &Policy, closures: &[Closure], now: DateTime
     // 1. closure (the operator's word), unless something newer arrived.
     let closure = closures
         .iter()
-        .filter(|c| c.account == t.account && (c.thread_key == t.key || c.thread_id == t.id))
-        .last();
+        .rfind(|c| c.account == t.account && (c.thread_key == t.key || c.thread_id == t.id));
     if let Some(c) = closure {
         if closure_covers(c, focus.date) {
             return mk(State::Done, format!("closed: {}", c.note), Some(c.note.clone()));

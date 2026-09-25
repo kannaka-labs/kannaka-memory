@@ -219,8 +219,7 @@ impl ImapSession {
                     String::from_utf8_lossy(u.literals.first()?).to_string()
                 } else {
                     let t = u.text.trim_end();
-                    if t.ends_with('"') {
-                        let inner = &t[..t.len() - 1];
+                    if let Some(inner) = t.strip_suffix('"') {
                         let start = inner.rfind('"')? + 1;
                         inner[start..].to_string()
                     } else {
