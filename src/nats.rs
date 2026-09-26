@@ -646,10 +646,15 @@ fn permissions_error(op: &str, subject: &str, raw: &str, authenticated: bool) ->
 
 /// One parsed NATS protocol frame.
 enum Frame {
+    /// A delivered message. `MSG` and `HMSG` both land here; for `HMSG` the
+    /// header block is stripped from `payload` and its status code (e.g. the
+    /// `503` of a no-responders notice) is surfaced as `status`. A plain
+    /// `MSG` — and an `HMSG` whose header line carries no code — has `None`.
     Msg {
         subject: String,
         sid: String,
         reply_to: Option<String>,
+        status: Option<u16>,
         payload: Vec<u8>,
     },
     Ping,
@@ -760,11 +765,74 @@ fn read_exact_resumable<R: Read>(
     Ok(())
 }
 
+/// Read a MSG/HMSG body of `nbytes` plus its trailing CRLF. `Ok(None)` means
+/// the peer closed mid-body (a genuine close, not a desync).
+fn read_msg_body<R: Read>(reader: &mut R, nbytes: usize) -> Result<Option<Vec<u8>>, NatsError> {
+    if nbytes > MAX_MSG_PAYLOAD {
+        // Wire-controlled size: allocating it unchecked lets one bogus
+        // header abort the process. Nothing legitimate approaches this
+        // (server max_payload defaults to 1 MiB).
+        return Err(NatsError::Protocol(format!(
+            "MSG payload {nbytes} exceeds {MAX_MSG_PAYLOAD} byte cap — refusing allocation"
+        )));
+    }
+    // Resumable payload read: the byte count is known, so a mid-payload
+    // read timeout (a lost segment straddling a short socket timeout) is
+    // ridden out to MSG_FRAME_DEADLINE rather than treated as a desync
+    // (#499). One shared deadline covers the payload AND the trailing CRLF.
+    let frame_deadline = Instant::now() + MSG_FRAME_DEADLINE;
+    let mut payload = vec![0u8; nbytes];
+    match read_exact_resumable(reader, &mut payload, frame_deadline) {
+        Ok(()) => {}
+        // Peer closed mid-payload — a genuine connection close, so hand the
+        // caller a clean Closed (reconnect/exit) rather than a desync error.
+        Err(ResumableReadError::Eof) => return Ok(None),
+        Err(ResumableReadError::Timeout) => {
+            return Err(NatsError::Protocol(format!(
+                "MSG payload stalled past {MSG_FRAME_DEADLINE:?} — connection dead"
+            )))
+        }
+        Err(ResumableReadError::Io(e)) => return Err(NatsError::Io(e)),
+    }
+    let mut crlf = [0u8; 2];
+    match read_exact_resumable(reader, &mut crlf, frame_deadline) {
+        Ok(()) => {}
+        Err(ResumableReadError::Eof) => return Ok(None),
+        Err(ResumableReadError::Timeout) => {
+            return Err(NatsError::Protocol(
+                "MSG trailing CRLF stalled — connection dead".to_string(),
+            ))
+        }
+        Err(ResumableReadError::Io(e)) => return Err(NatsError::Io(e)),
+    }
+    if &crlf != b"\r\n" {
+        return Err(NatsError::Protocol(
+            "MSG payload not followed by CRLF".to_string(),
+        ));
+    }
+    Ok(Some(payload))
+}
+
+/// Status code from an HMSG header block's first line (`NATS/1.0 503` or
+/// `NATS/1.0 503 No Responders`). `None` for a plain `NATS/1.0` line or
+/// anything that is not a NATS header block.
+fn parse_header_status(block: &[u8]) -> Option<u16> {
+    let first = block.split(|&b| b == b'\n').next()?;
+    let first = std::str::from_utf8(first).ok()?.trim_end_matches('\r');
+    let rest = first.strip_prefix("NATS/1.0")?;
+    let code = rest.split_whitespace().next()?;
+    if code.len() == 3 {
+        code.parse().ok()
+    } else {
+        None
+    }
+}
+
 /// Read exactly one protocol frame. Returns `Err` on any condition that
 /// desyncs the byte stream (partial line consumed before a timeout, short
 /// payload read, unparseable MSG header, missing CRLF, non-UTF-8 control
 /// line) — after such an error the connection must be considered dead.
-fn read_frame(reader: &mut BufReader<TcpStream>) -> Result<ReadOutcome, NatsError> {
+fn read_frame<R: BufRead>(reader: &mut R) -> Result<ReadOutcome, NatsError> {
     let mut line = String::new();
     // Bound control-line growth: `take` caps how many bytes this read_line
     // can pull, so a stream that never sends '\n' (desync, garbage peer)
@@ -816,50 +884,49 @@ fn read_frame(reader: &mut BufReader<TcpStream>) -> Result<ReadOutcome, NatsErro
         let nbytes: usize = nbytes_str.parse().map_err(|_| {
             NatsError::Protocol(format!("invalid MSG byte count: {trimmed}"))
         })?;
-        if nbytes > MAX_MSG_PAYLOAD {
-            // Wire-controlled size: allocating it unchecked lets one bogus
-            // header abort the process. Nothing legitimate approaches this
-            // (server max_payload defaults to 1 MiB).
-            return Err(NatsError::Protocol(format!("MSG payload {nbytes} exceeds {MAX_MSG_PAYLOAD} byte cap — refusing allocation")));
-        }
-        // Resumable payload read: the byte count is known, so a mid-payload
-        // read timeout (a lost segment straddling a short socket timeout) is
-        // ridden out to MSG_FRAME_DEADLINE rather than treated as a desync
-        // (#499). One shared deadline covers the payload AND the trailing CRLF.
-        let frame_deadline = Instant::now() + MSG_FRAME_DEADLINE;
-        let mut payload = vec![0u8; nbytes];
-        match read_exact_resumable(reader, &mut payload, frame_deadline) {
-            Ok(()) => {}
-            // Peer closed mid-payload — a genuine connection close, so hand the
-            // caller a clean Closed (reconnect/exit) rather than a desync error.
-            Err(ResumableReadError::Eof) => return Ok(ReadOutcome::Closed),
-            Err(ResumableReadError::Timeout) => {
-                return Err(NatsError::Protocol(format!(
-                    "MSG payload stalled past {MSG_FRAME_DEADLINE:?} — connection dead"
-                )))
-            }
-            Err(ResumableReadError::Io(e)) => return Err(NatsError::Io(e)),
-        }
-        let mut crlf = [0u8; 2];
-        match read_exact_resumable(reader, &mut crlf, frame_deadline) {
-            Ok(()) => {}
-            Err(ResumableReadError::Eof) => return Ok(ReadOutcome::Closed),
-            Err(ResumableReadError::Timeout) => {
-                return Err(NatsError::Protocol(
-                    "MSG trailing CRLF stalled — connection dead".to_string(),
-                ))
-            }
-            Err(ResumableReadError::Io(e)) => return Err(NatsError::Io(e)),
-        }
-        if &crlf != b"\r\n" {
-            return Err(NatsError::Protocol(
-                "MSG payload not followed by CRLF".to_string(),
-            ));
-        }
+        let Some(payload) = read_msg_body(reader, nbytes)? else {
+            return Ok(ReadOutcome::Closed);
+        };
         return Ok(ReadOutcome::Frame(Frame::Msg {
             subject: subject.to_string(),
             sid: sid.to_string(),
             reply_to: reply_to.map(String::from),
+            status: None,
+            payload,
+        }));
+    }
+    if let Some(rest) = trimmed.strip_prefix("HMSG ") {
+        // Only sent to a connection that declared `headers: true` in CONNECT
+        // (see `ProbingPublisher`). Wire format:
+        //   HMSG <subject> <sid> <#header bytes> <#total bytes>
+        //   HMSG <subject> <sid> <reply-to> <#header bytes> <#total bytes>
+        // The total covers the header block AND the body.
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        let (subject, sid, reply_to, hdr_str, total_str) = match parts.len() {
+            4 => (parts[0], parts[1], None, parts[2], parts[3]),
+            5 => (parts[0], parts[1], Some(parts[2]), parts[3], parts[4]),
+            n => {
+                return Err(NatsError::Protocol(format!(
+                    "malformed HMSG header ({n} fields): {trimmed}"
+                )))
+            }
+        };
+        let bad = || NatsError::Protocol(format!("invalid HMSG byte counts: {trimmed}"));
+        let hdr_len: usize = hdr_str.parse().map_err(|_| bad())?;
+        let total: usize = total_str.parse().map_err(|_| bad())?;
+        if hdr_len > total {
+            return Err(bad());
+        }
+        let Some(mut body) = read_msg_body(reader, total)? else {
+            return Ok(ReadOutcome::Closed);
+        };
+        let status = parse_header_status(&body[..hdr_len]);
+        let payload = body.split_off(hdr_len);
+        return Ok(ReadOutcome::Frame(Frame::Msg {
+            subject: subject.to_string(),
+            sid: sid.to_string(),
+            reply_to: reply_to.map(String::from),
+            status,
             payload,
         }));
     }
@@ -1049,6 +1116,46 @@ fn resolve_creds(
 /// creds therefore outrank env, which outranks `user:pass@` in the URL.
 /// `None` is exactly the previous behaviour.
 fn handshake(url: &str, explicit: Option<&(String, String)>) -> Result<Conn, NatsError> {
+    handshake_with(url, explicit, false).map(|(conn, _)| conn)
+}
+
+/// The CONNECT JSON. `no_responders` additionally declares `headers: true`
+/// and `no_responders: true`, which makes the server answer a request whose
+/// subject has NO subscribers with an immediate `HMSG ... NATS/1.0 503` on the
+/// reply inbox (nats-server 2.2+). Only `ProbingPublisher` asks for it: the
+/// shared `SwarmTransport` connections keep the exact CONNECT they always had,
+/// so no existing request path starts seeing 503s where it used to time out.
+fn connect_payload(creds: Option<&(String, String)>, no_responders: bool) -> String {
+    let extra = if no_responders {
+        r#","headers":true,"no_responders":true"#
+    } else {
+        ""
+    };
+    match creds {
+        Some((user, pass)) => {
+            // Escape JSON safely. Both fields are short tokens — quotation
+            // and backslash are the only chars worth handling.
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                r#"{{"verbose":false,"pedantic":false,"name":"kannaka","lang":"rust","version":"0.1.0","protocol":1{},"user":"{}","pass":"{}"}}"#,
+                extra,
+                esc(user),
+                esc(pass)
+            )
+        }
+        None => format!(
+            r#"{{"verbose":false,"pedantic":false,"name":"kannaka","lang":"rust","version":"0.1.0","protocol":1{extra}}}"#
+        ),
+    }
+}
+
+/// `handshake`, optionally opting into no-responders. Returns whether the
+/// opt-in actually took effect (the server INFO must advertise `headers`).
+fn handshake_with(
+    url: &str,
+    explicit: Option<&(String, String)>,
+    want_no_responders: bool,
+) -> Result<(Conn, bool), NatsError> {
     let (host, port, url_creds) = parse_nats_url(url)?;
     let addr = format!("{host}:{port}");
     use std::net::ToSocketAddrs;
@@ -1080,6 +1187,7 @@ fn handshake(url: &str, explicit: Option<&(String, String)>) -> Result<Conn, Nat
     }
     // Inspect the server INFO: we cannot speak TLS, so fail with a clear
     // message instead of a confusing "expected PONG" later.
+    let mut server_headers = false;
     if let Ok(info) =
         serde_json::from_str::<serde_json::Value>(info_line["INFO ".len()..].trim())
     {
@@ -1092,29 +1200,19 @@ fn handshake(url: &str, explicit: Option<&(String, String)>) -> Result<Conn, Nat
                 "server requires TLS, which this client does not support".to_string(),
             ));
         }
+        server_headers = info
+            .get("headers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     }
+    let no_responders = want_no_responders && server_headers;
 
     // Credentials: env vars take precedence, then URL user:pass@. Anonymous
     // connections get the server's anonymous permissions (read-only).
     let env_user = std::env::var("NATS_USER").unwrap_or_default();
     let env_pass = std::env::var("NATS_PASSWORD").unwrap_or_default();
     let creds = resolve_creds(explicit, env_user, env_pass, url_creds);
-    let connect_payload = match &creds {
-        Some((user, pass)) => {
-            // Escape JSON safely. Both fields are short tokens — quotation
-            // and backslash are the only chars worth handling.
-            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(
-                r#"{{"verbose":false,"pedantic":false,"name":"kannaka","lang":"rust","version":"0.1.0","protocol":1,"user":"{}","pass":"{}"}}"#,
-                esc(user),
-                esc(pass)
-            )
-        }
-        None => {
-            r#"{"verbose":false,"pedantic":false,"name":"kannaka","lang":"rust","version":"0.1.0","protocol":1}"#
-                .to_string()
-        }
-    };
+    let connect_payload = connect_payload(creds.as_ref(), no_responders);
     write!(writer, "CONNECT {connect_payload}\r\n")?;
     write!(writer, "PING\r\n")?;
     writer.flush()?;
@@ -1124,13 +1222,16 @@ fn handshake(url: &str, explicit: Option<&(String, String)>) -> Result<Conn, Nat
     for _ in 0..10 {
         match read_frame(&mut reader)? {
             ReadOutcome::Frame(Frame::Pong) => {
-                return Ok(Conn {
-                    writer,
-                    reader,
-                    dead: false,
-                    authenticated: creds.is_some(),
-                    stream_create_denied: false,
-                })
+                return Ok((
+                    Conn {
+                        writer,
+                        reader,
+                        dead: false,
+                        authenticated: creds.is_some(),
+                        stream_create_denied: false,
+                    },
+                    no_responders,
+                ))
             }
             ReadOutcome::Frame(Frame::Ping) => {
                 write!(writer, "PONG\r\n")?;
@@ -1155,6 +1256,204 @@ fn handshake(url: &str, explicit: Option<&(String, String)>) -> Result<Conn, Nat
     Err(NatsError::Protocol(
         "no PONG after CONNECT (too many interleaved frames)".to_string(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// No-responders delivery probe (`kannaka inbox send`)
+// ---------------------------------------------------------------------------
+
+/// What the broker said about a probed publish.
+///
+/// Core NATS is fire-and-forget: a PUB to a subject nobody subscribes to is
+/// accepted and silently dropped. `KANNAKA.inbox.<agent>` is not captured by
+/// any JetStream stream, so a directed inbox message to an agent that is not
+/// running `inbox serve` simply vanished while the sender printed success.
+/// The probe publishes with a reply inbox on a no-responders connection so
+/// the broker itself reports whether anyone received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerProbe {
+    /// The broker answered `503 No Responders`: zero subscribers on the
+    /// subject, so the message was dropped. Nothing will ever read it.
+    NoListener,
+    /// The broker routed the message to at least one subscriber. This proves
+    /// delivery to *a* subscriber of the subject, not that a handler ran.
+    Listening,
+    /// The broker refused the publish (ACL). Nothing was delivered.
+    Denied(String),
+    /// Published, but whether anyone received it could not be determined
+    /// (server without header support, reply inbox refused, no answer in the
+    /// window, connection lost). Carries the reason.
+    Unconfirmed(String),
+}
+
+/// Consume server frames after a probe's `SUB <inbox> <sid>` / `PUB <subject>
+/// <inbox>` / `PING` until the outcome is known.
+///
+/// Ordering is what makes this fast and exact: the server decides interest
+/// while processing our PUB and queues any 503 onto our connection before it
+/// processes the PING that follows, so the PONG is the "no 503 is coming"
+/// barrier. The deadline only matters when the server is slow or silent.
+fn await_listener_probe<R: BufRead>(
+    reader: &mut R,
+    write: &mut dyn FnMut(&[u8]) -> Result<(), NatsError>,
+    sid: &str,
+    subject: &str,
+    deadline: Instant,
+) -> ListenerProbe {
+    let mut inbox_denied: Option<String> = None;
+    loop {
+        match read_frame(reader) {
+            Ok(ReadOutcome::Frame(Frame::Msg {
+                sid: msid, status, ..
+            })) if msid == sid => {
+                return if status == Some(503) {
+                    ListenerProbe::NoListener
+                } else {
+                    // A genuine reply on our inbox — someone got it.
+                    ListenerProbe::Listening
+                };
+            }
+            Ok(ReadOutcome::Frame(Frame::Msg { .. })) => continue,
+            Ok(ReadOutcome::Frame(Frame::Ping)) => {
+                if let Err(e) = write(b"PONG\r\n") {
+                    return ListenerProbe::Unconfirmed(format!(
+                        "connection lost answering PING: {e}"
+                    ));
+                }
+            }
+            Ok(ReadOutcome::Frame(Frame::Pong)) => {
+                return match inbox_denied {
+                    Some(m) => ListenerProbe::Unconfirmed(format!(
+                        "broker refused the reply inbox, so it could not report a missing listener ({m})"
+                    )),
+                    None => ListenerProbe::Listening,
+                };
+            }
+            Ok(ReadOutcome::Frame(Frame::ServerErr(m))) => {
+                if is_permissions_error(&m) {
+                    if m.to_ascii_lowercase().contains("publish") {
+                        return ListenerProbe::Denied(format!(
+                            "broker refused publish to \"{subject}\" ({m})"
+                        ));
+                    }
+                    inbox_denied = Some(m);
+                } else if is_auth_error(&m) {
+                    return ListenerProbe::Unconfirmed(format!("server error: {m}"));
+                } else {
+                    eprintln!("[nats] server error: {m}");
+                }
+            }
+            Ok(ReadOutcome::Frame(_)) => continue,
+            Ok(ReadOutcome::TimedOut) => {
+                if Instant::now() >= deadline {
+                    return ListenerProbe::Unconfirmed(
+                        "the server did not answer the delivery probe in time".to_string(),
+                    );
+                }
+            }
+            Ok(ReadOutcome::Closed) => {
+                return ListenerProbe::Unconfirmed(
+                    "connection closed before the server answered the delivery probe".to_string(),
+                )
+            }
+            Err(e) => return ListenerProbe::Unconfirmed(format!("protocol error: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return ListenerProbe::Unconfirmed(
+                "the server did not answer the delivery probe in time".to_string(),
+            );
+        }
+    }
+}
+
+/// A short-lived, single-purpose connection that opted into NATS
+/// no-responders (`headers` + `no_responders` in CONNECT), so a publish can
+/// learn whether anything was subscribed to receive it.
+///
+/// Deliberately separate from `SwarmTransport`: the flag changes what the
+/// server sends back for EVERY request on the connection (a 503 instead of
+/// silence), and the long-lived transport's request paths were written
+/// against silence. No JetStream setup, no reconnect, no buffering — connect,
+/// publish, drop.
+pub struct ProbingPublisher {
+    conn: Conn,
+    no_responders: bool,
+    next_sid: u64,
+}
+
+impl ProbingPublisher {
+    /// Connect with the ambient identity (`NATS_USER`/`NATS_PASSWORD`, else
+    /// URL credentials), requesting no-responders support.
+    pub fn connect(url: &str) -> Result<Self, NatsError> {
+        let (conn, no_responders) = handshake_with(url, None, true)?;
+        Ok(Self {
+            conn,
+            no_responders,
+            next_sid: 1,
+        })
+    }
+
+    /// Did the server accept the no-responders opt-in (it advertised
+    /// `headers` in INFO)? When false, `publish_probing` can only publish.
+    pub fn supports_no_responders(&self) -> bool {
+        self.no_responders
+    }
+
+    /// Publish `payload` to `subject` and report whether the broker delivered
+    /// it to any subscriber. Returns within one round trip in the normal case,
+    /// and never later than `window`. `Err` only when the publish itself
+    /// could not be written.
+    pub fn publish_probing(
+        &mut self,
+        subject: &str,
+        payload: &[u8],
+        window: Duration,
+    ) -> Result<ListenerProbe, NatsError> {
+        if !self.no_responders {
+            self.publish(subject, payload)?;
+            return Ok(ListenerProbe::Unconfirmed(
+                "the server does not support no-responders (needs nats-server 2.2+ with headers)"
+                    .to_string(),
+            ));
+        }
+        let inbox = new_inbox("probe");
+        let sid = self.next_sid.to_string();
+        self.next_sid += 1;
+        let mut frame = Vec::with_capacity(payload.len() + inbox.len() * 2 + subject.len() + 64);
+        let _ = write!(frame, "SUB {inbox} {sid}\r\n");
+        let _ = write!(frame, "PUB {} {} {}\r\n", subject, inbox, payload.len());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\nPING\r\n");
+        self.conn.write_frames(&frame)?;
+
+        let prev = self.conn.read_timeout();
+        let _ = self
+            .conn
+            .set_read_timeout(Some(window.max(Duration::from_millis(10))));
+        let deadline = Instant::now() + window;
+        let outcome = {
+            let Conn { reader, writer, .. } = &mut self.conn;
+            let mut write = |b: &[u8]| -> Result<(), NatsError> {
+                writer
+                    .write_all(b)
+                    .and_then(|()| writer.flush())
+                    .map_err(NatsError::Io)
+            };
+            await_listener_probe(reader, &mut write, &sid, subject, deadline)
+        };
+        let _ = self
+            .conn
+            .write_frames(format!("UNSUB {sid}\r\n").as_bytes());
+        let _ = self.conn.set_read_timeout(prev);
+        Ok(outcome)
+    }
+
+    /// Plain publish on the probing connection, confirmed against an async
+    /// broker refusal (same PING barrier `SwarmTransport` uses).
+    pub fn publish(&mut self, subject: &str, payload: &[u8]) -> Result<(), NatsError> {
+        write_pub(&mut self.conn, subject, payload)?;
+        self.conn.confirm("publish", subject)
+    }
 }
 
 /// A message buffered during disconnect, replayed on reconnect.
@@ -5167,5 +5466,244 @@ mod tests {
             sub.reader.get_ref().read_timeout().unwrap(),
             Some(Duration::from_millis(250))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // HMSG + no-responders probe (`inbox send` delivery truth)
+    // -----------------------------------------------------------------------
+
+    fn frame_from(bytes: &[u8]) -> Result<ReadOutcome, NatsError> {
+        read_frame(&mut std::io::Cursor::new(bytes.to_vec()))
+    }
+
+    #[test]
+    fn hmsg_no_responders_status_is_parsed() {
+        // Exactly what nats-server 2.2+ sends to a request's reply inbox when
+        // nothing is subscribed to the request subject.
+        let raw = b"HMSG _INBOX.probe.1 7 16 16\r\nNATS/1.0 503\r\n\r\n\r\n";
+        match frame_from(raw).unwrap() {
+            ReadOutcome::Frame(Frame::Msg {
+                subject,
+                sid,
+                reply_to,
+                status,
+                payload,
+            }) => {
+                assert_eq!(subject, "_INBOX.probe.1");
+                assert_eq!(sid, "7");
+                assert_eq!(reply_to, None);
+                assert_eq!(status, Some(503));
+                assert!(payload.is_empty());
+            }
+            _ => panic!("expected an HMSG parsed as Frame::Msg"),
+        }
+    }
+
+    #[test]
+    fn hmsg_with_reply_headers_and_body_yields_body_only() {
+        let hdr = b"NATS/1.0\r\nNats-Msg-Id: abc\r\n\r\n";
+        let body = b"{\"x\":1}";
+        let mut raw = format!(
+            "HMSG subj.a 3 reply.to {} {}\r\n",
+            hdr.len(),
+            hdr.len() + body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(hdr);
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(b"\r\n");
+        match frame_from(&raw).unwrap() {
+            ReadOutcome::Frame(Frame::Msg {
+                reply_to,
+                status,
+                payload,
+                ..
+            }) => {
+                assert_eq!(reply_to.as_deref(), Some("reply.to"));
+                assert_eq!(
+                    status, None,
+                    "a plain NATS/1.0 header block carries no status"
+                );
+                assert_eq!(payload, body);
+            }
+            _ => panic!("expected an HMSG frame"),
+        }
+    }
+
+    #[test]
+    fn hmsg_rejects_header_len_past_total_and_bad_counts() {
+        assert!(frame_from(b"HMSG s 1 20 10\r\n0123456789\r\n").is_err());
+        assert!(frame_from(b"HMSG s 1 x 10\r\n0123456789\r\n").is_err());
+        assert!(frame_from(b"HMSG s 1 10\r\n0123456789\r\n").is_err());
+    }
+
+    #[test]
+    fn plain_msg_has_no_status() {
+        match frame_from(b"MSG s 1 2\r\nhi\r\n").unwrap() {
+            ReadOutcome::Frame(Frame::Msg {
+                status, payload, ..
+            }) => {
+                assert_eq!(status, None);
+                assert_eq!(payload, b"hi");
+            }
+            _ => panic!("expected MSG"),
+        }
+    }
+
+    #[test]
+    fn header_status_line_parsing() {
+        assert_eq!(parse_header_status(b"NATS/1.0 503\r\n\r\n"), Some(503));
+        assert_eq!(
+            parse_header_status(b"NATS/1.0 503 No Responders\r\n\r\n"),
+            Some(503)
+        );
+        assert_eq!(
+            parse_header_status(b"NATS/1.0 408 Request Timeout\r\n\r\n"),
+            Some(408)
+        );
+        assert_eq!(parse_header_status(b"NATS/1.0\r\nA: b\r\n\r\n"), None);
+        assert_eq!(parse_header_status(b"garbage"), None);
+        assert_eq!(parse_header_status(b""), None);
+    }
+
+    #[test]
+    fn connect_payload_opts_into_no_responders_only_when_asked() {
+        let plain: serde_json::Value = serde_json::from_str(&connect_payload(None, false)).unwrap();
+        assert!(plain.get("headers").is_none());
+        assert!(plain.get("no_responders").is_none());
+
+        let creds = ("u\"x".to_string(), "p\\w".to_string());
+        let probing: serde_json::Value =
+            serde_json::from_str(&connect_payload(Some(&creds), true)).unwrap();
+        assert_eq!(probing["headers"], serde_json::Value::Bool(true));
+        assert_eq!(probing["no_responders"], serde_json::Value::Bool(true));
+        assert_eq!(probing["user"], "u\"x");
+        assert_eq!(probing["pass"], "p\\w");
+    }
+
+    /// Drive `await_listener_probe` over raw server bytes; returns the outcome
+    /// and every byte the probe wrote back (PONGs).
+    fn probe_over(bytes: &[u8]) -> (ListenerProbe, Vec<u8>) {
+        let mut reader = std::io::Cursor::new(bytes.to_vec());
+        let mut wrote = Vec::new();
+        let out = await_listener_probe(
+            &mut reader,
+            &mut |b: &[u8]| {
+                wrote.extend_from_slice(b);
+                Ok(())
+            },
+            "9",
+            "KANNAKA.inbox.SpaceChild",
+            Instant::now() + Duration::from_secs(5),
+        );
+        (out, wrote)
+    }
+
+    #[test]
+    fn probe_503_on_our_sid_means_no_listener() {
+        let (out, _) = probe_over(b"HMSG _INBOX.p 9 16 16\r\nNATS/1.0 503\r\n\r\n\r\nPONG\r\n");
+        assert_eq!(out, ListenerProbe::NoListener);
+    }
+
+    #[test]
+    fn probe_pong_without_503_means_listening() {
+        // The server evaluates interest while processing our PUB and queues
+        // any 503 before the PONG for the PING we send right after it — so a
+        // PONG with no 503 in front of it is the positive answer.
+        let (out, _) = probe_over(b"PONG\r\n");
+        assert_eq!(out, ListenerProbe::Listening);
+    }
+
+    #[test]
+    fn probe_ignores_503_for_another_sid_and_answers_ping() {
+        let (out, wrote) =
+            probe_over(b"PING\r\nHMSG _INBOX.other 4 16 16\r\nNATS/1.0 503\r\n\r\n\r\nPONG\r\n");
+        assert_eq!(out, ListenerProbe::Listening);
+        assert_eq!(wrote, b"PONG\r\n");
+    }
+
+    #[test]
+    fn probe_real_reply_on_inbox_means_listening() {
+        let (out, _) = probe_over(b"MSG _INBOX.p 9 2\r\nok\r\n");
+        assert_eq!(out, ListenerProbe::Listening);
+    }
+
+    #[test]
+    fn probe_publish_permission_denial_is_reported() {
+        let (out, _) = probe_over(
+            b"-ERR 'Permissions Violation for Publish to \"KANNAKA.inbox.SpaceChild\"'\r\nPONG\r\n",
+        );
+        match out {
+            ListenerProbe::Denied(m) => assert!(m.contains("Permissions Violation")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_inbox_subscription_denial_is_unconfirmed_not_delivered() {
+        // Without the reply subscription the server cannot send us a 503, so
+        // the PONG that follows proves nothing either way.
+        let (out, _) = probe_over(
+            b"-ERR 'Permissions Violation for Subscription to \"_INBOX.p\"'\r\nPONG\r\n",
+        );
+        assert!(matches!(out, ListenerProbe::Unconfirmed(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn probe_connection_close_is_unconfirmed() {
+        let (out, _) = probe_over(b"");
+        assert!(matches!(out, ListenerProbe::Unconfirmed(_)), "got {out:?}");
+    }
+
+    /// End-to-end against a real nats-server. Opt-in: set
+    /// `KANNAKA_PROBE_TEST_NATS_URL` to a THROWAWAY server (never the live bus —
+    /// this publishes).
+    #[test]
+    fn probing_publisher_against_real_server() {
+        let url = match std::env::var("KANNAKA_PROBE_TEST_NATS_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("KANNAKA_PROBE_TEST_NATS_URL unset, skipping");
+                return;
+            }
+        };
+        let mut p = ProbingPublisher::connect(&url).expect("connect probing publisher");
+        assert!(
+            p.supports_no_responders(),
+            "nats-server >= 2.2 advertises headers"
+        );
+        let window = Duration::from_millis(1500);
+
+        let t0 = Instant::now();
+        let out = p
+            .publish_probing("KANNAKA.inbox.nobody-here", b"{}", window)
+            .unwrap();
+        assert_eq!(out, ListenerProbe::NoListener);
+        assert!(
+            t0.elapsed() < window,
+            "503 must arrive well inside the window"
+        );
+
+        // A plain subscriber on the subject (what `inbox serve` holds).
+        let listener = SwarmTransport::connect(&url).expect("listener connect");
+        let mut sub = listener.subscribe("KANNAKA.inbox.somebody").expect("sub");
+        let _ = sub.set_timeout(Some(Duration::from_millis(200)));
+        let out = p
+            .publish_probing("KANNAKA.inbox.somebody", b"{\"v\":1}", window)
+            .unwrap();
+        assert_eq!(out, ListenerProbe::Listening);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while Instant::now() < deadline {
+            if let SubEvent::Msg(m) = sub.next_event() {
+                got = Some(m);
+                break;
+            }
+        }
+        let m = got.expect("listener received the probed message");
+        assert_eq!(m.payload, b"{\"v\":1}");
+
+        // Plain publish on the same probing connection still works.
+        p.publish("KANNAKA.inbox.audit", b"{}").unwrap();
     }
 }

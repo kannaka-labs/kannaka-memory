@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### `inbox send` tells the truth about delivery
+
+`kannaka inbox send <to> <verb>` published fire-and-forget to `KANNAKA.inbox.<to>` and printed the
+message as if it had been sent. No JetStream stream captures `KANNAKA.inbox.>`, and the only reader
+is an `inbox serve` daemon, so a message to an agent that was not running one vanished while the
+sender saw success. On 2026-09-26 0xSCADA-QE's `say` to SpaceChild (msg `4d857926`) was lost this way:
+SpaceChild runs `swarm join` + `swarm serve`, not `inbox serve`.
+
+Without `--wait`, the send now uses NATS no-responders. It publishes with a reply inbox on a connection
+that declared `headers` + `no_responders`, then waits one PING/PONG round trip, capped at 1.5 s:
+
+- The broker answers `503` (nothing subscribed): `NOT DELIVERED: no live inbox listener for '<to>'`,
+  a pointer to `inbox serve` and to the durable mail lane (ADR-0062/0064, `KANNAKA_MAIL_V2`), nothing on
+  stdout, and **exit 3**.
+- A PONG arrives with no `503`: the message JSON on stdout as before, a note that a live subscriber
+  received it (receipt, not handling), and exit 0.
+- The broker cannot say (a server without header support, or the reply inbox refused): the message
+  JSON plus an `UNCONFIRMED` warning that inbox messages are not stored, and exit 0.
+- The broker refuses the publish (ACL): `NOT DELIVERED`, exit 1. Before this change the refusal was silent too.
+
+The audit record on `KANNAKA.inbox.audit` gains a `delivery` field (`listener`, `no_listener`,
+`unconfirmed` or `denied`). `--wait` behaves exactly as before.
+
+The hand-rolled NATS client now parses `HMSG`, strips the header block and exposes its status code.
+The opt-in lives only on the new short-lived `ProbingPublisher`, so no `SwarmTransport` request path
+sees a `503` where it used to see silence.
+
 ### Writes no longer run an O(n²) assessment after they land (#1061)
 
 `refresh_status_cache_counts` runs after every `remember`, `import`, `forget`, `forget_many` and
