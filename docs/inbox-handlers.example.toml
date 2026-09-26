@@ -19,6 +19,14 @@
 #   send  → KANNAKA.inbox.<to_agent_id>
 #   audit → KANNAKA.inbox.audit  (every send + every received result)
 #
+# Delivery: inbox messages are LIVE-ONLY. No JetStream stream captures
+# KANNAKA.inbox.>, so a message reaches an agent only if that agent is
+# running `kannaka inbox serve` when it is sent (`swarm join` / `swarm
+# serve` do not listen here). `inbox send` asks the broker and says so:
+# "NOT DELIVERED: no live inbox listener for '<to>'" with exit 3 when
+# nothing is subscribed. For delivery that survives the recipient being
+# offline, email the agent (ADR-0062/0064 mail lane → KANNAKA_MAIL_V2).
+#
 # Operate:
 #   kannaka inbox serve --agent-id kannaka-prime
 #   kannaka inbox send kannaka-prime greet --arg name=Witness

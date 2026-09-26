@@ -2,10 +2,31 @@
 //!
 //! Three subcommands:
 //!
-//!   kannaka inbox send <to> <verb> [--arg key=val ...] [--from <id>]
+//!   kannaka inbox send <to> <verb> [--arg key=val ...] [--from <id>] [--wait [secs]]
 //!     One-shot: publishes JSON `{from, to, verb, args, ts, msg_id}` to
 //!     `KANNAKA.inbox.<to>` and also fans out to `KANNAKA.inbox.audit`
-//!     so observers can watch the conversation live. Exits immediately.
+//!     so observers can watch the conversation live.
+//!
+//!     **Inbox messages are live-only and NOT stored.** No JetStream stream
+//!     captures `KANNAKA.inbox.>`; the only reader is an `inbox serve` daemon
+//!     subscribed to `KANNAKA.inbox.<to>` at the moment of sending. An agent
+//!     that runs `swarm join`/`swarm serve` but not `inbox serve` receives
+//!     nothing, and the message is gone. So without `--wait` the send asks
+//!     the broker (NATS no-responders) whether anything was subscribed:
+//!       - nothing subscribed → "NOT DELIVERED", exit 3, nothing printed on
+//!         stdout;
+//!       - a subscriber got it → the message JSON on stdout, exit 0 (this
+//!         proves a subscriber received it, not that a handler ran, and a
+//!         wildcard observer on `KANNAKA.inbox.>` counts as a subscriber;
+//!         use `--wait` for the handler's reply);
+//!       - broker could not say (old server, reply inbox refused) → the
+//!         message JSON on stdout plus an UNCONFIRMED warning, exit 0;
+//!       - broker refused the publish (ACL) → exit 1.
+//!     For delivery that survives the recipient being offline, email the
+//!     agent: the ADR-0062/0064 mail lane lands it on
+//!     `KANNAKA.mail.<slug>.inbound`, retained in stream `KANNAKA_MAIL_V2`.
+//!     `--wait` is unchanged: it waits for the handler's reply (exit 2 when
+//!     none arrives in time).
 //!
 //!   kannaka inbox serve [--agent-id <id>] [--handlers <path>]
 //!     Daemon: subscribes to `KANNAKA.inbox.<agent_id>`. For each incoming
@@ -48,7 +69,90 @@ use super::KannakaConfig;
 #[cfg(feature = "nats")]
 use super::{flag_value, resolve_nats_url};
 #[cfg(feature = "nats")]
-use kannaka_memory::nats::SubEvent;
+use kannaka_memory::nats::{ListenerProbe, SubEvent};
+
+/// How long `inbox send` waits for the broker to say whether anyone is
+/// subscribed. The answer normally comes back in one round trip (the probe's
+/// PING/PONG barrier); this only bounds a slow or silent server.
+#[cfg(feature = "nats")]
+const DELIVERY_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Exit code for "the broker says nobody is listening — message dropped".
+/// Distinct from 1 (errors) and 2 (`--wait` timed out).
+#[cfg(feature = "nats")]
+const EXIT_NOT_DELIVERED: i32 = 3;
+
+/// Where to send something that must survive the recipient being offline.
+/// `kannaka mail send` is ADR-0064 P2 and not shipped yet, so point at the
+/// lane that exists: the agent's mailbox, which the ADR-0062 membrane puts on
+/// the bus durably.
+#[cfg(feature = "nats")]
+const DURABLE_HINT: &str = "for durable delivery, email the agent instead: the ADR-0062/0064 mail lane \
+    puts it on KANNAKA.mail.<slug>.inbound, retained in stream KANNAKA_MAIL_V2 (`kannaka mail send` is not shipped yet; \
+    tools/mail/agent-mail.py send works today)";
+
+/// What `inbox send` (no `--wait`) tells the sender, derived purely from the
+/// broker's answer so it can be tested without a server.
+#[cfg(feature = "nats")]
+#[derive(Debug, PartialEq, Eq)]
+struct SendReport {
+    /// Process exit code.
+    exit_code: i32,
+    /// Audit-record `delivery` value.
+    delivery: &'static str,
+    /// Print the message JSON on stdout (the historical success output)?
+    print_payload: bool,
+    /// Lines for stderr.
+    notice: Vec<String>,
+}
+
+#[cfg(feature = "nats")]
+fn send_report(to: &str, msg_id: &str, probe: &ListenerProbe) -> SendReport {
+    let subject = format!("KANNAKA.inbox.{to}");
+    match probe {
+        ListenerProbe::Listening => SendReport {
+            exit_code: 0,
+            delivery: "listener",
+            print_payload: true,
+            notice: vec![format!(
+                "[inbox send] delivered msg {msg_id} to a live subscriber on {subject} \
+                 (receipt only, not handling: add --wait to get the handler's reply)"
+            )],
+        },
+        ListenerProbe::NoListener => SendReport {
+            exit_code: EXIT_NOT_DELIVERED,
+            delivery: "no_listener",
+            print_payload: false,
+            notice: vec![
+                format!(
+                    "[inbox send] NOT DELIVERED: no live inbox listener for '{to}'. Nothing is subscribed to \
+                     {subject} and inbox messages are not stored, so msg {msg_id} was dropped."
+                ),
+                format!("[inbox send] '{to}' must be running `kannaka inbox serve` to receive inbox messages."),
+                format!("[inbox send] {DURABLE_HINT}"),
+            ],
+        },
+        ListenerProbe::Denied(reason) => SendReport {
+            exit_code: 1,
+            delivery: "denied",
+            print_payload: false,
+            notice: vec![format!("[inbox send] NOT DELIVERED: {reason}")],
+        },
+        ListenerProbe::Unconfirmed(reason) => SendReport {
+            exit_code: 0,
+            delivery: "unconfirmed",
+            print_payload: true,
+            notice: vec![
+                format!("[inbox send] WARNING: delivery of msg {msg_id} is UNCONFIRMED: {reason}."),
+                format!(
+                    "[inbox send] inbox messages are live-only and not stored: if '{to}' is not running \
+                     `kannaka inbox serve` right now, it is lost."
+                ),
+                format!("[inbox send] {DURABLE_HINT}"),
+            ],
+        },
+    }
+}
 
 /// Reply subjects the `--wait` sender actually subscribes to. `inbox serve`
 /// refuses to publish handler output anywhere else — a forged `reply_to`
@@ -174,8 +278,9 @@ fn render_cmd(
 ///
 /// With `--wait` the sender subscribes to a unique reply subject BEFORE
 /// publishing, then blocks until the handler's response (or timeout)
-/// arrives there. Without `--wait` the send is fire-and-forget — the
-/// only visibility is the audit subject.
+/// arrives there. Without `--wait` the publish carries a NATS reply inbox on
+/// a no-responders connection, so the broker reports whether any subscriber
+/// existed; see `send_report` for what the sender is told.
 #[cfg(feature = "nats")]
 pub(crate) fn handle_inbox_send(cfg: &KannakaConfig, args: &[String]) {
     use std::time::Duration;
@@ -229,6 +334,10 @@ pub(crate) fn handle_inbox_send(cfg: &KannakaConfig, args: &[String]) {
         }
     }
     let nats_url = resolve_nats_url(args, 0, &cfg.swarm.nats_url);
+    if wait_secs.is_none() {
+        send_probed(&nats_url, &from, &to, &verb, arg_map);
+        return;
+    }
     let transport = match kannaka_memory::nats::SwarmTransport::connect(&nats_url) {
         Ok(t) => t,
         Err(e) => {
@@ -322,6 +431,73 @@ pub(crate) fn handle_inbox_send(cfg: &KannakaConfig, args: &[String]) {
     }
 
     println!("{}", serde_json::to_string(&payload_obj).unwrap_or_default());
+}
+
+/// `inbox send` without `--wait`: publish with a delivery probe and tell the
+/// sender what the broker said.
+#[cfg(feature = "nats")]
+fn send_probed(
+    nats_url: &str,
+    from: &str,
+    to: &str,
+    verb: &str,
+    arg_map: serde_json::Map<String, serde_json::Value>,
+) {
+    let mut publisher = match kannaka_memory::nats::ProbingPublisher::connect(nats_url) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("NATS connect failed at {nats_url}: {e}");
+            process::exit(1);
+        }
+    };
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let ts = chrono::Utc::now().to_rfc3339();
+    let payload_obj = serde_json::json!({
+        "msg_id": msg_id,
+        "from": from,
+        "to": to,
+        "verb": verb,
+        "args": arg_map,
+        "ts": ts,
+    });
+    let payload_bytes = serde_json::to_vec(&payload_obj).unwrap_or_default();
+    let directed_subject = format!("KANNAKA.inbox.{to}");
+    let probe =
+        match publisher.publish_probing(&directed_subject, &payload_bytes, DELIVERY_PROBE_WINDOW) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("publish {directed_subject}: {e}");
+                process::exit(1);
+            }
+        };
+    let report = send_report(to, &msg_id, &probe);
+    // Audit fan-out (so tail watchers see the outbound — and whether it
+    // actually reached anyone).
+    let audit = serde_json::json!({
+        "ts": ts,
+        "phase": "sent",
+        "delivery": report.delivery,
+        "msg_id": msg_id,
+        "from": from,
+        "to": to,
+        "verb": verb,
+        "args": payload_obj["args"],
+    });
+    let audit_bytes = serde_json::to_vec(&audit).unwrap_or_default();
+    let _ = publisher.publish("KANNAKA.inbox.audit", &audit_bytes);
+
+    for line in &report.notice {
+        eprintln!("{line}");
+    }
+    if report.print_payload {
+        println!(
+            "{}",
+            serde_json::to_string(&payload_obj).unwrap_or_default()
+        );
+    }
+    if report.exit_code != 0 {
+        process::exit(report.exit_code);
+    }
 }
 
 /// ----------------------------------------------------------------------
@@ -621,4 +797,72 @@ pub(crate) fn handle_inbox_serve(_cfg: &KannakaConfig, _args: &[String]) {
 pub(crate) fn handle_inbox_tail(_cfg: &KannakaConfig, _args: &[String]) {
     eprintln!("inbox tail requires the `nats` feature");
     process::exit(1);
+}
+
+#[cfg(all(test, feature = "nats"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_listener_is_reported_as_not_delivered() {
+        // The 2026-09-26 incident: 0xSCADA-QE -> SpaceChild, which runs swarm
+        // join + swarm serve but not inbox serve. The broker answers 503.
+        let r = send_report("SpaceChild", "4d857926", &ListenerProbe::NoListener);
+        assert_eq!(r.exit_code, EXIT_NOT_DELIVERED);
+        assert_ne!(r.exit_code, 0);
+        assert_eq!(r.delivery, "no_listener");
+        assert!(
+            !r.print_payload,
+            "a dropped message must not print the success JSON"
+        );
+        let all = r.notice.join("\n");
+        assert!(
+            all.contains("NOT DELIVERED: no live inbox listener for 'SpaceChild'"),
+            "{all}"
+        );
+        assert!(all.contains("msg 4d857926 was dropped"), "{all}");
+        assert!(all.contains("kannaka inbox serve"), "{all}");
+        assert!(
+            all.contains("KANNAKA_MAIL_V2"),
+            "must point at the durable lane: {all}"
+        );
+    }
+
+    #[test]
+    fn listener_is_success_but_says_receipt_not_handling() {
+        let r = send_report("kannaka", "m1", &ListenerProbe::Listening);
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.delivery, "listener");
+        assert!(r.print_payload);
+        let all = r.notice.join("\n");
+        assert!(
+            all.contains("delivered msg m1 to a live subscriber on KANNAKA.inbox.kannaka"),
+            "{all}"
+        );
+        assert!(all.contains("--wait"), "{all}");
+    }
+
+    #[test]
+    fn unconfirmed_warns_and_never_claims_delivery() {
+        let r = send_report("x", "m2", &ListenerProbe::Unconfirmed("old server".into()));
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.delivery, "unconfirmed");
+        assert!(r.print_payload, "published, so keep the historical stdout");
+        let all = r.notice.join("\n");
+        assert!(all.contains("UNCONFIRMED: old server"), "{all}");
+        assert!(all.contains("not stored"), "{all}");
+        assert!(!all.contains("delivered msg"), "{all}");
+    }
+
+    #[test]
+    fn denied_publish_fails() {
+        let r = send_report(
+            "x",
+            "m3",
+            &ListenerProbe::Denied("broker refused publish".into()),
+        );
+        assert_eq!(r.exit_code, 1);
+        assert!(!r.print_payload);
+        assert!(r.notice[0].contains("NOT DELIVERED: broker refused publish"));
+    }
 }
