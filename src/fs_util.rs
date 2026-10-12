@@ -20,6 +20,71 @@
 
 use std::path::Path;
 
+/// Deletes `path` when dropped unless [`TmpGuard::disarm`] was called.
+///
+/// A store save writes `<name>.tmp.<pid>.<nanos>` and renames it over the
+/// target. Every `?` between create and rename used to return with the temp
+/// still on disk. On a full disk that is self-perpetuating: each failed save
+/// leaves another temp, and the orphan sweep only ran after a SUCCESSFUL save,
+/// so nothing ever reclaimed them (debain2 2026-10-10..12: 61 orphans, 13.9 GB,
+/// the root disk at 100% for ~36 h and every citizen cycle failing ENOSPC).
+pub(crate) struct TmpGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl TmpGuard {
+    pub(crate) fn new(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), armed: true }
+    }
+
+    /// The temp was renamed into place: keep it.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Remove `<file name>.tmp.*` siblings of `path` last modified more than
+/// `min_age` ago. A save takes seconds, so an old one is a dead writer's
+/// orphan; a fresh one may be another writer's save in flight and is left
+/// alone. Best effort: errors are ignored. Call it BEFORE writing too, so a
+/// disk filled by orphans can recover on the next save instead of failing it.
+pub(crate) fn sweep_stale_tmps(path: &Path, min_age: std::time::Duration) -> usize {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|s| s.to_str())) else {
+        return 0;
+    };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefix = format!("{name}.tmp.");
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| now.duration_since(t).map(|d| d > min_age).unwrap_or(false))
+            .unwrap_or(false);
+        if old && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// How old a store temp must be before a sweep treats it as an orphan.
+pub(crate) const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Write `bytes` to `path` atomically: UUID-named temp sibling in the same
 /// directory (same-filesystem rename is an atomic swap) → `write_all` →
 /// `sync_all` → rename over the target. A reader always sees either the old
@@ -245,6 +310,54 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kannaka-fsutil-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn age(p: &std::path::Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs)).unwrap();
+    }
+
+    /// The sweep takes old orphans of THIS file only, and never a fresh temp
+    /// that could be another writer's save in flight.
+    #[test]
+    fn the_sweep_takes_old_orphans_and_spares_fresh_temps_and_neighbours() {
+        let d = temp_dir("sweep");
+        let target = d.join("kannaka.hrm");
+        std::fs::write(&target, b"store").unwrap();
+        let old = d.join("kannaka.hrm.tmp.111.222");
+        let fresh = d.join("kannaka.hrm.tmp.333.444");
+        let other_old = d.join("other.hrm.tmp.555.666");
+        for p in [&old, &fresh, &other_old] {
+            std::fs::write(p, b"partial").unwrap();
+        }
+        age(&old, 600);
+        age(&other_old, 600);
+        assert_eq!(sweep_stale_tmps(&target, STALE_TMP_AGE), 1);
+        assert!(!old.exists(), "an old orphan must go");
+        assert!(fresh.exists(), "a fresh temp may be a save in flight");
+        assert!(other_old.exists(), "another file's temp is not ours to take");
+        assert!(target.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The guard removes its temp unless disarmed, so a failed save leaves nothing.
+    #[test]
+    fn the_guard_removes_its_temp_unless_disarmed() {
+        let d = temp_dir("guard");
+        let a = d.join("a.tmp");
+        let b = d.join("b.tmp");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        {
+            let _g = TmpGuard::new(&a);
+        }
+        {
+            let mut g = TmpGuard::new(&b);
+            g.disarm();
+        }
+        assert!(!a.exists(), "an armed guard deletes its temp on drop");
+        assert!(b.exists(), "a disarmed guard leaves the file alone");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -498,6 +498,11 @@ impl ChiralMedium {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let tmp_path = path_ref.with_extension(format!("hrm.tmp.{pid}.{nanos}"));
+        // Reclaim dead writers' orphans BEFORE writing, so a disk they filled
+        // recovers on this save instead of failing it; and remove our own temp
+        // on every failure path below (fs_util::TmpGuard).
+        crate::fs_util::sweep_stale_tmps(path_ref, crate::fs_util::STALE_TMP_AGE);
+        let mut tmp_guard = crate::fs_util::TmpGuard::new(&tmp_path);
         let file = File::create(&tmp_path)?;
         let mut w = BufWriter::new(file);
 
@@ -590,6 +595,7 @@ impl ChiralMedium {
         drop(file);
 
         std::fs::rename(&tmp_path, path_ref)?;
+        tmp_guard.disarm();
 
         // Sweep orphaned tmp files. The per-pid/nanos tmp names above avoid
         // concurrent-save corruption, but interrupted or concurrent saves (a
@@ -599,28 +605,8 @@ impl ChiralMedium {
         // 100% on 2026-06-18 (SQLITE_CANTOPEN cascade). A save takes seconds, so
         // any sibling tmp older than 5 min is a dead orphan; never delete a
         // fresh one (it could be another writer's in-flight save).
-        if let (Some(dir), Some(stem)) = (
-            path_ref.parent(),
-            path_ref.file_name().and_then(|s| s.to_str()),
-        ) {
-            let tmp_prefix = format!("{stem}.tmp.");
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                let now = std::time::SystemTime::now();
-                for entry in entries.flatten() {
-                    if !entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
-                        continue;
-                    }
-                    let old = entry
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .map(|t| now.duration_since(t).map(|d| d.as_secs() > 300).unwrap_or(false))
-                        .unwrap_or(false);
-                    if old {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
+        // (Now also run before the write, and shared with the v1 save.)
+        crate::fs_util::sweep_stale_tmps(path_ref, crate::fs_util::STALE_TMP_AGE);
 
         Ok(())
     }

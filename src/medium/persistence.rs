@@ -34,6 +34,10 @@ impl Medium {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let tmp_path = path_ref.with_extension(format!("hrm.tmp.{pid}.{nanos}"));
+        // Same orphan handling as the chiral save: sweep dead writers' temps
+        // first, and never leave our own behind on a failed save.
+        crate::fs_util::sweep_stale_tmps(path_ref, crate::fs_util::STALE_TMP_AGE);
+        let mut tmp_guard = crate::fs_util::TmpGuard::new(&tmp_path);
         let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
 
@@ -114,6 +118,7 @@ impl Medium {
 
         // Atomic rename: tmp → final (data + checksum are both present, no gap)
         std::fs::rename(&tmp_path, path_ref)?;
+        tmp_guard.disarm();
 
         Ok(())
     }
