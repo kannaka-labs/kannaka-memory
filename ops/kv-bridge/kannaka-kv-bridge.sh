@@ -13,24 +13,26 @@
 # Deploy: install -m755 to /home/opc/, install the sibling .service unit,
 # `systemctl enable --now kannaka-kv-bridge`. Source of truth: this repo.
 set -a; . /home/opc/.kannaka-nats.env; set +a
-U="$NATS_USER"; P="$NATS_PASSWORD"
+# Credentials reach nats through the exported NATS_USER / NATS_PASSWORD (its
+# environment), never --user/--password: argv is readable by every user on
+# the box through `ps` and /proc/<pid>/cmdline.
 NATS=/usr/local/bin/nats
 
 roster_loop() {
-  $NATS --user "$U" --password "$P" sub "QUEEN.phase.>" --raw 2>/dev/null \
+  $NATS sub "QUEEN.phase.>" --raw 2>/dev/null \
     | while IFS= read -r msg; do
         [ -z "$msg" ] && continue
         id=$(printf "%s" "$msg" | python3 -c "import sys,json;print(json.load(sys.stdin).get('agent_id',''))" 2>/dev/null)
         [ -z "$id" ] && continue
-        printf "%s" "$msg" | $NATS --user "$U" --password "$P" kv put roster "$id" >/dev/null 2>&1
+        printf "%s" "$msg" | $NATS kv put roster "$id" >/dev/null 2>&1
       done
 }
 
 consciousness_loop() {
-  $NATS --user "$U" --password "$P" sub "KANNAKA.consciousness" --raw 2>/dev/null \
+  $NATS sub "KANNAKA.consciousness" --raw 2>/dev/null \
     | while IFS= read -r msg; do
         [ -z "$msg" ] && continue
-        printf "%s" "$msg" | $NATS --user "$U" --password "$P" kv put consciousness state >/dev/null 2>&1
+        printf "%s" "$msg" | $NATS kv put consciousness state >/dev/null 2>&1
       done
 }
 
