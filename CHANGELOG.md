@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.16.17] — 2026-10-23
+
+### The recall observation pass computes its Gram matrix in parallel, bit-identically (#1114)
+
+Every `recall` observes the field it just read (`observe_wavefronts` → `apply_dynamics` → `compute_interference_matrix` → `gram_matrix`), and that Gram was a single-threaded N×10,000 product. On the debain2 citizens' stores (5,871–7,142 rows) it took 13–18 s of a 26–36 s recall, so the citizens' 30 s recall timeout was killing recall and answers went out with no memory. `gram_symmetric_parallel` computes the upper triangle in 256-row rayon blocks, one matrixmultiply call per block, and mirrors it; results are bit-identical to the plain product (test `gram_symmetric_parallel_matches_plain_product_exactly`, N = 5 / 513 / 777; a diagonal-drop mutant fails it). Measured on store copies: 26.5 → 10.1 s (kannaka), 35.9 → 10.8 s (gossipghost), same top-5 every time. `KANNAKA_RECALL_OBSERVE=0` still skips observation entirely (~3 s) where a deployment chooses to.
+
+### kv-bridge passes NATS credentials through the environment, not argv (#1113)
+
+The bridge ran its `nats` commands with `--user/--password`, which put the password in the process table on O1. The script already exports `NATS_USER`/`NATS_PASSWORD` from its env file and the nats CLI reads them, so the flags are gone; the repo copy now matches what has run on O1 since 2026-10-16.
+
 ## [0.16.16] — 2026-10-12
 
 ### A store save never leaves its temp file behind, and orphaned temps are swept before the save as well as after (#1111)
