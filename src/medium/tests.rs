@@ -2099,6 +2099,31 @@ fn gram_matrix_is_sized_by_live_count_not_capacity() {
     assert_eq!(g.ncols(), n, "gram cols must equal the live count");
 }
 
+// km-recall-latency (2026-10-23): the observation side-effect computes the
+// Gram matrix once per recall; `gram_symmetric_parallel` must return exactly
+// what the single `h.dot(&h.t())` returned, bit for bit, at sizes that take
+// the parallel path (N >= 2 blocks) and with a ragged last block.
+#[test]
+fn gram_symmetric_parallel_matches_plain_product_exactly() {
+    use rand::{Rng, SeedableRng};
+    for &(n, dim) in &[(5usize, 64usize), (513, 97), (777, 300)] {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(n as u64 * 31 + dim as u64);
+        let h = ndarray::Array2::<f32>::from_shape_fn((n, dim), |_| rng.gen_range(-1.0f32..1.0));
+        let fast = super::dynamics::gram_symmetric_parallel(&h.view());
+        let plain = h.dot(&h.t());
+        assert_eq!(fast.dim(), plain.dim(), "n={n}: shape");
+        let mut worst = 0.0f32;
+        for i in 0..n {
+            for j in 0..n {
+                let (a, b) = (fast[[i, j]], plain[[i, j]]);
+                worst = worst.max((a - b).abs());
+                assert_eq!(fast[[i, j]], fast[[j, i]], "n={n}: ({i},{j}) not symmetric");
+            }
+        }
+        assert_eq!(worst, 0.0, "n={n} dim={dim}: max |fast - plain| = {worst} (expected bit-identical)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #825 — degeneracy tests for the published consciousness metrics.
 //

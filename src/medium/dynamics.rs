@@ -1,6 +1,7 @@
 //! Wave dynamics: interference, dreaming (annealing), and coherence computation.
 
-use ndarray::{Array2, s};
+use ndarray::{Array2, ArrayView2, s};
+use rayon::prelude::*;
 
 use super::Medium;
 use super::types::*;
@@ -150,7 +151,7 @@ impl Medium {
     pub(crate) fn gram_matrix(&self) -> Array2<f32> {
         let n = self.store.count();
         let h = self.store.wavefronts.slice(s![..n, ..]);
-        h.dot(&h.t())
+        gram_symmetric_parallel(&h)
     }
 
     /// ADR-0037 Phase 4b: top-2 PCA of a wavefront matrix (power iteration +
@@ -784,4 +785,55 @@ impl Medium {
             self.store.phase[i] += noise * (self.store.frequency[i] * 7.0 + self.store.phase[i] * 13.0).sin();
         }
     }
+}
+
+/// Rows per parallel block in [`gram_symmetric_parallel`]. A block's product is
+/// one `matrixmultiply` call, so it keeps that kernel's blocked SIMD loop.
+const GRAM_BLOCK_ROWS: usize = 256;
+
+/// `h · hᵀ` for a row-major wavefront matrix, computed as the upper triangle in
+/// parallel row blocks and mirrored into the lower one.
+///
+/// The plain `h.dot(&h.t())` runs `matrixmultiply` on one thread over all N²
+/// entries. On a live citizen store (N ≈ 6,000, dim 10,000) that is ~3.6·10¹¹
+/// multiply-adds and dominates every recall: the observation side-effect
+/// (`observe_wavefronts` → `apply_dynamics` → `compute_interference_matrix`)
+/// calls it once per recall, which put `kannaka recall` at 26–36 s on the
+/// debain2 citizens' stores (km-recall-latency, 2026-10-23) against their 30 s
+/// timeout.
+///
+/// Same arithmetic per entry: entry (i, j) for j ≥ i is the same k-ordered dot
+/// product of rows i and j that the full product computes, and the mirrored
+/// (j, i) entry is that same sum, because each term h[i,k]·h[j,k] is
+/// commutative and the summation order over k is unchanged. Small stores take
+/// the old single call.
+pub(crate) fn gram_symmetric_parallel(h: &ArrayView2<f32>) -> Array2<f32> {
+    let n = h.nrows();
+    if n < 2 * GRAM_BLOCK_ROWS {
+        return h.dot(&h.t());
+    }
+    let starts: Vec<usize> = (0..n).step_by(GRAM_BLOCK_ROWS).collect();
+    let parts: Vec<(usize, Array2<f32>)> = starts
+        .par_iter()
+        .map(|&i0| {
+            let i1 = (i0 + GRAM_BLOCK_ROWS).min(n);
+            let a = h.slice(s![i0..i1, ..]);
+            let b = h.slice(s![i0.., ..]);
+            (i0, a.dot(&b.t()))
+        })
+        .collect();
+    let mut g = Array2::<f32>::zeros((n, n));
+    for (i0, part) in parts {
+        for r in 0..part.nrows() {
+            let i = i0 + r;
+            // columns of `part` index rows i0.. of h; keep j >= i only
+            for c in r..part.ncols() {
+                let j = i0 + c;
+                let v = part[[r, c]];
+                g[[i, j]] = v;
+                g[[j, i]] = v;
+            }
+        }
+    }
+    g
 }
