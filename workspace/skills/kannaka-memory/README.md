@@ -61,7 +61,7 @@ This also installs the `flux` dependency skill.
 ```bash
 # On your OpenClaw host
 mkdir -p ~/workspace/skills
-git clone https://github.com/NickFlach/kannaka-memory.git
+git clone https://github.com/kannaka-labs/kannaka-memory.git
 cp -r kannaka-memory/workspace/skills/kannaka-memory ~/workspace/skills/
 
 # Build the CLI binary (choose the feature set you need)
@@ -288,7 +288,7 @@ The `/kannaka` skill provides direct Claude Code integration:
 
 ## Source
 
-- **Repository:** https://github.com/NickFlach/kannaka-memory
+- **Repository:** https://github.com/kannaka-labs/kannaka-memory
 - **License:** MIT
 - **Built on:** [ghostmagicOS](https://github.com/NickFlach/ghostmagicOS)
 
