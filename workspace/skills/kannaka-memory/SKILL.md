@@ -117,7 +117,7 @@ metadata:
       - id: kannaka-binary
         kind: manual
         label: "Clone and build: cargo build --release --features audio,glyph,collective --bin kannaka"
-        url: "https://github.com/NickFlach/kannaka-memory"
+        url: "https://github.com/kannaka-labs/kannaka-memory"
 ---
 
 # Kannaka Memory Skill
@@ -130,7 +130,7 @@ when contextually relevant, and can be versioned and shared via DoltHub.
 **Option A — Binary (recommended):**
 - Build and install the `kannaka` CLI and `kannaka-mcp` server from source:
   ```bash
-  git clone https://github.com/NickFlach/kannaka-memory.git
+  git clone https://github.com/kannaka-labs/kannaka-memory.git
   cd kannaka-memory
   # CLI (standard)
   cargo build --release --bin kannaka
