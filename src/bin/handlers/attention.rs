@@ -86,6 +86,7 @@ pub(crate) fn handle_attention_serve(
     };
 
     eprintln!("[attention serve] subject={subject} top_k={top_k}");
+    super::warn_if_hash_adopted(sys);
     eprintln!("[attention serve] landmarks=KANNAKA.exemplar.>  (best-effort)");
     eprintln!("[attention serve] nats={nats_url} press Ctrl+C to stop");
 

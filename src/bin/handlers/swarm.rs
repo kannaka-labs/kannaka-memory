@@ -182,6 +182,7 @@ pub(crate) fn handle_swarm_serve(
     let llm_ok = kannaka_memory::agent::llm_available(cfg);
 
     eprintln!("[swarm serve] agent_id={agent_id}");
+    super::warn_if_hash_adopted(sys);
     match prompt_arm {
         Some(arm) => eprintln!("[swarm serve] prompt arm: {}", arm.name()),
         None => eprintln!(

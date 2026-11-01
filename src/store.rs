@@ -469,7 +469,7 @@ pub fn phi_span_score(span: u8) -> f32 {
 /// The pipeline field is kept for compatibility callers that need raw encoding.
 pub struct ResonanceEngine {
     pub store: Box<dyn MediumBackend>,
-    pub(crate) pipeline: EncodingPipeline,
+    pub pipeline: EncodingPipeline,
     /// Legacy — kept for callers that check it. Not used by core paths.
     pub similarity_threshold: f32,
 }

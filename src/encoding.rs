@@ -30,16 +30,35 @@ pub trait TextEncoder: Send + Sync {
     fn embedding_dim(&self) -> usize;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashVariant {
+    Standard, // hash
+    Cleaned,  // hash2
+}
+
 /// A fast, deterministic hash-based encoder for testing.
 /// Tokenizes on whitespace, hashes each token to a vector, then bundles.
 pub struct SimpleHashEncoder {
     dim: usize,
     seed: u64,
+    variant: HashVariant,
 }
 
 impl SimpleHashEncoder {
     pub fn new(dim: usize, seed: u64) -> Self {
-        Self { dim, seed }
+        Self {
+            dim,
+            seed,
+            variant: HashVariant::Standard,
+        }
+    }
+
+    pub fn new_cleaned(dim: usize, seed: u64) -> Self {
+        Self {
+            dim,
+            seed,
+            variant: HashVariant::Cleaned,
+        }
     }
 
     /// Deterministic hash-based vector for a single token.
@@ -73,7 +92,19 @@ impl SimpleHashEncoder {
 
 impl TextEncoder for SimpleHashEncoder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EncodingError> {
-        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let tokens: Vec<String> = if self.variant == HashVariant::Cleaned {
+            text.split_whitespace()
+                .map(|t| {
+                    t.to_lowercase()
+                        .trim_matches(|c: char| c.is_ascii_punctuation())
+                        .to_string()
+                })
+                .filter(|t| !t.is_empty())
+                .collect()
+        } else {
+            text.split_whitespace().map(|t| t.to_string()).collect()
+        };
+
         if tokens.is_empty() {
             return Err(EncodingError::EmptyInput);
         }
@@ -297,6 +328,8 @@ impl TextEncoder for CompositeEncoder {
 pub struct EncodingPipeline {
     encoder: Box<dyn TextEncoder>,
     codebook: Codebook,
+    pub stamp: String,
+    pub adopted: bool,
 }
 
 impl EncodingPipeline {
@@ -306,7 +339,18 @@ impl EncodingPipeline {
             codebook.input_dim,
             "encoder dim must match codebook input dim"
         );
-        Self { encoder, codebook }
+        Self {
+            encoder,
+            codebook,
+            stamp: "unknown".to_string(),
+            adopted: false,
+        }
+    }
+
+    pub fn with_metadata(mut self, stamp: String, adopted: bool) -> Self {
+        self.stamp = stamp;
+        self.adopted = adopted;
+        self
     }
 
     /// Access the codebook.
@@ -535,5 +579,32 @@ mod tests {
         assert!(mem.amplitude > 0.0);
         let norm: f32 = mem.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_hash2_tokenizer_normalization() {
+        let dim = 384;
+        let seed = 42;
+        let h1 = SimpleHashEncoder::new(dim, seed);
+        let h2 = SimpleHashEncoder::new_cleaned(dim, seed);
+
+        // Standard hash is case-sensitive and punctuation-sensitive
+        let v_word = h1.embed("Word").unwrap();
+        let v_lower = h1.embed("word").unwrap();
+        let v_punct = h1.embed("word.").unwrap();
+        assert_ne!(v_word, v_lower);
+        assert_ne!(v_lower, v_punct);
+
+        // hash2 (Cleaned) is case-insensitive and ignores trailing punctuation
+        let v2_word = h2.embed("Word").unwrap();
+        let v2_lower = h2.embed("word").unwrap();
+        let v2_punct = h2.embed("word.").unwrap();
+
+        assert_eq!(v2_word, v2_lower, "Word and word should hash equal under hash2");
+        assert_eq!(v2_lower, v2_punct, "word and word. should hash equal under hash2");
+
+        // Leading punctuation and multiple punctuation
+        let v2_multi = h2.embed("...Word...").unwrap();
+        assert_eq!(v2_lower, v2_multi, "word and ...Word... should hash equal under hash2");
     }
 }
