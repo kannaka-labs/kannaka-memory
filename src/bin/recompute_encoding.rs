@@ -58,6 +58,11 @@ fn encoder_dim() -> usize {
         .unwrap_or(DEFAULT_DIM)
 }
 
+/// The `.encoder` stamp for the strict (ollama) pipeline this tool builds.
+fn encoder_stamp(model: &str, dim: usize) -> String {
+    format!("ollama:{model}:{dim}")
+}
+
 /// Probe the endpoint we are ACTUALLY going to embed against, not a fixed one.
 fn embedder_reachable(url: &str) -> bool {
     ureq::get(&format!("{url}/api/tags"))
@@ -131,6 +136,8 @@ fn main() {
 
     let (url, model, dim) = (encoder_url(), encoder_model(), encoder_dim());
     eprintln!("encoder: {model} @ {url} ({dim}d)");
+    // Computed before `model` moves into the pipeline (#1116 part 3).
+    let new_stamp = encoder_stamp(&model, dim);
 
     // Up-front probe so the common failure is a clean refusal rather than a
     // half-finished corpus. It is NOT the real guarantee: it proves the embedder
@@ -158,13 +165,32 @@ fn main() {
         std::process::exit(1);
     });
 
-    match store.recompute_encoding(dry_run) {
+    // TODO(#1116 part 4): batch the embeds through Ollama's `/api/embed` with an
+    // array `input`; `OllamaEncoder` only has a single-string path today.
+    let started = std::time::Instant::now();
+    let mut progress = |done: usize, total: usize| {
+        eprintln!("progress: {done}/{total} rows, {:.1}s elapsed", started.elapsed().as_secs_f64());
+    };
+    match store.recompute_encoding_with_progress(dry_run, &mut progress) {
         Ok((scanned, updated)) => {
             if dry_run {
                 eprintln!("[dry-run] would re-encode {updated} of {scanned} memories (text only)");
             } else {
                 eprintln!("Re-encoded {updated} of {scanned} memories through the current pipeline");
                 eprintln!("Cluster sidecar invalidated; verify recall before rolling out further.");
+                // #1116 part 3: the vectors changed, so the stamp must too —
+                // otherwise every later open adopts the old one.
+                match kannaka_memory::write_encoder_stamp(&data_dir, &new_stamp) {
+                    Ok(old) => eprintln!(
+                        ".encoder stamp: old={} new={new_stamp}",
+                        old.as_deref().unwrap_or("(none)")
+                    ),
+                    Err(e) => {
+                        eprintln!("Error: vectors rewritten but .encoder stamp NOT updated: {e}");
+                        eprintln!("Set {}/.encoder to '{new_stamp}' by hand.", data_dir.display());
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Err(e) => {
@@ -176,7 +202,7 @@ fn main() {
 
 #[cfg(test)]
 mod invocation_tests {
-    use super::{parse_invocation, Invocation};
+    use super::{encoder_stamp, parse_invocation, Invocation};
     use std::path::PathBuf;
 
     fn argv(rest: &[&str]) -> Vec<String> {
@@ -214,5 +240,22 @@ mod invocation_tests {
             parse_invocation(&argv(&["--dry-run", "/data"])),
             Invocation::Run { dry_run: true, data_dir: Some(PathBuf::from("/data")) }
         );
+    }
+
+    #[test]
+    fn stamp_is_rewritten_atomically_and_reports_the_old_one() {
+        let dir = std::env::temp_dir().join(format!("kannaka-recompute-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".encoder"), "hash:384:42
+").unwrap();
+        let new = encoder_stamp("all-minilm", 384);
+        let old = kannaka_memory::write_encoder_stamp(&dir, &new).unwrap();
+        assert_eq!(old.as_deref(), Some("hash:384:42"));
+        assert_eq!(std::fs::read_to_string(dir.join(".encoder")).unwrap(), "ollama:all-minilm:384");
+        // No stamp before: old is None, and no temp litter remains.
+        std::fs::remove_file(dir.join(".encoder")).unwrap();
+        assert_eq!(kannaka_memory::write_encoder_stamp(&dir, &new).unwrap(), None);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
