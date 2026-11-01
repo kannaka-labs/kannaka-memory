@@ -537,7 +537,14 @@ impl KannakaMemorySystem {
         std::fs::create_dir_all(&data_dir)?;
 
         let consolidation = ConsolidationEngine::default();
-        let dream_state = DreamState::default();
+        let mut dream_state = DreamState::default();
+        // #1063: verified (staged) consolidation, opt-in via
+        // KANNAKA_VERIFIED_CONSOLIDATION=off|staged|accept (unset = off, the
+        // in-place cycle unchanged). Set on dream_state.engine because that is
+        // the engine `dream()` runs; `self.consolidation` never consolidates.
+        dream_state.engine.verified = crate::consolidation::verified::VerifiedConsolidation::new(
+            crate::consolidation::verified::VerifiedMode::from_env(),
+        );
         let bridge = ConsciousnessBridge::new(0.3, 0.5);
         let kuramoto = KuramotoSync::default();
         let rhythm = RhythmEngine::new(&data_dir);
