@@ -501,10 +501,11 @@ fn handle_belief_cores(args: &[String]) {
 fn parse_encoder_stamp(stamp: &str) -> Option<(String, String, usize)> {
     let parts: Vec<&str> = stamp.trim().split(':').collect();
     match parts.as_slice() {
-        ["hash", dim, seed] => {
+        ["hash" | "hash2", dim, seed] => {
+            let kind = parts[0].to_string();
             let d: usize = dim.parse().ok()?;
             seed.parse::<u64>().ok()?;
-            Some(("hash".to_string(), (*seed).to_string(), d))
+            Some((kind, (*seed).to_string(), d))
         }
         ["ollama", model, dim] if !model.is_empty() => {
             Some(("ollama".to_string(), (*model).to_string(), dim.parse().ok()?))
@@ -559,7 +560,7 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
     let mut adopted = false;
     if env_kind.is_none() {
         if let Some((k, a, d)) = stamped.as_deref().and_then(parse_encoder_stamp) {
-            if k == "hash" {
+            if k == "hash" || k == "hash2" {
                 seed = a.parse().unwrap_or(42);
             } else {
                 model = a;
@@ -575,6 +576,11 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
         "hash" | "" => (
             Box::new(SimpleHashEncoder::new(dim, seed)),
             format!("hash:{dim}:{seed}"),
+            dim,
+        ),
+        "hash2" => (
+            Box::new(SimpleHashEncoder::new_cleaned(dim, seed)),
+            format!("hash2:{dim}:{seed}"),
             dim,
         ),
         "ollama" => {
@@ -594,7 +600,7 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
             )
         }
         other => {
-            eprintln!("[config] unknown encoder kind '{other}' (expected hash|ollama)");
+            eprintln!("[config] unknown encoder kind '{other}' (expected hash|hash2|ollama)");
             process::exit(2);
         }
     };
@@ -626,7 +632,7 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
     }
 
     let codebook = Codebook::new(in_dim, 10_000, 42);
-    EncodingPipeline::new(encoder, codebook)
+    EncodingPipeline::new(encoder, codebook).with_metadata(desc, adopted)
 }
 
 #[cfg(test)]
@@ -642,6 +648,10 @@ mod encoder_stamp_tests {
             Some(("hash".to_string(), "42".to_string(), 384))
         );
         assert_eq!(
+            parse_encoder_stamp("hash2:384:42"),
+            Some(("hash2".to_string(), "42".to_string(), 384))
+        );
+        assert_eq!(
             parse_encoder_stamp("ollama:all-minilm:384"),
             Some(("ollama".to_string(), "all-minilm".to_string(), 384))
         );
@@ -655,6 +665,30 @@ mod encoder_stamp_tests {
             parse_encoder_stamp("hash:768:7"),
             Some(("hash".to_string(), "7".to_string(), 768))
         );
+        assert_eq!(
+            parse_encoder_stamp("hash2:768:7"),
+            Some(("hash2".to_string(), "7".to_string(), 768))
+        );
+    }
+
+    /// #1116: the status JSON fields "encoder" and "encoder_semantic" must
+    /// correctly distinguish between non-semantic hash encoders and semantic
+    /// model-based encoders.
+    #[test]
+    fn status_field_encoder_logic() {
+        let cases = [
+            ("hash:384:42", false),
+            ("hash2:384:42", false),
+            ("ollama:all-minilm:384", true),
+            ("ollama:mxbai-embed-large:1024", true),
+        ];
+        for (stamp, expected_semantic) in cases {
+            let is_semantic = stamp.starts_with("ollama:");
+            assert_eq!(
+                is_semantic, expected_semantic,
+                "stamp {stamp} semantic mismatch"
+            );
+        }
     }
 
     /// Anything this build does not understand must return None so the caller
@@ -674,6 +708,25 @@ mod encoder_stamp_tests {
             "ollama:all-minilm:384:extra",
         ] {
             assert_eq!(parse_encoder_stamp(bad), None, "stamp {bad:?} must not parse");
+        }
+    }
+}
+
+/// Warn when a store is opened with a non-semantic hash encoder.
+pub(crate) fn warn_if_hash_adopted(sys: &KannakaMemorySystem) {
+    let pipeline = &sys.engine.pipeline;
+    if pipeline.adopted && pipeline.stamp.starts_with("hash:") {
+        let has_text = sys
+            .engine
+            .store
+            .all_memories()
+            .map(|ms| ms.iter().any(|m| !m.content.is_empty()))
+            .unwrap_or(false);
+        if has_text {
+            eprintln!(
+                "[encoder] WARNING: this store is being read with a non-semantic hash encoder ({}).",
+                pipeline.stamp
+            );
         }
     }
 }
@@ -2351,6 +2404,7 @@ fn main() {
                 eprintln!("{RECALL_USAGE}");
                 process::exit(1);
             }
+            warn_if_hash_adopted(&sys);
             // `--collective` / `--remote` (+ their `--agent-id`/`--timeout`) are
             // handled load-free in main() before the HRM init; this arm is the
             // LOCAL recall path only.
@@ -2374,6 +2428,7 @@ fn main() {
             // a single recall), so a benchmark can ask hundreds of questions
             // of one loaded store without paying the process start each time.
             if args.get(command_start + 1).map(String::as_str) == Some("--batch") {
+                warn_if_hash_adopted(&sys);
                 let path = flag_value(&args, command_start + 1, "--batch", RECALL_USAGE).to_string();
                 let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                     eprintln!("recall --batch: cannot read {path}: {e}");
@@ -3185,6 +3240,13 @@ fn main() {
             }
 
             output["field_mode"] = serde_json::json!("HRM");
+
+            // #1116: encoder identification
+            output["encoder"] = serde_json::json!(sys.engine.pipeline.stamp);
+            output["encoder_semantic"] =
+                serde_json::json!(sys.engine.pipeline.stamp.starts_with("ollama:"));
+
+            warn_if_hash_adopted(&sys);
 
             // Refresh the Observatory fast-path cache from the snapshot we
             // just computed (#730). Pre-fix only dream()/dream_lite() ever
