@@ -136,6 +136,8 @@ fn main() {
 
     let (url, model, dim) = (encoder_url(), encoder_model(), encoder_dim());
     eprintln!("encoder: {model} @ {url} ({dim}d)");
+    // Computed before `model` moves into the pipeline (#1116 part 3).
+    let new_stamp = encoder_stamp(&model, dim);
 
     // Up-front probe so the common failure is a clean refusal rather than a
     // half-finished corpus. It is NOT the real guarantee: it proves the embedder
@@ -178,7 +180,6 @@ fn main() {
                 eprintln!("Cluster sidecar invalidated; verify recall before rolling out further.");
                 // #1116 part 3: the vectors changed, so the stamp must too —
                 // otherwise every later open adopts the old one.
-                let new_stamp = encoder_stamp(&model, dim);
                 match kannaka_memory::write_encoder_stamp(&data_dir, &new_stamp) {
                     Ok(old) => eprintln!(
                         ".encoder stamp: old={} new={new_stamp}",
