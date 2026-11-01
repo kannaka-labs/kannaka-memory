@@ -448,6 +448,9 @@ pub struct HrmStore {
     /// 1,678-memory store, measured. `save_medium` flushes only the sidecar
     /// when this is set and `dirty` is not.
     retrieval_dirty: bool,
+    /// #979: per-store override of whether dream rows compete in the evidence
+    /// ranking. `None` defers to `KANNAKA_RECALL_INCLUDE_DREAMS` (default: no).
+    include_dreams_override: Option<bool>,
     /// When true, `save_medium` is a no-op — the process loads and mutates
     /// in RAM but never persists. Set via `KANNAKA_READONLY` so the long-
     /// running reader services (swarm serve / inbox serve / attention serve)
@@ -524,6 +527,7 @@ impl HrmStore {
             memory_cache: HashMap::new(),
             dirty: false,
             retrieval_dirty: false,
+            include_dreams_override: None,
             readonly: Self::env_readonly(),
             new_ids: Vec::new(),
         }
@@ -604,6 +608,7 @@ impl HrmStore {
                     memory_cache: HashMap::new(),
                     dirty: false,
                     retrieval_dirty: false,
+                    include_dreams_override: None,
                     readonly: Self::env_readonly(),
                     new_ids: Vec::new(),
                 };
@@ -639,6 +644,7 @@ impl HrmStore {
                     memory_cache: HashMap::new(),
                     dirty: false,
                     retrieval_dirty: false,
+                    include_dreams_override: None,
                     readonly: Self::env_readonly(),
                     new_ids: Vec::new(),
                 };
@@ -1475,20 +1481,37 @@ impl HrmStore {
             .unwrap_or(true)
     }
 
-    /// Whether recall may return dream rows (#979). Default: yes, unchanged.
+    /// Whether dream rows may compete for the evidence top-k (#979).
+    /// **Default: no.** Opt in with `KANNAKA_RECALL_INCLUDE_DREAMS=1` or
+    /// [`HrmStore::set_include_dreams`] (research only).
     ///
     /// A dream is a cross-cluster synthesis, not a turn, so it can never BE the
     /// evidence a question asks for — yet it competes for the same top-k slots
-    /// and wins: rank 1 in 24 of 30 questions after ONE deep dream, taking MRR
-    /// from 0.950 to 0.529 while hit@15 held. At k=15 accuracy survived; at k=5
-    /// the same displacement is a straight accuracy loss.
+    /// and wins (rank 1 in 24 of 30 questions after ONE deep dream; MRR 0.950 ->
+    /// 0.529). Excluded rows are not discarded: `resonate_query_split` returns
+    /// them in a separate `dreams` list.
     ///
-    /// Today a caller cannot tell a dream from a memory without inspecting
-    /// metadata. `KANNAKA_RECALL_INCLUDE_DREAMS=0` lets one ask for evidence only.
-    fn recall_include_dreams() -> bool {
-        std::env::var("KANNAKA_RECALL_INCLUDE_DREAMS")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
-            .unwrap_or(true)
+    /// History: #1011 shipped the inverse knob (`=0` to exclude) default-on; the
+    /// default flipped here. `=0`/`off`/`false`/`no` still mean "exclude".
+    fn recall_include_dreams(&self) -> bool {
+        if let Some(v) = self.include_dreams_override {
+            return v;
+        }
+        Self::parse_include_dreams(std::env::var("KANNAKA_RECALL_INCLUDE_DREAMS").ok().as_deref())
+    }
+
+    /// `KANNAKA_RECALL_INCLUDE_DREAMS` parsing, pure so the default is testable
+    /// without touching the process environment.
+    fn parse_include_dreams(raw: Option<&str>) -> bool {
+        raw.map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+            .unwrap_or(false)
+    }
+
+    /// Per-store override of the dream-inclusion default (`None` = defer to the
+    /// environment). Process-global env vars race between parallel tests and
+    /// threads; this does not.
+    pub fn set_include_dreams(&mut self, include: Option<bool>) {
+        self.include_dreams_override = include;
     }
 
     /// Every hit keeps its recall channel (#1005): only the chiral branch can
@@ -3198,28 +3221,43 @@ impl MediumBackend for HrmStore {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<crate::store::ResonanceHit>, StoreError> {
-        if Self::recall_include_dreams() {
-            return self.resonate_query_inner(query, top_k);
+        Ok(self.resonate_query_split(query, top_k)?.0)
+    }
+
+    /// #979: `(evidence, dreams)`. Evidence is the top-k ranking with dream rows
+    /// removed (unless dreams are opted in, in which case it is the raw ranking
+    /// and `dreams` is empty). Over-fetches and truncates rather than returning
+    /// short: the point is to reclaim the slot, not merely hide the row.
+    fn resonate_query_split(
+        &mut self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<(Vec<crate::store::ResonanceHit>, Vec<crate::store::ResonanceHit>), StoreError> {
+        if self.recall_include_dreams() {
+            return Ok((self.resonate_query_inner(query, top_k)?, Vec::new()));
         }
-        // #979: a dream row can never be the evidence a question needs, and it
-        // takes a top-k slot anyway — measured at rank 1 in 24 of 30 questions,
-        // MRR 0.950 -> 0.529 after a SINGLE deep dream. Over-fetch and drop them
-        // rather than returning short: the point is to reclaim the slot, not
-        // merely to hide the row.
+        // Fast path: fetch exactly top_k first. If no dream row is in it the
+        // result is byte-identical to the pre-#979 ranking (a wider fetch can
+        // change which channel's hits survive, e.g. the intuition flag).
+        let is_dream_id = |s: &Self, id: &uuid::Uuid| s.memory_cache.get(id).map(|m| m.hallucinated).unwrap_or(false);
+        let first = self.resonate_query_inner(query, top_k)?;
+        if !first.iter().any(|h| is_dream_id(self, &h.id)) {
+            return Ok((first, Vec::new()));
+        }
         let expanded = top_k.saturating_mul(3).max(top_k.saturating_add(10));
         let raw = self.resonate_query_inner(query, expanded)?;
-        let kept: Vec<crate::store::ResonanceHit> = raw
-            .into_iter()
-            .filter(|h| {
-                !self
-                    .memory_cache
-                    .get(&h.id)
-                    .map(|m| m.hallucinated)
-                    .unwrap_or(false)
-            })
-            .take(top_k)
-            .collect();
-        Ok(kept)
+        let (mut evidence, mut dreams) = (Vec::new(), Vec::new());
+        for h in raw {
+            let is_dream = self.memory_cache.get(&h.id).map(|m| m.hallucinated).unwrap_or(false);
+            if is_dream {
+                dreams.push(h);
+            } else {
+                evidence.push(h);
+            }
+        }
+        evidence.truncate(top_k);
+        dreams.truncate(top_k);
+        Ok((evidence, dreams))
     }
 
     fn resonate_query_with_beam(
@@ -3766,16 +3804,16 @@ mod tests {
         }
     }
     /// #979: dream rows take rank 1 in 24 of 30 bench questions and can never
-    /// be the evidence a question needs, so a caller must be able to ask for
-    /// evidence only. Default is unchanged — dreams still returned.
+    /// be the evidence a question needs. Default: they are excluded from the
+    /// evidence ranking and returned in a separate `dreams` list; opting in
+    /// (research) restores the old shared ranking.
     ///
-    /// The control arm is the whole test: asserting "the dream is absent" proves
-    /// nothing unless the dream DOES come back by default, on this same fixture.
-    #[test]
-    fn dreams_can_be_excluded_from_recall() {
+    /// The opt-in arm is the control: asserting "the dream is absent" proves
+    /// nothing unless the dream DOES come back when asked for, on this fixture.
+    /// Uses the per-store override, not the env var, so parallel tests cannot race.
+    fn dream_fixture() -> (HrmStore, NamedTempFile, uuid::Uuid, uuid::Uuid) {
         let temp_file = NamedTempFile::new().unwrap();
         let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
-
         let real = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a turn that actually happened".to_string());
         let real_id = store.insert(real).unwrap();
         let mut dream = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a synthesis across clusters".to_string());
@@ -3785,27 +3823,181 @@ mod tests {
             store.get(&dream_id).unwrap().unwrap().hallucinated,
             "insert did not preserve the hallucinated flag, so this test cannot mean anything"
         );
-
-        // Control: by default the dream is returned.
-        std::env::remove_var("KANNAKA_RECALL_INCLUDE_DREAMS");
-        let with: Vec<uuid::Uuid> = store.resonate_query("a synthesis across clusters", 5)
-            .unwrap().into_iter().map(|(id, _)| id).collect();
-        assert!(
-            with.contains(&dream_id),
-            "control failed: the dream was not returned by default, so excluding it below proves nothing"
-        );
-
-        // Opt out: evidence only.
-        std::env::set_var("KANNAKA_RECALL_INCLUDE_DREAMS", "0");
-        let without: Vec<uuid::Uuid> = store.resonate_query("a synthesis across clusters", 5)
-            .unwrap().into_iter().map(|(id, _)| id).collect();
-        std::env::remove_var("KANNAKA_RECALL_INCLUDE_DREAMS");
-        assert!(!without.contains(&dream_id), "the dream row survived KANNAKA_RECALL_INCLUDE_DREAMS=0");
-        assert!(
-            without.contains(&real_id),
-            "the real memory was dropped too — the filter is removing more than dreams"
-        );
+        (store, temp_file, real_id, dream_id)
     }
+
+    #[test]
+    fn dreams_are_excluded_from_evidence_ranking_by_default() {
+        // The default itself: unset means excluded; only an explicit yes opts in.
+        assert!(!HrmStore::parse_include_dreams(None));
+        assert!(!HrmStore::parse_include_dreams(Some("0")));
+        assert!(!HrmStore::parse_include_dreams(Some("garbage")));
+        assert!(HrmStore::parse_include_dreams(Some(" Yes ")));
+
+        let (mut store, _tmp, real_id, dream_id) = dream_fixture();
+        // The default is pinned above; the override keeps an ambient env var
+        // from changing what the ranking assertions measure.
+        store.set_include_dreams(Some(false));
+        let ids = |v: Vec<(uuid::Uuid, f32)>| v.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let ranked = ids(store.resonate_query("a synthesis across clusters", 5).unwrap());
+        assert!(!ranked.contains(&dream_id), "a dream row took an evidence slot by default");
+        assert!(ranked.contains(&real_id), "filter removed the real memory too");
+
+        // The same dream is surfaced in the separate list, not lost.
+        let (evidence, dreams) = store.resonate_query_split("a synthesis across clusters", 5).unwrap();
+        assert!(evidence.iter().all(|h| h.id != dream_id));
+        assert!(evidence.iter().any(|h| h.id == real_id));
+        assert_eq!(dreams.iter().map(|h| h.id).collect::<Vec<_>>(), vec![dream_id]);
+    }
+
+    #[test]
+    fn dreams_opt_in_restores_shared_ranking() {
+        let (mut store, _tmp, real_id, dream_id) = dream_fixture();
+        store.set_include_dreams(Some(true));
+        let ranked: Vec<uuid::Uuid> = store.resonate_query("a synthesis across clusters", 5)
+            .unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(ranked.contains(&dream_id), "control failed: opt-in did not return the dream");
+        assert!(ranked.contains(&real_id));
+        let (evidence, dreams) = store.resonate_query_split("a synthesis across clusters", 5).unwrap();
+        assert!(evidence.iter().any(|h| h.id == dream_id), "opted-in dream must rank as evidence");
+        assert!(dreams.is_empty(), "opted-in dreams are in the ranking, not duplicated in `dreams`");
+
+        // Explicit exclusion beats whatever the environment says.
+        store.set_include_dreams(Some(false));
+        let (evidence, dreams) = store.resonate_query_split("a synthesis across clusters", 5).unwrap();
+        assert!(evidence.iter().all(|h| h.id != dream_id));
+        assert_eq!(dreams.len(), 1);
+    }
+
+    #[test]
+    fn excluding_dreams_does_not_shorten_the_answer() {
+        // Many dreams that outrank every real row must not eat the top-k.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut store = HrmStore::new(make_test_pipeline(), temp_file.path().to_path_buf());
+        store.set_include_dreams(Some(false));
+        for i in 0..4 {
+            let mut d = HyperMemory::new(vec![0.5; WAVEFRONT_DIM], format!("dream bridge number {i}"));
+            d.hallucinated = true;
+            store.insert(d).unwrap();
+        }
+        for i in 0..3 {
+            let mut v = vec![0.5; WAVEFRONT_DIM];
+            v[i] = 0.9;
+            store.insert(HyperMemory::new(v, format!("real turn {i}"))).unwrap();
+        }
+        // Control: with dreams in the ranking, at least one takes a top-3 slot,
+        // so the slow (over-fetch) path below is really exercised.
+        store.set_include_dreams(Some(true));
+        let shared = store.resonate_query_hits("dream bridge", 3).unwrap();
+        assert!(
+            shared.iter().any(|h| store.get(&h.id).unwrap().unwrap().hallucinated),
+            "control failed: no dream reached the top 3, so this fixture tests nothing"
+        );
+        store.set_include_dreams(Some(false));
+        let (evidence, dreams) = store.resonate_query_split("dream bridge", 3).unwrap();
+        assert_eq!(evidence.len(), 3, "dreams took slots from the evidence ranking");
+        assert!(evidence.iter().all(|h| !store.get(&h.id).unwrap().unwrap().hallucinated));
+        assert!(!dreams.is_empty() && dreams.len() <= 3);
+    }
+    /// #979 bench: how often does a dream row take rank 1, on a CLEAN corpus
+    /// (no dream before the single deep dream run here), before vs after the
+    /// default flipped. "before" = dreams opted into the ranking (the old
+    /// behaviour), "after" = the new default. 10 runs, each with its own corpus.
+    ///
+    ///   cargo test --release --lib probe_dream_rank1_share -- --ignored --nocapture --test-threads=1
+    ///
+    /// (`--test-threads=1`: it sets `KANNAKA_BELIEF_PHASE` for the process.)
+    ///
+    /// SYNTHETIC corpus + SimpleHashEncoder: it re-measures the MECHANISM, not
+    /// the 80% figure from the 30-question bench (that corpus and encoder are
+    /// not in this repo). Compare the shapes, not the digits.
+    ///
+    /// Measured 2026-11-01 (10 runs, 480 queries/arm, 20 dream rows): rank-1
+    /// dream 0.0% in BOTH arms, MRR 0.909 vs 0.906, hit@5 100% vs 100%. This
+    /// synthetic corpus does not reproduce the displacement at all, so it is a
+    /// regression harness, not evidence about the 80% figure.
+    #[test]
+    #[ignore = "bench: cargo test --release --lib probe_dream_rank1_share -- --ignored --nocapture"]
+    fn probe_dream_rank1_share() {
+        const RUNS: u64 = 10;
+        const TOPICS: usize = 6;
+        const PER_TOPIC: usize = 8;
+        const WORDS: usize = 14;
+        let words = |t: usize, w: usize| format!("t{t}w{w}");
+        // Without belief phase the born-phase field collapses (order=1.0) and a
+        // dream has no clusters to bridge, so it hallucinates nothing and the
+        // bench would measure zero dream rows. Ignored test, run alone.
+        std::env::set_var("KANNAKA_BELIEF_PHASE", "1");
+        let (mut tot_before, mut tot_after, mut n_before, mut n_after) = (0usize, 0usize, 0usize, 0usize);
+        let (mut mrr_b, mut mrr_a) = (0.0f64, 0.0f64);
+        let (mut hit_b, mut hit_a, mut tot_dreams) = (0usize, 0usize, 0usize);
+        for run in 0..RUNS {
+            let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ run.wrapping_mul(0xA24B_AED4_963E_E407);
+            let mut next = move |m: usize| -> usize {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                (rng % m as u64) as usize
+            };
+            let temp_file = NamedTempFile::new().unwrap();
+            let mut store = HrmStore::new_flat(make_test_pipeline(), temp_file.path().to_path_buf());
+            store.upgrade_to_chiral();
+            let mut corpus: Vec<(uuid::Uuid, String)> = Vec::new();
+            for t in 0..TOPICS {
+                for _ in 0..PER_TOPIC {
+                    let mut ws: Vec<String> = (0..9).map(|_| words(t, next(WORDS))).collect();
+                    ws.push(words((t + 1 + next(TOPICS - 1)) % TOPICS, next(WORDS)));
+                    let text = ws.join(" ");
+                    let id = store.absorb(&text, 0.5, None).unwrap();
+                    corpus.push((id, text));
+                }
+            }
+            assert!(
+                !store.all_memories().unwrap().iter().any(|m| m.hallucinated),
+                "corpus is not clean: dream rows exist before the dream"
+            );
+            // One deep dream per attempt; retry (hotter, longer) until the dream
+            // actually hallucinates, so the bench never silently measures zero rows.
+            let count_dreams = |s: &HrmStore| s.all_memories().unwrap().iter().filter(|m| m.hallucinated).count();
+            let mut attempts = 1;
+            let mut reported = store.dream(6, Some(1.5)).wavefronts_hallucinated;
+            while count_dreams(&store) == 0 && attempts < 6 {
+                reported += store.dream(10 * attempts, Some(1.5)).wavefronts_hallucinated;
+                attempts += 1;
+            }
+            eprintln!("BENCH dream report: wavefronts_hallucinated={reported}");
+            let dreams = count_dreams(&store);
+            eprintln!("BENCH dream attempts={attempts}");
+            tot_dreams += dreams;
+            // Query: 4 words of the memory (paraphrase-ish subset).
+            for (id, text) in corpus.iter() {
+                let toks: Vec<&str> = text.split(' ').collect();
+                let q = (0..4).map(|i| toks[(i * 2 + 1) % toks.len()]).collect::<Vec<_>>().join(" ");
+                for arm_after in [false, true] {
+                    store.set_include_dreams(Some(!arm_after));
+                    let hits = store.resonate_query_hits(&q, 5).unwrap();
+                    let top_is_dream = hits.first()
+                        .map(|h| store.get(&h.id).ok().flatten().map(|m| m.hallucinated).unwrap_or(false))
+                        .unwrap_or(false);
+                    let rank = hits.iter().position(|h| h.id == *id);
+                    let rr = rank.map(|r| 1.0 / (r as f64 + 1.0)).unwrap_or(0.0);
+                    if arm_after {
+                        n_after += 1; tot_after += top_is_dream as usize; mrr_a += rr; hit_a += rank.is_some() as usize;
+                    } else {
+                        n_before += 1; tot_before += top_is_dream as usize; mrr_b += rr; hit_b += rank.is_some() as usize;
+                    }
+                }
+            }
+            println!("BENCH run {run:>2}: dream rows after dream = {dreams}");
+        }
+        std::env::remove_var("KANNAKA_BELIEF_PHASE");
+        assert!(tot_dreams > 0, "bench produced no dream rows: it measured nothing");
+        let pct = |a: usize, n: usize| 100.0 * a as f64 / n.max(1) as f64;
+        println!("BENCH runs={RUNS} queries/arm={n_before} dream rows total={tot_dreams}");
+        println!("BENCH before (dreams in ranking): rank-1 dream {:.1}% ({}/{})  MRR {:.3}  hit@5 {:.1}%",
+            pct(tot_before, n_before), tot_before, n_before, mrr_b / n_before as f64, pct(hit_b, n_before));
+        println!("BENCH after  (default, excluded): rank-1 dream {:.1}% ({}/{})  MRR {:.3}  hit@5 {:.1}%",
+            pct(tot_after, n_after), tot_after, n_after, mrr_a / n_after as f64, pct(hit_a, n_after));
+    }
+
     /// #978: ingest cost per item grows with store size — 370 ms/item at 500,
     /// 522-687 at 750-880, and a ~2000-item store that did not finish in 82
     /// minutes. The issue attributes the remaining O(n)-per-insert to the

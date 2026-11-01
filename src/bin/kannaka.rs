@@ -1316,6 +1316,12 @@ fn handle_networked_recall(cfg: &KannakaConfig, args: &[String]) {
                 let _ = flag_value(args, i, "--nats-url", USAGE);
                 i += 2;
             }
+            // #979: the dream policy belongs to the store that answers; a
+            // serving daemon applies its own, so these flags cannot travel.
+            "--show-dreams" | "--include-dreams" => {
+                eprintln!("recall: {} applies to a local recall only, not --remote/--collective", args[i]);
+                process::exit(2);
+            }
             other if other.starts_with("--") => {
                 // A typo'd flag must NOT silently become part of the query.
                 eprintln!("recall: unknown flag: {other}");
@@ -2399,7 +2405,7 @@ fn main() {
             }
         }
         "recall" => {
-            const RECALL_USAGE: &str = "Usage: kannaka recall <query> [--top-k N] [--at RFC3339] [--envelope] [--collective] [--remote] [--agent-id ID] [--timeout SECS] [--nats-url URL]\n  --remote asks a serving daemon (KANNAKA.recall.<ID>); stdout is the results as a JSON array, so no --json flag exists or is needed";
+            const RECALL_USAGE: &str = "Usage: kannaka recall <query> [--top-k N] [--at RFC3339] [--envelope] [--show-dreams] [--include-dreams] [--collective] [--remote] [--agent-id ID] [--timeout SECS] [--nats-url URL]\n  --show-dreams emits {\"results\":[..],\"dreams\":[..]} instead of a bare array (dream rows are never ranked as evidence, #979)\n  --include-dreams lets dream rows compete in the ranking (research only; local recall)\n  --remote asks a serving daemon (KANNAKA.recall.<ID>); stdout is the results as a JSON array, so no --json flag exists or is needed";
             if args.len() < command_start + 2 {
                 eprintln!("{RECALL_USAGE}");
                 process::exit(1);
@@ -2480,6 +2486,7 @@ fn main() {
             }
             let mut top_k = 5usize;
             let mut envelope = false;
+            let mut show_dreams = false;
             let mut as_of: Option<chrono::DateTime<chrono::Utc>> = None;
             let mut query_parts = Vec::new();
             let mut i = command_start + 1;
@@ -2488,6 +2495,15 @@ fn main() {
                     "--top-k" | "--limit" => {
                         top_k = parse_flag_value(&args, i, args[i].as_str(), RECALL_USAGE);
                         i += 2;
+                    }
+                    "--show-dreams" => {
+                        show_dreams = true;
+                        i += 1;
+                    }
+                    // #979 research opt-in; single-threaded CLI, set before recall.
+                    "--include-dreams" => {
+                        std::env::set_var("KANNAKA_RECALL_INCLUDE_DREAMS", "1");
+                        i += 1;
                     }
                     // ADR-0029 Phase 4b — opt into the envelope. Default
                     // still emits the legacy array shape so existing
@@ -2523,26 +2539,29 @@ fn main() {
             }
             let query = query_parts.join(" ");
             let _as_of = as_of.map(kannaka_memory::medium::hemisphere::RecallAsOf::new);
-            match sys.recall(&query, top_k) {
-                Ok(results) => {
-                    let json_results: serde_json::Value = results
-                        .iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "id": r.id.to_string(),
-                                "content": r.content,
-                                "similarity": r.similarity,
-                                "strength": r.strength,
-                                "age_hours": r.age_hours,
-                                "layer": r.layer,
-                                // How many times the world showed this fact.
-                                // Without this the count is only readable by
-                                // cat-ing the sidecar.
-                                "times_seen": r.times_seen,
-                            })
+            match sys.recall_split(&query, top_k) {
+                Ok(outcome) => {
+                    let row = |r: &kannaka_memory::openclaw::RecallResult| {
+                        serde_json::json!({
+                            "id": r.id.to_string(),
+                            "content": r.content,
+                            "similarity": r.similarity,
+                            "strength": r.strength,
+                            "age_hours": r.age_hours,
+                            "layer": r.layer,
+                            // How many times the world showed this fact.
+                            // Without this the count is only readable by
+                            // cat-ing the sidecar.
+                            "times_seen": r.times_seen,
                         })
-                        .collect::<Vec<_>>()
-                        .into();
+                    };
+                    let evidence: Vec<serde_json::Value> = outcome.evidence.iter().map(row).collect();
+                    let json_results: serde_json::Value = if show_dreams {
+                        let dreams: Vec<serde_json::Value> = outcome.dreams.iter().map(row).collect();
+                        serde_json::json!({ "results": evidence, "dreams": dreams })
+                    } else {
+                        evidence.into()
+                    };
                     if envelope {
                         kannaka_memory::cli::print_envelope("recall", json_results);
                     } else {
