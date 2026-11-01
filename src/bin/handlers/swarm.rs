@@ -1876,12 +1876,15 @@ pub(crate) fn handle_swarm_peers(cfg: &KannakaConfig, args: &[String]) {
         .iter()
         .filter(|p| !kannaka_memory::nats::is_fresh_presence(p, now))
         .count();
+    // Borrowed, not consumed: the #960 multi-instance summary below reads
+    // `retained` too.
     let peers: Vec<serde_json::Value> = if show_all {
-        retained
+        retained.clone()
     } else {
         retained
-            .into_iter()
+            .iter()
             .filter(|p| kannaka_memory::nats::is_fresh_presence(p, now))
+            .cloned()
             .collect()
     };
     if as_json {
@@ -1981,6 +1984,44 @@ pub(crate) fn handle_swarm_peers(cfg: &KannakaConfig, args: &[String]) {
             }
         }
         println!("{label:<24} {mem:<8} {ver:<8} {caps}");
+    }
+    // #960: identities running on more than one instance, aggregated. The rows
+    // above stay per-record; this says "present if any instance is" and the
+    // mean coherence of the live ones. Aggregated over every retained record
+    // (stale included), so an identity whose instances all went quiet reads
+    // as absent instead of vanishing from this list.
+    let multi: Vec<_> = kannaka_memory::nats::aggregate_presence(&retained, now)
+        .into_iter()
+        .filter(|i| i.instances.len() > 1)
+        .collect();
+    if !multi.is_empty() {
+        println!();
+        println!("Multi-instance identities:");
+        for i in &multi {
+            let coh = i
+                .coherence
+                .map(|c| format!("{c:.3}"))
+                .unwrap_or_else(|| "-".into());
+            let hosts: Vec<String> = i
+                .instances
+                .iter()
+                .map(|n| {
+                    format!(
+                        "{}@{}",
+                        kannaka_memory::sanitize_display(&n.instance_id),
+                        kannaka_memory::sanitize_display(n.host.as_deref().unwrap_or("?"))
+                    )
+                })
+                .collect();
+            println!(
+                "  {} — {} ({}/{} instances live, coherence {coh}) [{}]",
+                kannaka_memory::sanitize_display(&i.agent_id),
+                if i.present { "present" } else { "absent" },
+                i.live_instances,
+                i.instances.len(),
+                hosts.join(", ")
+            );
+        }
     }
     println!();
     if show_all {
