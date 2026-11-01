@@ -30,6 +30,9 @@ use crate::wave::{cosine_similarity, normalize};
 #[cfg(feature = "collective")]
 use rayon::prelude::*;
 
+/// #1063: staged consolidation (stage, check, commit or quarantine).
+pub mod verified;
+
 /// Amplitude ceiling for the particle-consolidation strengthen path (#360).
 /// The wave-native observe path already caps wavefront energy at 2.0
 /// (`consciousness.rs`); this path grew amplitude unbounded, so repeated
@@ -266,6 +269,13 @@ pub struct ConsolidationReport {
     pub kannaktopus_targets: Vec<usize>,
     /// Long-ghosted (zero-amplitude) memories hard-deleted this cycle (#361).
     pub ghosts_reclaimed: usize,
+    /// #1063: whether this cycle ran staged and what happened to it.
+    /// `NotStaged` for ordinary in-place cycles. A `Quarantined` cycle wrote
+    /// nothing, so every count above is zero; the staged run's own report is
+    /// kept only in the quarantine pool.
+    pub staged: verified::StagedStatus,
+    /// #1063: why the staged cycle was quarantined.
+    pub quarantine_reason: Option<String>,
 }
 
 /// Report from modality-aware dream consolidation (NCS Phase 3.2, #48).
@@ -378,6 +388,9 @@ pub struct ConsolidationEngine {
     /// L4.S15: tuned post-xi-fix. 0.30 was unreachable pre-fix, 0.15 too
     /// aggressive (300/300 pairs qualify, phase_coherence collapses).
     pub repulsion_threshold: f32,
+    /// #1063 verified (staged) consolidation. Default `VerifiedMode::Off`:
+    /// the in-place cycle, unchanged.
+    pub verified: verified::VerifiedConsolidation,
 }
 
 impl Default for ConsolidationEngine {
@@ -395,13 +408,31 @@ impl Default for ConsolidationEngine {
             hallucination_amplitude: 0.5,
             protect_established: false,
             repulsion_threshold: 0.22,
+            verified: verified::VerifiedConsolidation::default(),
         }
     }
 }
 
 impl ConsolidationEngine {
     /// Run a full 9-stage consolidation cycle on memories at the given layer range.
+    ///
+    /// With `verified.mode` other than `Off` (the default) the cycle runs on a
+    /// staged copy and is committed or quarantined (see [`verified`]);
+    /// otherwise it runs in place.
     pub fn consolidate(
+        &self,
+        engine: &mut ResonanceEngine,
+        min_layer: u8,
+        max_layer: u8,
+    ) -> ConsolidationReport {
+        if self.verified.mode != verified::VerifiedMode::Off {
+            return self.consolidate_staged_with(engine, min_layer, max_layer, |_| {});
+        }
+        self.consolidate_in_place(engine, min_layer, max_layer)
+    }
+
+    /// The unconditional in-place cycle (the pre-#1063 body of `consolidate`).
+    pub(crate) fn consolidate_in_place(
         &self,
         engine: &mut ResonanceEngine,
         min_layer: u8,
