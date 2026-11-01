@@ -92,6 +92,9 @@ pub struct IdentityStore {
     /// When this token pair was obtained (UTC). Informational; expiry
     /// authority is the JWT `exp` claim.
     pub obtained_at: chrono::DateTime<chrono::Utc>,
+    /// Persistent voice for this identity (#985). Absent in legacy files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<crate::voice::VoiceSpec>,
 }
 
 impl IdentityStore {
@@ -421,6 +424,7 @@ mod tests {
             access_token: "access.token.value".into(),
             refresh_token: "refresh-token-value".into(),
             obtained_at: chrono::Utc::now(),
+            voice: None,
         }
     }
 
