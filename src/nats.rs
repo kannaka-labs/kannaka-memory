@@ -101,6 +101,129 @@ pub fn is_fresh_presence(p: &serde_json::Value, now: chrono::DateTime<Utc>) -> b
     }
 }
 
+/// Optional instance id of this process, from `KANNAKA_INSTANCE_ID` (#960).
+///
+/// ADR-0042 Phase 4 runs one identity (`agent_id`) on several instances at once
+/// (queue-grouped responders on oracle1 + oracle3). Unset/empty = the legacy
+/// single-instance case, whose wire format is unchanged. An id outside
+/// `[A-Za-z0-9_-]` is refused (with a warning) rather than rewritten, because
+/// two rewritten ids could collide on one subject and erase each other.
+pub fn local_instance_id() -> Option<String> {
+    let raw = std::env::var("KANNAKA_INSTANCE_ID").ok()?;
+    let id = raw.trim();
+    if id.is_empty() {
+        return None;
+    }
+    if !is_valid_instance_id(id) {
+        eprintln!("[nats] Warning: KANNAKA_INSTANCE_ID {id:?} ignored: use only A-Z a-z 0-9 _ -");
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Whether `id` can be a presence subject token as-is (#960).
+pub fn is_valid_instance_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Best-effort host name for the presence record (#960).
+pub fn local_host() -> Option<String> {
+    ["KANNAKA_HOST", "HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+/// Presence subject for an identity instance. An instance id is a subject
+/// token, so anything outside `[A-Za-z0-9_-]` is replaced with `_`. No instance
+/// id keeps the legacy `KANNAKA.presence.<agent_id>` subject, so single-instance
+/// agents publish byte-for-byte what they always did.
+pub fn presence_subject(agent_id: &str, instance_id: Option<&str>) -> String {
+    match instance_id.map(str::trim).filter(|i| !i.is_empty()) {
+        None => format!("KANNAKA.presence.{agent_id}"),
+        Some(inst) => {
+            let tok: String = inst
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            format!("KANNAKA.presence.{agent_id}.{tok}")
+        }
+    }
+}
+
+/// One running instance of an identity, as seen in presence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresenceInstance {
+    /// Empty for a legacy record that carries no `instance_id`.
+    pub instance_id: String,
+    pub host: Option<String>,
+    pub last_seen: Option<String>,
+    /// Not a tombstone and heartbeat still fresh.
+    pub live: bool,
+    pub coherence: Option<f64>,
+}
+
+/// An identity with every instance it runs on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdentityPresence {
+    pub agent_id: String,
+    /// Present if ANY instance is live.
+    pub present: bool,
+    pub live_instances: usize,
+    /// Mean `coherence` over live instances that report one (the same plain
+    /// mean `queen::Hive::coherence` uses); `None` if none report.
+    pub coherence: Option<f64>,
+    pub instances: Vec<PresenceInstance>,
+}
+
+/// Fold raw presence records (tombstones included) into one entry per identity.
+///
+/// Compatibility read path: a record without `instance_id` is the identity's
+/// sole legacy instance (empty `instance_id`), so pre-#960 records aggregate as
+/// identities of exactly one instance. Sorted by agent id, then instance id.
+pub fn aggregate_presence(
+    records: &[serde_json::Value],
+    now: chrono::DateTime<Utc>,
+) -> Vec<IdentityPresence> {
+    let mut by_id: std::collections::BTreeMap<String, Vec<PresenceInstance>> =
+        std::collections::BTreeMap::new();
+    for p in records {
+        let Some(agent) = p.get("agent_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let s = |k: &str| p.get(k).and_then(|v| v.as_str()).map(String::from);
+        let inst = PresenceInstance {
+            instance_id: s("instance_id").unwrap_or_default(),
+            host: s("host"),
+            last_seen: s("last_seen"),
+            live: is_active_presence(p) && is_fresh_presence(p, now),
+            coherence: p.get("coherence").and_then(|v| v.as_f64()),
+        };
+        by_id.entry(agent.to_string()).or_default().push(inst);
+    }
+    by_id
+        .into_iter()
+        .map(|(agent_id, mut instances)| {
+            instances.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+            let live: Vec<&PresenceInstance> = instances.iter().filter(|i| i.live).collect();
+            let cs: Vec<f64> = live.iter().filter_map(|i| i.coherence).collect();
+            let coherence = if cs.is_empty() {
+                None
+            } else {
+                Some(cs.iter().sum::<f64>() / cs.len() as f64)
+            };
+            IdentityPresence {
+                agent_id,
+                present: !live.is_empty(),
+                live_instances: live.len(),
+                coherence,
+                instances,
+            }
+        })
+        .collect()
+}
+
 fn add_envelope(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut() {
         // Per consciousness-core/docs/nats-contract.yaml:
@@ -3223,7 +3346,10 @@ impl SwarmTransport {
         agent_id: &str,
         payload: &serde_json::Value,
     ) -> Result<(), NatsError> {
-        let subject = format!("KANNAKA.presence.{agent_id}");
+        // An `instance_id` in the payload routes to a per-instance subject so
+        // sibling instances don't overwrite each other (max_msgs_per_subject=1).
+        let inst = payload.get("instance_id").and_then(|v| v.as_str());
+        let subject = presence_subject(agent_id, inst);
         let bytes = serde_json::to_vec(payload)
             .map_err(|e| NatsError::Serialize(e.to_string()))?;
         self.publish_raw(&subject, &bytes)
@@ -3242,11 +3368,25 @@ impl SwarmTransport {
     /// tombstone is invisible to every consumer rather than each one needing
     /// to know about it.
     pub fn publish_presence_left(&self, agent_id: &str) -> Result<(), NatsError> {
+        self.publish_presence_instance_left(agent_id, None)
+    }
+
+    /// Retract ONE instance's presence record (#960). It lives on its own
+    /// subject, so sibling instances of the identity are untouched and the
+    /// identity stays present until its last instance leaves.
+    pub fn publish_presence_instance_left(
+        &self,
+        agent_id: &str,
+        instance_id: Option<&str>,
+    ) -> Result<(), NatsError> {
         let mut payload = serde_json::json!({
             "agent_id": agent_id,
             "status": "left",
             "last_seen": chrono::Utc::now().to_rfc3339(),
         });
+        if let Some(inst) = instance_id.map(str::trim).filter(|i| !i.is_empty()) {
+            payload["instance_id"] = serde_json::json!(inst);
+        }
         add_envelope(&mut payload);
         self.publish_presence(agent_id, &payload)
     }
@@ -4711,6 +4851,107 @@ impl NatsSubscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #960: one identity, several instances ----
+
+    fn inst_rec(agent: &str, inst: Option<&str>, host: &str, age_s: i64, coh: f64) -> serde_json::Value {
+        let ts = (Utc::now() - chrono::Duration::seconds(age_s)).to_rfc3339();
+        let mut v = serde_json::json!({
+            "agent_id": agent, "host": host, "last_seen": ts, "coherence": coh,
+        });
+        if let Some(i) = inst {
+            v["instance_id"] = serde_json::json!(i);
+        }
+        v
+    }
+
+    fn left(agent: &str, inst: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "agent_id": agent, "status": "left", "last_seen": Utc::now().to_rfc3339(),
+        });
+        if let Some(i) = inst {
+            v["instance_id"] = serde_json::json!(i);
+        }
+        v
+    }
+
+    #[test]
+    fn presence_subject_is_legacy_without_instance_and_tokenised_with() {
+        assert_eq!(presence_subject("kannaka", None), "KANNAKA.presence.kannaka");
+        assert_eq!(presence_subject("kannaka", Some("  ")), "KANNAKA.presence.kannaka");
+        assert_eq!(presence_subject("kannaka", Some("o3.a b")), "KANNAKA.presence.kannaka.o3_a_b");
+    }
+
+    #[test]
+    fn instance_ids_that_would_need_rewriting_are_refused() {
+        // "o3.a b" and "o3_a_b" map to the same subject token; only the second
+        // may be used, so two instances can never share a subject.
+        assert!(is_valid_instance_id("o3_a_b"));
+        assert!(is_valid_instance_id("oracle-1"));
+        assert!(!is_valid_instance_id("o3.a b"));
+        assert!(!is_valid_instance_id("o3>"));
+        assert!(!is_valid_instance_id(""));
+    }
+
+    #[test]
+    fn two_instances_aggregate_under_one_identity() {
+        let recs = vec![
+            inst_rec("kannaka", Some("o1"), "oracle1", 5, 0.6),
+            inst_rec("kannaka", Some("o3"), "oracle3", 10, 0.8),
+        ];
+        let r = aggregate_presence(&recs, Utc::now());
+        assert_eq!(r.len(), 1);
+        assert!(r[0].present);
+        assert_eq!(r[0].live_instances, 2);
+        assert_eq!(r[0].instances[0].host.as_deref(), Some("oracle1"));
+        assert_eq!(r[0].instances[1].instance_id, "o3");
+        assert!((r[0].coherence.unwrap() - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_instance_leaving_keeps_identity_present() {
+        let recs = vec![
+            inst_rec("kannaka", Some("o1"), "oracle1", 5, 0.6),
+            left("kannaka", Some("o3")),
+        ];
+        let r = aggregate_presence(&recs, Utc::now());
+        assert!(r[0].present);
+        assert_eq!(r[0].live_instances, 1);
+        // Coherence is the survivor's alone, not diluted by the departed one.
+        assert!((r[0].coherence.unwrap() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn both_instances_leaving_makes_identity_absent() {
+        let recs = vec![left("kannaka", Some("o1")), left("kannaka", Some("o3"))];
+        let r = aggregate_presence(&recs, Utc::now());
+        assert!(!r[0].present);
+        assert_eq!(r[0].live_instances, 0);
+        assert_eq!(r[0].coherence, None);
+    }
+
+    #[test]
+    fn stale_instance_does_not_count_as_present() {
+        let recs = vec![
+            inst_rec("kannaka", Some("o1"), "oracle1", 5, 0.5),
+            inst_rec("kannaka", Some("o3"), "oracle3", PRESENCE_LIVE_WINDOW_SECS + 60, 0.9),
+        ];
+        let r = aggregate_presence(&recs, Utc::now());
+        assert_eq!(r[0].live_instances, 1);
+        assert!((r[0].coherence.unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn legacy_record_without_instance_id_reads_as_single_instance() {
+        let recs = vec![
+            serde_json::json!({"agent_id": "old", "last_seen": Utc::now().to_rfc3339()}),
+            inst_rec("other", None, "h", 1, 0.4),
+        ];
+        let r = aggregate_presence(&recs, Utc::now());
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|i| i.present && i.live_instances == 1 && i.instances[0].instance_id.is_empty()));
+        assert_eq!(r[0].coherence, None);
+    }
 
     /// The recall event: its subject sits under the memory stream's
     /// `KANNAKA.events.memory.>` capture, it carries the ids in rank order

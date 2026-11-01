@@ -1176,6 +1176,15 @@ fn swarm_publish_heartbeat(
         "memory_count": sys.engine.store.count(),
         "kannaka_version": kannaka_memory::config::VERSION,
     });
+    // #960: additive instance fields. Absent KANNAKA_INSTANCE_ID leaves the
+    // record (and its subject) exactly as before.
+    if let Some(inst) = kannaka_memory::nats::local_instance_id() {
+        presence["instance_id"] = serde_json::json!(inst);
+        presence["coherence"] = serde_json::json!(phase.coherence);
+        if let Some(h) = kannaka_memory::nats::local_host() {
+            presence["host"] = serde_json::json!(h);
+        }
+    }
     // Optional identity block (user_id/email only, never tokens) so peers
     // can render who operates this node. Absent identity → presence
     // payload unchanged from pre-identity versions.
@@ -1184,6 +1193,16 @@ fn swarm_publish_heartbeat(
     }
     if let Err(e) = transport.publish_presence(my_agent_id, &presence) {
         eprintln!("[nats] Warning: {label} presence publish failed: {e}");
+    } else if presence.get("instance_id").is_some() {
+        // #960: an agent that starts setting KANNAKA_INSTANCE_ID moves to a
+        // per-instance subject; retract its old legacy record once, or the
+        // identity shows a blank second instance until that record goes stale.
+        static LEGACY_RETRACTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LEGACY_RETRACTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Err(e) = transport.publish_presence_left(my_agent_id) {
+                eprintln!("[nats] Warning: legacy presence retraction failed: {e}");
+            }
+        }
     }
     // Periodic flush — see km#bug-grew-then-reset. systemd Stop / SIGKILL
     // skips Drop's flush, so without this the in-process HRM growth since
@@ -1522,10 +1541,14 @@ fn swarm_brief_peers(nats_url: &str, topic: &str, want_json: bool) -> bool {
         }
     };
     let peers = transport.get_presence().unwrap_or_default();
-    let peer_ids: Vec<String> = peers
+    // #960: one entry per identity -- sibling instances share a queue group,
+    // so asking each would just duplicate the same answer.
+    let mut peer_ids: Vec<String> = peers
         .iter()
         .filter_map(|p| p.get("agent_id").and_then(|v| v.as_str()).map(String::from))
         .collect();
+    peer_ids.sort();
+    peer_ids.dedup();
     if peer_ids.is_empty() {
         eprintln!("brief --peers: no peers present; using local");
         return false;
@@ -5508,7 +5531,7 @@ fn main() {
                     // (#737) caps the resulting ghost at ~5 minutes rather
                     // than 24h, but a clean exit knows it is leaving and
                     // should say so rather than lean on the staleness net.
-                    if let Err(e) = transport.publish_presence_left(&my_agent_id) {
+                    if let Err(e) = transport.publish_presence_instance_left(&my_agent_id, kannaka_memory::nats::local_instance_id().as_deref()) {
                         eprintln!(
                             "[nats] Warning: presence retraction failed ({e}) — peers may \
                              show this agent until the presence freshness window expires"
@@ -5548,7 +5571,7 @@ fn main() {
                         // the presence record. Without an explicit retraction the
                         // agent stayed in `swarm peers` until the presence
                         // stream's 24h max_age expired it — a full day of ghosts.
-                        if let Err(e) = transport.publish_presence_left(&leave_agent_id) {
+                        if let Err(e) = transport.publish_presence_instance_left(&leave_agent_id, kannaka_memory::nats::local_instance_id().as_deref()) {
                             eprintln!(
                                 "[nats] Warning: presence retraction failed ({e}) — peers may \
                                  show this agent until the 24h presence TTL expires"
