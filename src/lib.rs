@@ -8,6 +8,7 @@
 
 pub mod acp;
 pub(crate) mod fs_util;
+pub use fs_util::write_encoder_stamp;
 pub mod bridge;
 pub mod observe;
 pub mod openclaw;

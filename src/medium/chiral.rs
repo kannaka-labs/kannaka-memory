@@ -920,8 +920,24 @@ impl ChiralMedium {
         pipeline: &EncodingPipeline,
         dry_run: bool,
     ) -> Result<usize, MediumError> {
+        self.re_encode_all_with_progress(pipeline, dry_run, &mut |_, _| {})
+    }
+
+    /// As [`re_encode_all`], calling `progress(rows_done, total_rows)` before every
+    /// 100th row and after the last (#1116 part 4). `rows_done` counts rows
+    /// visited, including skipped ones.
+    pub fn re_encode_all_with_progress(
+        &mut self,
+        pipeline: &EncodingPipeline,
+        dry_run: bool,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<usize, MediumError> {
         let mut updated = 0usize;
-        for i in 0..self.right.count() {
+        let total = self.right.count();
+        for i in 0..total {
+            if i > 0 && i % 100 == 0 {
+                progress(i, total);
+            }
             // Only re-encode genuine TEXT wavefronts. SKIP:
             //  - dream HALLUCINATIONS (metadata.hallucinated): their vectors are
             //    synthetic cross-cluster superpositions, NOT encoder output —
@@ -973,6 +989,9 @@ impl ChiralMedium {
                     }
                 }
             }
+        }
+        if total > 0 {
+            progress(total, total);
         }
         Ok(updated)
     }

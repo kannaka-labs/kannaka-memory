@@ -185,9 +185,8 @@ const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// process holds the target open without `FILE_SHARE_DELETE` — something
 /// antivirus scanners and non-Rust readers do routinely and briefly. Before
 /// #933 the plain `std::fs::write` silently succeeded; failing loudly is the
-/// right direction, but it introduced a new transient failure:
-///
-///     failed to write ...: rename: Access is denied. (os error 5)
+/// right direction, but it introduced a new transient failure, reported as
+/// `failed to write ...: rename: Access is denied. (os error 5)`.
 ///
 /// Only `PermissionDenied` retries. `NotFound`, `CrossesDevices` and the rest
 /// are permanent — retrying them would just delay an honest error. A file that
@@ -217,6 +216,19 @@ fn sync_parent_dir(path: &Path) {
 
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
+
+/// Atomically replace `<data_dir>/.encoder` with `stamp` (write temp + rename,
+/// via [`atomic_write_bytes`]). Returns the previous stamp, if one was readable
+/// (#1116 part 3). Public so `kannaka-recompute-encoding` can call it.
+pub fn write_encoder_stamp(data_dir: &Path, stamp: &str) -> Result<Option<String>, String> {
+    let path = data_dir.join(".encoder");
+    let old = std::fs::read_to_string(&path)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    atomic_write_bytes(&path, stamp.as_bytes())?;
+    Ok(old)
+}
 
 /// Rename a staged temp sibling over its target. The temp file is removed if
 /// the rename fails, so a failed write never leaves litter behind.

@@ -2441,6 +2441,16 @@ impl HrmStore {
     /// stale `.clusters.json` sidecar, and persists. Snapshot the HRM first
     /// (the deployment gate #107 specifies) and verify recall before adopting.
     pub fn recompute_encoding(&mut self, dry_run: bool) -> Result<(usize, usize), StoreError> {
+        self.recompute_encoding_with_progress(dry_run, &mut |_, _| {})
+    }
+
+    /// As [`recompute_encoding`], reporting `progress(rows_done, total_rows)`
+    /// every 100 rows (#1116 part 4).
+    pub fn recompute_encoding_with_progress(
+        &mut self,
+        dry_run: bool,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<(usize, usize), StoreError> {
         let scanned = self.count();
         if self.chiral.is_none() {
             return Err(StoreError::Other(
@@ -2453,7 +2463,7 @@ impl HrmStore {
             // dry_run makes re_encode_all COUNT eligible wavefronts without mutating
             // the in-memory hemispheres, so a dry run leaves the store untouched.
             chiral
-                .re_encode_all(pipeline, dry_run)
+                .re_encode_all_with_progress(pipeline, dry_run, progress)
                 .map_err(|e| StoreError::Other(format!("re-encode failed: {e}")))?
         };
         if dry_run {
