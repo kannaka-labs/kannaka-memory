@@ -22,7 +22,7 @@ use kannaka_memory::provenance::{node_signing_key, verifying_key_bytes};
 use kannaka_memory::reputation::{RepStore, SeedStatus};
 
 const USAGE: &str = "Usage: kannaka identity \
-    <register|login|whoami|logout|keygen|pubkey|enroll-seed|vouch|revoke|beacon> [args]";
+    <register|login|whoami|logout|keygen|pubkey|enroll-seed|vouch|revoke|beacon|voice> [args]";
 
 pub(crate) fn handle_identity(args: &[String]) {
     let sub = match args.get(1) {
@@ -46,6 +46,7 @@ pub(crate) fn handle_identity(args: &[String]) {
         "vouch" => handle_vouch(args),
         "revoke" => handle_revoke(args),
         "beacon" => handle_beacon(),
+        "voice" => handle_voice(args),
         _ => {
             eprintln!("{USAGE}");
             process::exit(1);
@@ -159,6 +160,102 @@ fn handle_whoami() {
             process::exit(1);
         }
     }
+}
+
+const VOICE_USAGE: &str =
+    "Usage: kannaka identity voice [show|set <provider> <voice_id> [--setting k=v]...|clear]";
+
+/// `kannaka identity voice` (#985): resolution is identity > config > default.
+fn handle_voice(args: &[String]) {
+    use kannaka_memory::voice;
+    let path = identity::identity_path();
+    let rest = &args[2.min(args.len())..];
+    let verb = rest.first().map(String::as_str).unwrap_or("show");
+    let store = match IdentityStore::load(&path) {
+        Ok(s) => s,
+        // `show` can still answer from config/default; writing over an
+        // unreadable identity file could destroy the session in it.
+        Err(e) if verb == "show" => {
+            eprintln!("identity voice: warning: cannot read identity ({e}); showing config/default");
+            None
+        }
+        Err(e) => {
+            eprintln!("identity voice: {e}");
+            process::exit(1);
+        }
+    };
+    match verb {
+        "show" => {
+            let cfg = KannakaConfig::load();
+            let (spec, src) =
+                voice::resolve(store.as_ref().and_then(|s| s.voice.as_ref()), cfg.voice.as_ref());
+            println!("provider: {}", spec.provider);
+            println!("voice_id: {}", spec.voice_id);
+            for (k, v) in &spec.settings {
+                println!("setting:  {k}={v}");
+            }
+            println!("source:   {}", src.as_str());
+        }
+        "set" => {
+            let spec = match parse_voice_set(&rest[1..]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("identity voice: {e}\n{VOICE_USAGE}");
+                    process::exit(1);
+                }
+            };
+            if let Err(e) = voice::validate_spec(&spec, &voice::spool_dir()) {
+                eprintln!("identity voice: {e}");
+                process::exit(1);
+            }
+            let Some(mut store) = store else {
+                eprintln!("identity voice: no identity found; run `kannaka identity login` first");
+                process::exit(1);
+            };
+            store.voice = Some(spec);
+            if let Err(e) = store.save(&path) {
+                eprintln!("identity voice: {e}");
+                process::exit(1);
+            }
+            println!("voice set");
+        }
+        "clear" => {
+            if let Some(mut store) = store {
+                store.voice = None;
+                if let Err(e) = store.save(&path) {
+                    eprintln!("identity voice: {e}");
+                    process::exit(1);
+                }
+            }
+            println!("voice cleared");
+        }
+        _ => {
+            eprintln!("{VOICE_USAGE}");
+            process::exit(1);
+        }
+    }
+}
+
+/// `<provider> <voice_id> [--setting k=v]...` -> a spec, or why not.
+fn parse_voice_set(args: &[String]) -> Result<kannaka_memory::voice::VoiceSpec, String> {
+    let (Some(provider), Some(voice_id)) = (args.first(), args.get(1)) else {
+        return Err("set needs <provider> <voice_id>".into());
+    };
+    let mut spec = kannaka_memory::voice::VoiceSpec::new(provider.clone(), voice_id.clone());
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] != "--setting" {
+            return Err(format!("unexpected argument '{}'", args[i]));
+        }
+        match args.get(i + 1).and_then(|s| s.split_once('=')) {
+            Some((k, v)) if !k.trim().is_empty() => {
+                spec.settings.insert(k.to_string(), v.to_string());
+            }
+            _ => return Err("--setting expects k=v with a non-empty key".into()),
+        }
+        i += 2;
+    }
+    Ok(spec)
 }
 
 fn handle_logout() {
@@ -489,12 +586,20 @@ fn store_session(
     refresh_token: String,
 ) -> std::path::PathBuf {
     let path = identity::identity_path();
+    // A re-login must not drop the identity's voice.
+    // Only the same user's voice carries over; another login starts clean.
+    let voice = IdentityStore::load(&path)
+        .ok()
+        .flatten()
+        .filter(|s| s.user_id == user_id)
+        .and_then(|s| s.voice);
     let store = IdentityStore {
         user_id: user_id.to_string(),
         email: email.to_string(),
         access_token,
         refresh_token,
         obtained_at: chrono::Utc::now(),
+        voice,
     };
     if let Err(e) = store.save(&path) {
         eprintln!("  identity: failed to store session: {e}");
@@ -547,6 +652,27 @@ fn read_password(email: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn voice_set_parses_provider_id_and_settings() {
+        let s = parse_voice_set(&sv(&["file", "aria", "--setting", "speed=1.2", "--setting", "pitch=-1"])).unwrap();
+        assert_eq!((s.provider.as_str(), s.voice_id.as_str()), ("file", "aria"));
+        assert_eq!(s.settings["speed"], "1.2");
+        assert_eq!(s.settings["pitch"], "-1");
+    }
+
+    #[test]
+    fn voice_set_rejects_bad_arguments() {
+        assert!(parse_voice_set(&sv(&["file"])).is_err());
+        assert!(parse_voice_set(&sv(&["file", "aria", "--setting"])).is_err());
+        assert!(parse_voice_set(&sv(&["file", "aria", "--setting", "novalue"])).is_err());
+        assert!(parse_voice_set(&sv(&["file", "aria", "--setting", "=v"])).is_err());
+        assert!(parse_voice_set(&sv(&["file", "aria", "stray"])).is_err());
+    }
 
     // keygen is idempotent: node_signing_key generates once then reloads the
     // SAME key, so the printed base64 pubkey is stable across re-runs.

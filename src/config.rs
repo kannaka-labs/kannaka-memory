@@ -49,6 +49,9 @@ pub struct KannakaConfig {
     pub encoder: EncoderConfig,
     #[serde(default)]
     pub events: EventsConfig,
+    /// `[voice]` — default voice when the identity has none (#985).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<crate::voice::VoiceSpec>,
 }
 
 /// `[events]` — what the durable memory-event stream carries (#1057).

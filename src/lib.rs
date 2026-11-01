@@ -116,6 +116,7 @@ pub mod lab_tools;
 
 // SpaceChild SSO identity for swarm agents (spacechild-auth client + token store).
 pub mod identity;
+pub mod voice;
 
 // Grounded scholarly research (OpenAlex) for the curiosity loop.
 pub mod openalex;
