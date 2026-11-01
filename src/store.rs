@@ -131,6 +131,17 @@ pub trait MediumBackend: Send + Sync {
             .collect())
     }
 
+    /// #979: `(evidence, dreams)` — dream-origin rows (`hallucinated`) are kept
+    /// OUT of the evidence ranking and returned separately. Backends with no
+    /// dream rows return everything as evidence.
+    fn resonate_query_split(
+        &mut self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<(Vec<ResonanceHit>, Vec<ResonanceHit>), StoreError> {
+        Ok((self.resonate_query_hits(query, top_k)?, Vec::new()))
+    }
+
     /// Backward-compatible alias for resonate_query().
     fn recall_text(&mut self, query: &str, top_k: usize) -> Result<Vec<(Uuid, f32)>, StoreError> {
         self.resonate_query(query, top_k)

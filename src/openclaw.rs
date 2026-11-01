@@ -203,6 +203,19 @@ pub struct RecallResult {
     pub times_seen: u32,
 }
 
+/// #979: a recall split into evidence and dream-origin rows. Dream rows
+/// (`hallucinated`) are cross-cluster syntheses, never evidence, so they are
+/// kept out of the `evidence` ranking and surfaced here instead.
+#[derive(Debug, Clone, Default)]
+pub struct RecallOutcome {
+    /// Top-k ranking with dream rows removed (unless dreams were opted in via
+    /// `KANNAKA_RECALL_INCLUDE_DREAMS=1`, in which case they rank here).
+    pub evidence: Vec<RecallResult>,
+    /// Dream-origin rows that matched the query, strongest first. Empty when
+    /// dreams are opted into the ranking.
+    pub dreams: Vec<RecallResult>,
+}
+
 /// Result of a literal text search (NOT resonance-based — see `search()`
 /// vs `recall()`). Read-only: no medium mutation, no embedding.
 #[derive(Debug, Clone)]
@@ -1533,13 +1546,20 @@ impl KannakaMemorySystem {
             .unwrap_or(false)
     }
 
+    /// Evidence-only recall: dream rows never take a slot (#979). Use
+    /// [`recall_split`](Self::recall_split) to also see the dreams.
     pub fn recall(&mut self, query: &str, top_k: usize) -> Result<Vec<RecallResult>, SystemError> {
+        Ok(self.recall_split(query, top_k)?.evidence)
+    }
+
+    /// Recall with dream-origin rows surfaced separately (#979).
+    pub fn recall_split(&mut self, query: &str, top_k: usize) -> Result<RecallOutcome, SystemError> {
         // #1044: over-fetch only when the store actually holds expiries, so
         // the common case is byte-identical to before.
         let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
         let fetch = if drop_expired { top_k.saturating_add(5).max(top_k * 2) } else { top_k };
         let as_of = crate::medium::hemisphere::recall_now();
-        let results = self.engine.store.resonate_query_hits(query, fetch)
+        let (results, dream_hits) = self.engine.store.resonate_query_split(query, fetch)
             .map_err(SystemError::Store)?;
         let now = Utc::now();
 
@@ -1574,6 +1594,30 @@ impl KannakaMemorySystem {
                 });
             }
         }
+        // #979: dream rows are reported, not ranked — and not reactivated, so
+        // looking at a dream does not feed the replay signal that promotes it.
+        let mut dreams = Vec::new();
+        for hit in dream_hits {
+            if dreams.len() >= top_k {
+                break;
+            }
+            if let Some(m) = self.engine.store.get(&hit.id).ok().flatten() {
+                // Same expiry rule as the evidence rows above.
+                if drop_expired && Self::expired_as_of(m, as_of) {
+                    continue;
+                }
+                dreams.push(RecallResult {
+                    id: hit.id,
+                    content: m.content.clone(),
+                    similarity: hit.strength,
+                    strength: hit.strength,
+                    intuition: hit.is_intuition,
+                    age_hours: (now - m.created_at).num_seconds().max(0) as f64 / 3600.0,
+                    layer: m.layer_depth,
+                    times_seen: m.times_seen,
+                });
+            }
+        }
         // ADR-0036 Phase 1: record reactivation on the hits. This is the
         // production recall path; it previously never bumped retrieval_count
         // (only the legacy ResonanceEngine::recall did), so the replay signal
@@ -1603,7 +1647,7 @@ impl KannakaMemorySystem {
             );
             self.last_novelty = Some(n);
         }
-        Ok(out)
+        Ok(RecallOutcome { evidence: out, dreams })
     }
 
     /// ADR-0040: enable or disable the cerebellar novelty detector at runtime.
