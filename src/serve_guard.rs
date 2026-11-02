@@ -340,9 +340,6 @@ pub enum RateDecision {
         limit: u32,
         first_in_window: bool,
     },
-    /// Too many distinct requesters to track. Identity rotation, almost
-    /// certainly; refuse rather than let the limiter's map grow.
-    TooManyRequesters { tracked: usize },
 }
 
 impl RateDecision {
@@ -361,10 +358,6 @@ impl RateDecision {
             RateDecision::Global { limit, .. } => Some(format!(
                 "rate limited: this node answers at most {limit} asks per hour in total. Try again later."
             )),
-            RateDecision::TooManyRequesters { .. } => Some(
-                "rate limited: this node is tracking too many requesters right now. Try again later."
-                    .to_string(),
-            ),
         }
     }
 }
@@ -477,8 +470,21 @@ impl ServeRateLimiter {
             self.requesters
                 .retain(|_, b| now_secs >= b.window_start && now_secs - b.window_start < WINDOW_SECS);
         }
+        // Still full: make room by evicting the bucket whose window started
+        // first. Refusing every untracked key instead let one caller with 4096
+        // throwaway ids lock every NEW caller out for the whole window — the
+        // cheap outage this limiter exists to prevent (#1124). Memory stays
+        // bounded either way; a rotating caller only resets its own oldest
+        // buckets, and the global ceiling above still bounds the total.
         if !self.requesters.contains_key(key) && self.requesters.len() >= MAX_TRACKED_REQUESTERS {
-            return RateDecision::TooManyRequesters { tracked: self.requesters.len() };
+            if let Some(oldest) = self
+                .requesters
+                .iter()
+                .min_by_key(|(_, b)| b.window_start)
+                .map(|(k, _)| k.clone())
+            {
+                self.requesters.remove(&oldest);
+            }
         }
 
         let bucket = self
@@ -1066,15 +1072,28 @@ mod tests {
             assert!(rl.check(&format!("from:s{i}"), 1000).is_allow(), "ask {i}");
         }
         assert_eq!(rl.tracked(), MAX_TRACKED_REQUESTERS);
-        match rl.check("from:one-too-many", 1000) {
-            RateDecision::TooManyRequesters { tracked } => {
-                assert_eq!(tracked, MAX_TRACKED_REQUESTERS);
-            }
-            other => panic!("expected a capacity refusal, got {other:?}"),
-        }
-        assert_eq!(rl.tracked(), MAX_TRACKED_REQUESTERS, "a refusal must not record a new key");
+        // #1124: a new caller is served, not locked out, and the map stays bounded.
+        assert!(rl.check("from:one-too-many", 1001).is_allow(), "a new caller must not be locked out by a full map");
+        assert_eq!(rl.tracked(), MAX_TRACKED_REQUESTERS, "eviction keeps the map at its cap");
         // An hour later the stale entries are reclaimed and the node serves again.
         assert!(rl.check("from:later", 1000 + WINDOW_SECS).is_allow());
+    }
+
+    // #1124: the flood evicts its own oldest buckets, not a newer caller's.
+    #[test]
+    fn a_full_map_evicts_the_oldest_bucket() {
+        let mut rl = ServeRateLimiter::new(1, u32::MAX);
+        assert!(rl.check("from:early", 1000).is_allow());
+        for i in 0..MAX_TRACKED_REQUESTERS - 2 {
+            assert!(rl.check(&format!("from:flood{i}"), 1100).is_allow());
+        }
+        assert!(rl.check("from:honest", 1200).is_allow());
+        assert!(!rl.check("from:honest", 1200).is_allow(), "control: the per-requester limit holds");
+        assert_eq!(rl.tracked(), MAX_TRACKED_REQUESTERS);
+
+        assert!(rl.check("from:newcomer", 1300).is_allow());
+        assert!(!rl.requesters.contains_key("from:early"), "the oldest bucket is the one evicted");
+        assert!(!rl.check("from:honest", 1300).is_allow(), "a newer caller's spent bucket is kept, not reset");
     }
 
     #[test]
