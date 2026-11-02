@@ -2,7 +2,7 @@
 
 use std::env;
 // std::io::Read used in sub-commands
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use kannaka_memory::config::{self, KannakaConfig};
@@ -14,6 +14,92 @@ use kannaka_memory::glyph_bridge::GlyphEncoder;
 
 use kannaka_memory::MediumBackend;
 use kannaka_memory::{Codebook, EncodingPipeline, HrmStore, SimpleHashEncoder};
+
+/// Pure validation: prefix must not be empty or whitespace-only.
+fn validate_prefix(p: &str) -> Result<(), &'static str> {
+    if p.is_empty() {
+        return Err("empty prefix");
+    }
+    if p.trim().is_empty() {
+        return Err("whitespace-only prefix");
+    }
+    Ok(())
+}
+
+/// Pure validation: parse a numeric flag value.
+fn validate_numeric<T: std::str::FromStr>(v: &str) -> Result<T, &'static str> {
+    v.parse::<T>().map_err(|_| "invalid numeric value")
+}
+
+/// Pure path resolution: backup path follows the HRM name and location.
+fn get_backup_path(hrm_path: &Path, tag: &str, ts: &str) -> PathBuf {
+    let name = hrm_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("kannaka.hrm"))
+        .to_string_lossy();
+    hrm_path.with_file_name(format!("{}.bak-{}-{}", name, tag, ts))
+}
+
+/// Refuse to mutate when there is nothing to back up.
+fn check_backup_source(src: &Path) -> Result<(), String> {
+    if src.exists() {
+        Ok(())
+    } else {
+        Err(format!(
+            "HRM file {} does not exist; nothing to back up, aborting before any mutation.",
+            src.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn backup_source_must_exist() {
+        assert!(check_backup_source(Path::new("/nonexistent/zzz.hrm")).is_err());
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(check_backup_source(f.path()).is_ok(), "an existing store file must pass");
+    }
+
+    #[test]
+    fn prefix_validation() {
+        assert!(validate_prefix("valid").is_ok());
+        assert!(validate_prefix("  valid-with-space  ").is_ok());
+        assert_eq!(validate_prefix(""), Err("empty prefix"));
+        assert_eq!(validate_prefix("   "), Err("whitespace-only prefix"));
+        assert_eq!(validate_prefix("\t\n "), Err("whitespace-only prefix"));
+    }
+
+    #[test]
+    fn numeric_validation() {
+        assert_eq!(validate_numeric::<usize>("123"), Ok(123));
+        assert_eq!(validate_numeric::<f32>("1.23"), Ok(1.23));
+        assert!(validate_numeric::<usize>("abc").is_err());
+        assert!(validate_numeric::<usize>("1.23").is_err());
+        assert!(validate_numeric::<f32>("1O").is_err()); // typo 1O (letter O)
+    }
+
+    #[test]
+    fn backup_path_resolution() {
+        let hrm = Path::new("/custom/path/to/my.hrm");
+        let ts = "20261101-120000";
+        let bak = get_backup_path(hrm, "pre-belief-activate", ts);
+        assert_eq!(
+            bak.to_str().unwrap().replace('\\', "/"),
+            "/custom/path/to/my.hrm.bak-pre-belief-activate-20261101-120000"
+        );
+
+        let hrm_bare = Path::new("kannaka.hrm");
+        let bak_bare = get_backup_path(hrm_bare, "pre-couple", ts);
+        assert_eq!(
+            bak_bare.to_str().unwrap().replace('\\', "/"),
+            "kannaka.hrm.bak-pre-couple-20261101-120000"
+        );
+    }
+}
 
 #[cfg(feature = "collective")]
 use kannaka_memory::collective::{dream_cross_modal_link, Glyph, GlyphSource, SgaClass};
@@ -989,7 +1075,7 @@ pub(crate) fn parse_flag_value<T: std::str::FromStr>(
     usage: &str,
 ) -> T {
     let v = flag_value(args, i, flag, usage);
-    match v.parse::<T>() {
+    match validate_numeric::<T>(v) {
         Ok(t) => t,
         Err(_) => {
             eprintln!("{flag}: invalid value '{v}'");
@@ -1856,6 +1942,26 @@ fn main() {
     // All subsequent code uses `cfg` instead of raw env::var lookups.
     let cfg = KannakaConfig::load();
 
+    // Pre-load validation for destructive commands (#1131).
+    if args[command_start] == "prune-prefix" {
+        let mut prefixes = Vec::new();
+        for a in args[command_start + 1..].iter() {
+            if a != "--dry-run" {
+                prefixes.push(a.as_str());
+            }
+        }
+        if prefixes.is_empty() {
+            eprintln!("prune-prefix: at least one prefix required");
+            process::exit(1);
+        }
+        for p in prefixes {
+            if let Err(e) = validate_prefix(p) {
+                eprintln!("prune-prefix: prefix '{p}' is invalid: {e}");
+                process::exit(2);
+            }
+        }
+    }
+
     // ADR-0037: bridge persisted [belief] config → the KANNAKA_BELIEF_* env
     // vars the engine reads. Must run BEFORE the HRM loads / any belief check
     // (and before the update-check thread spawns, so set_var is single-threaded).
@@ -2719,6 +2825,7 @@ fn main() {
             // Phase-1 reach (Pinned is never evicted either way).
             let mut apply = false;
             let mut include_long_term = false;
+            const TRIAGE_USAGE: &str = "Usage: kannaka triage [--apply] [--dry-run] [--include-long-term] [--redundancy X] [--min-amplitude X] [--min-age-hours N] [--max-evict N] [--max-total N]";
             let mut max_total: Option<usize> = None;
             let mut params = kannaka_memory::openclaw::TriageParams {
                 redundancy: cfg.triage.redundancy,
@@ -2744,26 +2851,24 @@ fn main() {
                             include_long_term = true;
                             i += 1;
                         }
-                        "--redundancy" if i + 1 < args.len() => {
-                            params.redundancy = args[i + 1].parse().unwrap_or(params.redundancy);
+                        "--redundancy" => {
+                            params.redundancy = parse_flag_value(&args, i, "--redundancy", TRIAGE_USAGE);
                             i += 2;
                         }
-                        "--min-amplitude" if i + 1 < args.len() => {
-                            params.min_amplitude =
-                                args[i + 1].parse().unwrap_or(params.min_amplitude);
+                        "--min-amplitude" => {
+                            params.min_amplitude = parse_flag_value(&args, i, "--min-amplitude", TRIAGE_USAGE);
                             i += 2;
                         }
-                        "--min-age-hours" if i + 1 < args.len() => {
-                            params.min_age_hours =
-                                args[i + 1].parse().unwrap_or(params.min_age_hours);
+                        "--min-age-hours" => {
+                            params.min_age_hours = parse_flag_value(&args, i, "--min-age-hours", TRIAGE_USAGE);
                             i += 2;
                         }
-                        "--max-evict" if i + 1 < args.len() => {
-                            params.max_evict = args[i + 1].parse().unwrap_or(params.max_evict);
+                        "--max-evict" => {
+                            params.max_evict = parse_flag_value(&args, i, "--max-evict", TRIAGE_USAGE);
                             i += 2;
                         }
-                        "--max-total" if i + 1 < args.len() => {
-                            max_total = args[i + 1].parse().ok();
+                        "--max-total" => {
+                            max_total = Some(parse_flag_value(&args, i, "--max-total", TRIAGE_USAGE));
                             i += 2;
                         }
                         other => {
@@ -3561,19 +3666,33 @@ fn main() {
                         }
                     };
                     // Auto-backup before any mutation.
-                    let data_dir = KannakaConfig::data_dir();
-                    let hrm_path = data_dir.join("kannaka.hrm");
+                    // Back up the file this store opened, not a path rebuilt
+                    // from config, which can name a different file (#1067).
+                    let Some(hrm_path) = sys
+                        .engine
+                        .store
+                        .as_any()
+                        .downcast_ref::<kannaka_memory::hrm_store::HrmStore>()
+                        .map(|h| h.hrm_path().to_path_buf())
+                    else {
+                        eprintln!("error: the open store is not an HRM file; nothing to back up, aborting before any mutation.");
+                        if let Some(ref svc) = manage_service { svc_start(svc); }
+                        process::exit(1);
+                    };
                     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-                    let backup = data_dir.join(format!("kannaka.hrm.bak-pre-belief-activate-{ts}"));
+                    let backup = get_backup_path(&hrm_path, "pre-belief-activate", &ts);
                     let before = sys.engine.store.all_memories().map(|m| m.len()).unwrap_or(0);
-                    if hrm_path.exists() {
-                        if let Err(e) = std::fs::copy(&hrm_path, &backup) {
-                            eprintln!("error: backup failed ({e}) — aborting before any mutation.");
-                            if let Some(ref svc) = manage_service { svc_start(svc); }
-                            process::exit(1);
-                        }
-                        eprintln!("[belief] backup → {}", backup.display());
+                    if let Err(e) = check_backup_source(&hrm_path) {
+                        eprintln!("error: {e}");
+                        if let Some(ref svc) = manage_service { svc_start(svc); }
+                        process::exit(1);
                     }
+                    if let Err(e) = std::fs::copy(&hrm_path, &backup) {
+                        eprintln!("error: backup failed ({e}) — aborting before any mutation.");
+                        if let Some(ref svc) = manage_service { svc_start(svc); }
+                        process::exit(1);
+                    }
+                    eprintln!("[belief] backup → {}", backup.display());
                     // The migration: re-phase existing wavefronts from content (phase-only,
                     // count-stable) and persist. NOT a full dream — the slow/destructive
                     // consolidation passes stay with the gated nightly dream.
@@ -3586,9 +3705,9 @@ fn main() {
                     let tolerance = (before / 20).max(5);
                     if lost > tolerance {
                         eprintln!("!! memory count dropped {before} → {after} (> {tolerance} tolerance) — RESTORING backup");
-                        if hrm_path.exists() && backup.exists() {
-                            let _ = std::fs::copy(&backup, &hrm_path);
-                            eprintln!("restored {} from {}", hrm_path.display(), backup.display());
+                        match std::fs::copy(&backup, &hrm_path) {
+                            Ok(_) => eprintln!("restored {} from {}", hrm_path.display(), backup.display()),
+                            Err(e) => eprintln!("error: RESTORE FAILED ({e}); recover manually from {}", backup.display()),
                         }
                         if let Some(ref svc) = manage_service { svc_start(svc); }
                         process::exit(1);
@@ -3803,20 +3922,31 @@ fn main() {
                                     process::exit(1);
                                 }
                             };
-                            let data_dir = KannakaConfig::data_dir();
-                            let hrm_path = data_dir.join("kannaka.hrm");
+                            // The file this store opened (#1067), as in `belief activate`.
+                            let Some(hrm_path) = sys
+                                .engine
+                                .store
+                                .as_any()
+                                .downcast_ref::<kannaka_memory::hrm_store::HrmStore>()
+                                .map(|h| h.hrm_path().to_path_buf())
+                            else {
+                                eprintln!("error: the open store is not an HRM file; nothing to back up, aborting before any mutation.");
+                                process::exit(1);
+                            };
                             let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
                             // Backup before ANY mutation — and ABORT if it fails: a couple
                             // must never overwrite the live .hrm with no recoverable copy
                             // (mirrors `belief activate`).
-                            let backup = data_dir.join(format!("kannaka.hrm.bak-pre-couple-{ts}"));
-                            if hrm_path.exists() {
-                                if let Err(e) = std::fs::copy(&hrm_path, &backup) {
-                                    eprintln!("error: backup failed ({e}) — aborting before any mutation.");
-                                    process::exit(1);
-                                }
-                                eprintln!("[couple] backup → {}", backup.display());
+                            let backup = get_backup_path(&hrm_path, "pre-couple", &ts);
+                            if let Err(e) = check_backup_source(&hrm_path) {
+                                eprintln!("error: {e}");
+                                process::exit(1);
                             }
+                            if let Err(e) = std::fs::copy(&hrm_path, &backup) {
+                                eprintln!("error: backup failed ({e}) — aborting before any mutation.");
+                                process::exit(1);
+                            }
+                            eprintln!("[couple] backup → {}", backup.display());
                             let before = sys.engine.store.all_memories().map(|m| m.len()).unwrap_or(0);
                             let ring0 = sys.engine.store.as_any()
                                 .downcast_ref::<kannaka_memory::hrm_store::HrmStore>()
@@ -3832,9 +3962,9 @@ fn main() {
                             let tolerance = (before / 20).max(5);
                             if lost > tolerance {
                                 eprintln!("!! memory count dropped {before} → {after} (> {tolerance} tolerance) — RESTORING backup");
-                                if hrm_path.exists() && backup.exists() {
-                                    let _ = std::fs::copy(&backup, &hrm_path);
-                                    eprintln!("restored {} from {}", hrm_path.display(), backup.display());
+                                match std::fs::copy(&backup, &hrm_path) {
+                                    Ok(_) => eprintln!("restored {} from {}", hrm_path.display(), backup.display()),
+                                    Err(e) => eprintln!("error: RESTORE FAILED ({e}); recover manually from {}", backup.display()),
                                 }
                                 process::exit(1);
                             }
