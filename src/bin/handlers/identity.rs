@@ -348,7 +348,13 @@ fn handle_enroll_seed(args: &[String]) {
     let b64 = require_arg(args, 2, usage);
     // load_unmodified so persisting the seed set doesn't bake unrelated
     // env-only values (KANNAKA_AGENT_ID, KANNAKA_NATS_URL, …) into the file.
-    let mut cfg = KannakaConfig::load_unmodified();
+    let mut cfg = match KannakaConfig::load_unmodified() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  enroll-seed: {e}");
+            process::exit(1);
+        }
+    };
     match enroll_seed(&mut cfg, &b64) {
         Ok((count, added)) => {
             if !added {
@@ -443,7 +449,13 @@ fn handle_revoke(args: &[String]) {
     };
 
     // 1. Config: drop it from the pinned seed set (dedup-safe by decoded bytes).
-    let mut cfg = KannakaConfig::load_unmodified();
+    let mut cfg = match KannakaConfig::load_unmodified() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  revoke: {e}");
+            process::exit(1);
+        }
+    };
     let before = cfg.swarm_trust.seed_pubkeys.len();
     cfg.swarm_trust
         .seed_pubkeys

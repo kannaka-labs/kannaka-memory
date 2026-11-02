@@ -159,7 +159,13 @@ pub(crate) fn handle_swarm_activate_gate(args: &[String]) {
     // (b) Collect the target seed set = --seed args ∪ config.seed_pubkeys.
     // load_unmodified so a later write doesn't bake env-only values (agent id,
     // NATS url, …) into the file.
-    let cfg = KannakaConfig::load_unmodified();
+    let cfg = match KannakaConfig::load_unmodified() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  activate-gate: {e}");
+            process::exit(1);
+        }
+    };
     let plan = match build_gate_plan(&cfg, &opts.seeds) {
         Ok(p) => p,
         Err(e) => {
@@ -240,7 +246,13 @@ pub(crate) fn handle_swarm_activate_gate(args: &[String]) {
 
     // (d, --yes) Apply: enroll the seeds + flip the flag, then persist. Reload
     // load_unmodified so we write the on-disk view, not the env-enriched one.
-    let mut wcfg = KannakaConfig::load_unmodified();
+    let mut wcfg = match KannakaConfig::load_unmodified() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  activate-gate: {e}");
+            process::exit(1);
+        }
+    };
     for s in &opts.seeds {
         if let Err(e) = enroll_seed(&mut wcfg, s) {
             // Already validated in build_gate_plan; a failure here is unexpected.

@@ -155,7 +155,13 @@ pub(crate) fn handle_config(cfg: &KannakaConfig, args: &[String]) {
             // KannakaConfig::load() which applies env precedence, so
             // saving that value back to disk would leak the env into
             // the file.
-            let mut new_cfg = KannakaConfig::load_unmodified();
+            let mut new_cfg = match KannakaConfig::load_unmodified() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
             match key.as_str() {
                 "agent.id" => new_cfg.agent.id = value.clone(),
                 "agent.display_name" => new_cfg.agent.display_name = value.clone(),
