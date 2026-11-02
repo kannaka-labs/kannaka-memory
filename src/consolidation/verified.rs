@@ -52,8 +52,8 @@
 //!   out of scope for phase 1 and must not block every later dream). Bounds
 //!   are what the stages write, widened to the pre-cycle hull: amplitude
 //!   `[0, max(AMPLITUDE_CEILING, 1.3 x hallucination_amplitude)]`; phase
-//!   `[-PI, TAU]` (`stage_strengthen` stores `circular_mean2`, an un-normalised
-//!   atan2 in `[-PI, PI]`, every other stage stores `norm(..)` in `[0, TAU)`).
+//!   `[0, TAU]` (every stage stores `norm(..)` in `[0, TAU)`; #1136 fixed the
+//!   one that did not).
 //! * ids and provenance intact: every pre-cycle row is still present unless it
 //!   was already a ghost (see below); `origin_agent`, `created_at`, `content`
 //!   and `parents` unchanged (compared as a digest); `merge_history` not
@@ -95,7 +95,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -322,7 +322,7 @@ impl PreCycle {
         let mut amp_hi = 0.0f32;
         let default_freq = crate::wave::WaveParams::default().frequency;
         let (mut freq_lo, mut freq_hi) = (default_freq, default_freq);
-        let (mut phase_lo, mut phase_hi) = (-PI, TAU);
+        let (mut phase_lo, mut phase_hi) = (0.0f32, TAU);
         for m in engine.store.all_memories().unwrap_or_default() {
             if m.amplitude.is_finite() {
                 amp_hi = amp_hi.max(m.amplitude);

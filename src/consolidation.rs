@@ -723,8 +723,9 @@ impl ConsolidationEngine {
             // Circular mean, not arithmetic: a constructive pair straddling
             // the 2π wrap (e.g. 6.2 and 0.2) has an arithmetic mean near π —
             // anti-phase to the pair's own neighborhood, which the next dream
-            // then classifies destructive and dampens.
-            let avg_phase = circular_mean2(phase_a, phase_b);
+            // then classifies destructive and dampens. atan2 lands in
+            // (−π, π]; norm() stores it in [0, TAU) like every other stage (#1136).
+            let avg_phase = norm(circular_mean2(phase_a, phase_b));
 
             // Boost amplitude and align phase for memory A (skip ghosts and sub-noise-floor)
             if let Some(mem) = engine.store.get_mut(&pair.id_a).ok().flatten() {
@@ -3409,6 +3410,25 @@ mod tests {
         // Sanity: a non-straddling pair matches the arithmetic mean.
         let plain = circular_mean2(1.0, 2.0);
         assert!(angular_distance(plain, 1.5) < 1e-3, "got {plain}");
+    }
+
+    #[test]
+    fn strengthen_stores_a_normalised_phase() {
+        // #1136: 6.2 and 6.0 average to ~6.1, which atan2 reports as ~−0.18.
+        let mut engine = make_engine();
+        let a = insert_with_phase_and_layer(&mut engine, "first of a near-wrap pair", 6.2, 0);
+        let b = insert_with_phase_and_layer(&mut engine, "second of a near-wrap pair", 6.0, 0);
+        for id in [a, b] {
+            engine.store.get_mut(&id).ok().flatten().unwrap().amplitude = 0.5;
+        }
+        let eng = ConsolidationEngine::default();
+        let pairs = vec![InterferencePair { id_a: a, id_b: b, similarity: 0.9, kind: Interference::Constructive }];
+        assert_eq!(eng.stage_strengthen(&mut engine, &pairs), 2, "both rows must be strengthened");
+        for id in [a, b] {
+            let phase = engine.store.get(&id).unwrap().unwrap().phase;
+            assert!((0.0..std::f32::consts::TAU).contains(&phase), "stored phase {phase} is outside [0, TAU)");
+            assert!(angular_distance(phase, 6.1) < 0.01, "stored phase {phase} is not the pair's midpoint");
+        }
     }
 
     #[test]
