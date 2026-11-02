@@ -1595,8 +1595,20 @@ impl HrmStore {
             // #977: the chiral branch observes inline rather than through
             // `apply_observation`, so it needs the same gate — otherwise the knob
             // would silently do nothing on exactly the stores the fleet runs.
+            // The field effects land on the flat medium, which a chiral store
+            // never saves; the energy boost must also reach the cache and the
+            // right hemisphere, or the save writes the cached energies over it
+            // and recall changes nothing that lasts (#1133).
             if Self::recall_observation_enabled() {
                 self.medium.observe_wavefronts(&observations);
+                let n = results.len().max(1);
+                let boosts: Vec<(Uuid, f32)> = results.iter().enumerate()
+                    .map(|(i, r)| {
+                        let ranking_factor = 1.0 - (i as f32 / n as f32);
+                        (r.id, r.resonance_strength.abs().min(1.0).max(0.1) * ranking_factor)
+                    })
+                    .collect();
+                self.persist_chiral_observation_boosts(&boosts);
                 self.mark_dirty();
             }
 
@@ -1628,7 +1640,41 @@ impl HrmStore {
             })
             .collect();
         self.medium.observe_wavefronts(&observations);
+        // The save writes the cache's amplitudes back over the medium, so the
+        // boost lasts only if the cache carries it too (#1133). A ghost stays
+        // a ghost: recall must not revive a soft-deleted row.
+        for &(index, _) in &observations {
+            let id = self.medium.store.metadata[index].id;
+            let energy = self.medium.store.energy[index];
+            if let Some(m) = self.memory_cache.get_mut(&id) {
+                if m.amplitude > 0.0 {
+                    m.amplitude = energy;
+                }
+            }
+        }
         self.mark_dirty();
+    }
+
+    /// Recall's energy boost on a chiral store: the same `intensity * 0.1`
+    /// `Medium::observe_wavefront` adds, capped at ENERGY_CAP, written to the
+    /// cache (which the save syncs into the right hemisphere) and to the right
+    /// hemisphere itself (#1133). Ghosts are left at zero.
+    fn persist_chiral_observation_boosts(&mut self, boosts: &[(Uuid, f32)]) {
+        const OBSERVATION_ENERGY_SCALE: f32 = 0.1; // as Medium::observe_wavefront
+        let Some(ref mut chiral) = self.chiral else { return };
+        for &(id, intensity) in boosts {
+            if intensity <= 0.0 {
+                continue;
+            }
+            let Some(m) = self.memory_cache.get_mut(&id) else { continue };
+            if m.amplitude <= 0.0 {
+                continue;
+            }
+            m.amplitude = (m.amplitude + intensity * OBSERVATION_ENERGY_SCALE).min(ENERGY_CAP);
+            if let Some(&idx) = chiral.right.id_to_index.get(&id) {
+                chiral.right.energy[idx] = m.amplitude;
+            }
+        }
     }
     
     /// Get consciousness metrics from the holographic medium.
@@ -2794,6 +2840,16 @@ impl HrmStore {
     /// Creates emergent association in the field by combining the wavefront patterns
     /// and nudging their phases toward alignment.
     pub fn relate_wavefronts(&mut self, id_a: Uuid, id_b: Uuid) -> Result<Uuid, StoreError> {
+        // A chiral store persists only its right hemisphere, so the association
+        // must be written there or it is gone at the next load (#1133, as #630
+        // for insert).
+        if self.chiral.is_some() {
+            let associative_id = self.relate_on_chiral(id_a, id_b)?;
+            self.rebuild_cache()?;
+            self.mark_dirty();
+            return Ok(associative_id);
+        }
+
         let idx_a = self.medium.get_wavefront_index(&id_a)
             .ok_or_else(|| StoreError::Other(format!("Wavefront not found: {id_a}")))?;
         
@@ -2807,6 +2863,47 @@ impl HrmStore {
         self.rebuild_cache()?;
         self.mark_dirty();
 
+        Ok(associative_id)
+    }
+
+    /// `Medium::relate_wavefronts` on the right hemisphere: the association is
+    /// normalize(a + b) (a's direction if they cancel) at the mean energy, and
+    /// both phases are nudged toward each other. The flat version's settle step
+    /// has no hemisphere counterpart and is not applied.
+    fn relate_on_chiral(&mut self, id_a: Uuid, id_b: Uuid) -> Result<Uuid, StoreError> {
+        let chiral = self.chiral.as_mut().expect("caller checked chiral");
+        let right = &chiral.right;
+        let idx = |id: Uuid| {
+            right.id_to_index.get(&id).copied()
+                .ok_or_else(|| StoreError::Other(format!("Wavefront not found: {id}")))
+        };
+        let (ia, ib) = (idx(id_a)?, idx(id_b)?);
+        if ia == ib {
+            return Err(StoreError::Other("cannot relate a wavefront to itself".into()));
+        }
+        let row_a = right.wavefronts.row(ia);
+        let mut vector: Vec<f32> = row_a.iter().zip(right.wavefronts.row(ib).iter()).map(|(a, b)| a + b).collect();
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-6 {
+            vector.iter_mut().for_each(|x| *x /= norm);
+        } else {
+            vector = row_a.to_vec();
+        }
+        let energy = (right.energy[ia] + right.energy[ib]) / 2.0;
+        let content = format!(
+            "ASSOCIATION: [{}] <-> [{}]",
+            right.metadata[ia].content.chars().take(50).collect::<String>(),
+            right.metadata[ib].content.chars().take(50).collect::<String>()
+        );
+        let associative_id = chiral
+            .store_vector(&vector, content, energy)
+            .map_err(|e| StoreError::Other(format!("Failed to relate wavefronts: {e}")))?;
+
+        const PHASE_COUPLING: f32 = 0.15; // as Medium::relate_wavefronts
+        let right = &mut chiral.right;
+        let (pa, pb) = (right.phase[ia], right.phase[ib]);
+        right.phase[ia] += PHASE_COUPLING * (pb - pa).sin();
+        right.phase[ib] += PHASE_COUPLING * (pa - pb).sin();
         Ok(associative_id)
     }
     /// Cluster-prefilter candidate set for recall (refactor #4).
@@ -3732,6 +3829,86 @@ mod tests {
             "#630: inserted memory must survive save+reload on a chiral store"
         );
         assert_eq!(got.unwrap().content, CONTENT);
+    }
+
+    fn chiral_store_with(path: &std::path::Path, texts: &[&str]) -> (HrmStore, Vec<Uuid>) {
+        let mut store = HrmStore::new(make_test_pipeline(), path.to_path_buf());
+        store.upgrade_to_chiral();
+        let ids = texts
+            .iter()
+            .map(|t| {
+                let v = make_test_pipeline().encode_text(t).unwrap();
+                store.insert(HyperMemory::new(v, t.to_string())).unwrap()
+            })
+            .collect();
+        (store, ids)
+    }
+
+    /// #1133: on a chiral store `relate_wavefronts` wrote the association to
+    /// the flat medium, which is never saved, so the new row was gone at once.
+    #[test]
+    fn relate_survives_save_and_reload_on_a_chiral_store() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let (assoc, a, b) = {
+            let (mut store, ids) = chiral_store_with(&path, &["the lighthouse keeper", "the tide tables"]);
+            let assoc = store.relate_wavefronts(ids[0], ids[1]).unwrap();
+            assert!(store.get(&assoc).unwrap().is_some(), "the association must be in the live store");
+            store.flush().unwrap();
+            (assoc, ids[0], ids[1])
+        };
+        let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+        let got = reloaded.get(&assoc).unwrap().expect("#1133: the association must survive a reload");
+        assert!(got.content.starts_with("ASSOCIATION: [the lighthouse keeper]"), "{}", got.content);
+        assert!(reloaded.get(&a).unwrap().is_some() && reloaded.get(&b).unwrap().is_some(), "control: the related rows remain");
+    }
+
+    /// #1133: recall's energy boost landed on the flat medium, and the save
+    /// wrote the cached energies over it, so recall changed nothing that
+    /// lasted. Both store kinds must carry the boost through a reload; the
+    /// unrecalled row is the control (nothing boosts everything).
+    #[test]
+    fn recall_boost_survives_save_and_reload() {
+        for chiral in [true, false] {
+            let temp = NamedTempFile::new().unwrap();
+            let path = temp.path().to_path_buf();
+            let (hit, other, hit_before, other_before) = {
+                let mut store = HrmStore::new_flat(make_test_pipeline(), path.clone());
+                if chiral { store.upgrade_to_chiral(); }
+                let mut a = vec![0.0f32; WAVEFRONT_DIM]; a[3] = 1.0;
+                let mut b = vec![0.0f32; WAVEFRONT_DIM]; b[300] = 1.0;
+                let mut ma = HyperMemory::new(a.clone(), "the recalled memory".to_string()); ma.amplitude = 0.5;
+                let mut mb = HyperMemory::new(b, "an unrelated memory".to_string()); mb.amplitude = 0.5;
+                let ia = store.insert(ma).unwrap();
+                let ib = store.insert(mb).unwrap();
+                store.flush().unwrap();
+                let before = |s: &HrmStore, id| s.energy_of(&id).unwrap();
+                let (ea, eb) = (before(&store, ia), before(&store, ib));
+                // Through the real recall path; top-1, so exactly one row is observed.
+                std::env::remove_var("KANNAKA_RECALL_OBSERVE");
+                let hits = store.resonate_query("the recalled memory", 1).unwrap();
+                assert_eq!(hits.len(), 1, "chiral={chiral}: control: the recall must return a hit");
+                assert!(store.dirty, "chiral={chiral}: a boost is a persistent change and must be saved");
+                store.flush().unwrap();
+                if hits[0].0 == ia { (ia, ib, ea, eb) } else { (ib, ia, eb, ea) }
+            };
+            let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+            let hit_after = reloaded.energy_of(&hit).unwrap();
+            assert!(hit_after > hit_before + 1e-4, "chiral={chiral}: the boost was lost ({hit_before} -> {hit_after})");
+            assert_eq!(reloaded.energy_of(&other).unwrap(), other_before, "chiral={chiral}: control: an unrecalled row is unchanged");
+        }
+    }
+
+    /// #1133 with #1132: a recall must not revive a ghost.
+    #[test]
+    fn recall_boost_leaves_a_ghost_at_zero() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut store = HrmStore::new(make_test_pipeline(), temp.path().to_path_buf());
+        store.upgrade_to_chiral();
+        let id = store.insert(HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a ghost".to_string())).unwrap();
+        store.get_mut(&id).unwrap().unwrap().amplitude = 0.0;
+        store.persist_chiral_observation_boosts(&[(id, 1.0)]);
+        assert_eq!(store.get(&id).unwrap().unwrap().amplitude, 0.0);
     }
 
     /// #965: energy is ranking weight and is capped at ENERGY_CAP on every boost
