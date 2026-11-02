@@ -101,12 +101,14 @@ pub fn compute_merge_grouping(
         return grouping;
     }
 
-    // Build the N×D matrix; rows with a mismatched/empty vector or a Pinned tier
-    // are marked unusable (never grouped).
+    // Build the N×D matrix; rows with a mismatched/empty vector, a Pinned tier
+    // or zero energy are marked unusable (never grouped). Zero energy is a
+    // ghost (ADR-0037): it leaves only through `stage_compact_ghosts` after its
+    // recovery window, never by being merged away (#1132).
     let mut mat = Array2::<f32>::zeros((n, dim));
     let mut usable = vec![false; n];
     for (i, v) in vectors.iter().enumerate() {
-        if v.len() == dim && tiers[i] != Tier::Pinned {
+        if v.len() == dim && tiers[i] != Tier::Pinned && energies[i] > 0.0 {
             for (d, &x) in v.iter().enumerate() {
                 mat[[i, d]] = x;
             }
@@ -353,6 +355,8 @@ pub fn compute_decay_set(
             tiers.get(i).copied() == Some(Tier::ShortTerm)
                 && retrieval_counts.get(i).copied().unwrap_or(0) == 0
                 && !merge_participants.contains(&i)
+                // A ghost (zero amplitude) is not a trace to fade (#1132).
+                && amplitudes[i] > 0.0
         })
         .collect();
     if candidates.is_empty() {
@@ -1889,6 +1893,7 @@ impl HrmStore {
             if m.tier == Tier::ShortTerm {
                 st_total += 1;
                 if m.amplitude < opts.shortterm_evict
+                    && m.amplitude > 0.0 // a ghost is left to stage_compact_ghosts (#1132)
                     && m.retrieval_count == 0
                     && !merged_indices.contains(&i)
                 {
@@ -2021,6 +2026,16 @@ impl HrmStore {
                 })
                 .collect()
         };
+
+        // Ghosts (ADR-0037) are marked in the cache, which a flush writes back
+        // to the medium; a row ghosted earlier in this process can still carry
+        // its old energy here. Take the cache's zero so grouping, decay and
+        // evict all see the ghost and leave it alone, as the plan does (#1132).
+        for s in snaps.iter_mut() {
+            if self.memory_cache.get(&s.id).is_some_and(|m| m.amplitude <= 0.0) {
+                s.energy = 0.0;
+            }
+        }
 
         let n = snaps.len();
         report.memories_examined = n;
@@ -2159,6 +2174,7 @@ impl HrmStore {
         for s in &snaps {
             if s.tier == Tier::ShortTerm
                 && s.energy < opts.shortterm_evict
+                && s.energy > 0.0 // a ghost is left to stage_compact_ghosts (#1132)
                 && retrieval.get(&s.id).copied().unwrap_or(0) == 0
                 && !merged_ids.contains(&s.id)
             {
@@ -4633,6 +4649,39 @@ mod tests {
         assert!(store.get(&evicted).unwrap().is_none(), "cold ShortTerm evicted");
         assert!(store.get(&kept).unwrap().is_some(), "reactivated ShortTerm kept");
         assert_eq!(report.would_evict, 1);
+    }
+
+    /// #1132: a ghost (ADR-0037, amplitude 0) meets every evict condition and
+    /// can sit next to a near-duplicate, so Apply used to delete it or merge it
+    /// away inside the recovery window `stage_compact_ghosts` exists to keep.
+    /// The ghosts are made in the cache only, as the stages do, so the medium
+    /// still holds their old energy (the same-process case). The cold live row
+    /// is the control: eviction itself must still work.
+    #[test]
+    fn apply_leaves_ghosts_to_compaction_issue_1132() {
+        let mut store = HrmStore::new_flat(make_test_pipeline(), NamedTempFile::new().unwrap().path().to_path_buf());
+        let mut v1 = vec![0.0f32; WAVEFRONT_DIM]; v1[10] = 1.0;
+        let lone_ghost = insert_ctl(&mut store, v1, "lone ghost", 0.5, 0.0, Tier::ShortTerm, 0);
+        let base = vec![0.5f32; WAVEFRONT_DIM];
+        let live = insert_ctl(&mut store, base.clone(), "live twin", 1.0, 0.0, Tier::LongTerm, 0);
+        let mut v2 = base.clone(); v2[0] += 0.001;
+        let twin_ghost = insert_ctl(&mut store, v2, "ghost twin", 1.0, 0.0, Tier::ShortTerm, 0);
+        let mut v3 = vec![0.0f32; WAVEFRONT_DIM]; v3[20] = 1.0;
+        let cold = insert_ctl(&mut store, v3, "cold short", 0.05, 0.0, Tier::ShortTerm, 0);
+        for id in [lone_ghost, twin_ghost] {
+            store.get_mut(&id).unwrap().unwrap().amplitude = 0.0;
+        }
+
+        let plan = store.plan_consolidation(&apply_opts());
+        let report = store.apply_consolidation(&apply_opts());
+
+        assert!(store.get(&lone_ghost).unwrap().is_some(), "a ghost must not be evicted");
+        assert!(store.get(&twin_ghost).unwrap().is_some(), "a ghost must not be merged away");
+        assert!(store.get(&live).unwrap().is_some());
+        assert!(store.get(&cold).unwrap().is_none(), "control: a cold live ShortTerm is still evicted");
+        assert_eq!(report.would_evict, 1);
+        assert_eq!(report.would_absorb, 0);
+        assert_eq!((plan.would_evict, plan.would_absorb), (1, 0), "the plan must agree with apply");
     }
 
     #[test]
