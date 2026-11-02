@@ -1591,12 +1591,21 @@ impl HrmStore {
             // #977: the chiral branch observes inline rather than through
             // `apply_observation`, so it needs the same gate — otherwise the knob
             // would silently do nothing on exactly the stores the fleet runs.
-            // The observation lands on the flat medium, which a chiral store
-            // never saves, so it is session-local here and must not mark the
-            // store dirty: that forced a full `.hrm` rewrite per recall whose
-            // save then wrote the cached energies over the boost anyway (#1133).
+            // The field effects land on the flat medium, which a chiral store
+            // never saves; the energy boost must also reach the cache and the
+            // right hemisphere, or the save writes the cached energies over it
+            // and recall changes nothing that lasts (#1133).
             if Self::recall_observation_enabled() {
                 self.medium.observe_wavefronts(&observations);
+                let n = results.len().max(1);
+                let boosts: Vec<(Uuid, f32)> = results.iter().enumerate()
+                    .map(|(i, r)| {
+                        let ranking_factor = 1.0 - (i as f32 / n as f32);
+                        (r.id, r.resonance_strength.abs().min(1.0).max(0.1) * ranking_factor)
+                    })
+                    .collect();
+                self.persist_chiral_observation_boosts(&boosts);
+                self.mark_dirty();
             }
 
             Ok(results
@@ -1627,7 +1636,41 @@ impl HrmStore {
             })
             .collect();
         self.medium.observe_wavefronts(&observations);
+        // The save writes the cache's amplitudes back over the medium, so the
+        // boost lasts only if the cache carries it too (#1133). A ghost stays
+        // a ghost: recall must not revive a soft-deleted row.
+        for &(index, _) in &observations {
+            let id = self.medium.store.metadata[index].id;
+            let energy = self.medium.store.energy[index];
+            if let Some(m) = self.memory_cache.get_mut(&id) {
+                if m.amplitude > 0.0 {
+                    m.amplitude = energy;
+                }
+            }
+        }
         self.mark_dirty();
+    }
+
+    /// Recall's energy boost on a chiral store: the same `intensity * 0.1`
+    /// `Medium::observe_wavefront` adds, capped at ENERGY_CAP, written to the
+    /// cache (which the save syncs into the right hemisphere) and to the right
+    /// hemisphere itself (#1133). Ghosts are left at zero.
+    fn persist_chiral_observation_boosts(&mut self, boosts: &[(Uuid, f32)]) {
+        const OBSERVATION_ENERGY_SCALE: f32 = 0.1; // as Medium::observe_wavefront
+        let Some(ref mut chiral) = self.chiral else { return };
+        for &(id, intensity) in boosts {
+            if intensity <= 0.0 {
+                continue;
+            }
+            let Some(m) = self.memory_cache.get_mut(&id) else { continue };
+            if m.amplitude <= 0.0 {
+                continue;
+            }
+            m.amplitude = (m.amplitude + intensity * OBSERVATION_ENERGY_SCALE).min(ENERGY_CAP);
+            if let Some(&idx) = chiral.right.id_to_index.get(&id) {
+                chiral.right.energy[idx] = m.amplitude;
+            }
+        }
     }
     
     /// Get consciousness metrics from the holographic medium.
@@ -3804,17 +3847,52 @@ mod tests {
         assert!(reloaded.get(&a).unwrap().is_some() && reloaded.get(&b).unwrap().is_some(), "control: the related rows remain");
     }
 
-    /// #1133: recall's observation lands on the flat medium, which a chiral
-    /// store never saves; marking dirty forced a full rewrite per recall.
+    /// #1133: recall's energy boost landed on the flat medium, and the save
+    /// wrote the cached energies over it, so recall changed nothing that
+    /// lasted. Both store kinds must carry the boost through a reload; the
+    /// unrecalled row is the control (nothing boosts everything).
     #[test]
-    fn recall_does_not_dirty_a_chiral_store() {
+    fn recall_boost_survives_save_and_reload() {
+        for chiral in [true, false] {
+            let temp = NamedTempFile::new().unwrap();
+            let path = temp.path().to_path_buf();
+            let (hit, other, hit_before, other_before) = {
+                let mut store = HrmStore::new_flat(make_test_pipeline(), path.clone());
+                if chiral { store.upgrade_to_chiral(); }
+                let mut a = vec![0.0f32; WAVEFRONT_DIM]; a[3] = 1.0;
+                let mut b = vec![0.0f32; WAVEFRONT_DIM]; b[300] = 1.0;
+                let mut ma = HyperMemory::new(a.clone(), "the recalled memory".to_string()); ma.amplitude = 0.5;
+                let mut mb = HyperMemory::new(b, "an unrelated memory".to_string()); mb.amplitude = 0.5;
+                let ia = store.insert(ma).unwrap();
+                let ib = store.insert(mb).unwrap();
+                store.flush().unwrap();
+                let before = |s: &HrmStore, id| s.energy_of(&id).unwrap();
+                let (ea, eb) = (before(&store, ia), before(&store, ib));
+                // Through the real recall path; top-1, so exactly one row is observed.
+                std::env::remove_var("KANNAKA_RECALL_OBSERVE");
+                let hits = store.resonate_query("the recalled memory", 1).unwrap();
+                assert_eq!(hits.len(), 1, "chiral={chiral}: control: the recall must return a hit");
+                assert!(store.dirty, "chiral={chiral}: a boost is a persistent change and must be saved");
+                store.flush().unwrap();
+                if hits[0].0 == ia { (ia, ib, ea, eb) } else { (ib, ia, eb, ea) }
+            };
+            let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+            let hit_after = reloaded.energy_of(&hit).unwrap();
+            assert!(hit_after > hit_before + 1e-4, "chiral={chiral}: the boost was lost ({hit_before} -> {hit_after})");
+            assert_eq!(reloaded.energy_of(&other).unwrap(), other_before, "chiral={chiral}: control: an unrecalled row is unchanged");
+        }
+    }
+
+    /// #1133 with #1132: a recall must not revive a ghost.
+    #[test]
+    fn recall_boost_leaves_a_ghost_at_zero() {
         let temp = NamedTempFile::new().unwrap();
-        let (mut store, _) = chiral_store_with(temp.path(), &["copper wire gauge", "a spool of copper"]);
-        store.flush().unwrap();
-        assert!(!store.dirty, "control: a flushed store starts clean");
-        let hits = store.resonate_query_inner("copper", 2).unwrap();
-        assert!(!hits.is_empty(), "control: the recall must actually return something");
-        assert!(!store.dirty, "a recall changed nothing persistent and must not force a save");
+        let mut store = HrmStore::new(make_test_pipeline(), temp.path().to_path_buf());
+        store.upgrade_to_chiral();
+        let id = store.insert(HyperMemory::new(vec![0.5; WAVEFRONT_DIM], "a ghost".to_string())).unwrap();
+        store.get_mut(&id).unwrap().unwrap().amplitude = 0.0;
+        store.persist_chiral_observation_boosts(&[(id, 1.0)]);
+        assert_eq!(store.get(&id).unwrap().unwrap().amplitude, 0.0);
     }
 
     /// #965: energy is ranking weight and is capped at ENERGY_CAP on every boost
