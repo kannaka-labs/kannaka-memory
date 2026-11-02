@@ -1591,9 +1591,12 @@ impl HrmStore {
             // #977: the chiral branch observes inline rather than through
             // `apply_observation`, so it needs the same gate — otherwise the knob
             // would silently do nothing on exactly the stores the fleet runs.
+            // The observation lands on the flat medium, which a chiral store
+            // never saves, so it is session-local here and must not mark the
+            // store dirty: that forced a full `.hrm` rewrite per recall whose
+            // save then wrote the cached energies over the boost anyway (#1133).
             if Self::recall_observation_enabled() {
                 self.medium.observe_wavefronts(&observations);
-                self.mark_dirty();
             }
 
             Ok(results
@@ -2778,6 +2781,16 @@ impl HrmStore {
     /// Creates emergent association in the field by combining the wavefront patterns
     /// and nudging their phases toward alignment.
     pub fn relate_wavefronts(&mut self, id_a: Uuid, id_b: Uuid) -> Result<Uuid, StoreError> {
+        // A chiral store persists only its right hemisphere, so the association
+        // must be written there or it is gone at the next load (#1133, as #630
+        // for insert).
+        if self.chiral.is_some() {
+            let associative_id = self.relate_on_chiral(id_a, id_b)?;
+            self.rebuild_cache()?;
+            self.mark_dirty();
+            return Ok(associative_id);
+        }
+
         let idx_a = self.medium.get_wavefront_index(&id_a)
             .ok_or_else(|| StoreError::Other(format!("Wavefront not found: {id_a}")))?;
         
@@ -2791,6 +2804,47 @@ impl HrmStore {
         self.rebuild_cache()?;
         self.mark_dirty();
 
+        Ok(associative_id)
+    }
+
+    /// `Medium::relate_wavefronts` on the right hemisphere: the association is
+    /// normalize(a + b) (a's direction if they cancel) at the mean energy, and
+    /// both phases are nudged toward each other. The flat version's settle step
+    /// has no hemisphere counterpart and is not applied.
+    fn relate_on_chiral(&mut self, id_a: Uuid, id_b: Uuid) -> Result<Uuid, StoreError> {
+        let chiral = self.chiral.as_mut().expect("caller checked chiral");
+        let right = &chiral.right;
+        let idx = |id: Uuid| {
+            right.id_to_index.get(&id).copied()
+                .ok_or_else(|| StoreError::Other(format!("Wavefront not found: {id}")))
+        };
+        let (ia, ib) = (idx(id_a)?, idx(id_b)?);
+        if ia == ib {
+            return Err(StoreError::Other("cannot relate a wavefront to itself".into()));
+        }
+        let row_a = right.wavefronts.row(ia);
+        let mut vector: Vec<f32> = row_a.iter().zip(right.wavefronts.row(ib).iter()).map(|(a, b)| a + b).collect();
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-6 {
+            vector.iter_mut().for_each(|x| *x /= norm);
+        } else {
+            vector = row_a.to_vec();
+        }
+        let energy = (right.energy[ia] + right.energy[ib]) / 2.0;
+        let content = format!(
+            "ASSOCIATION: [{}] <-> [{}]",
+            right.metadata[ia].content.chars().take(50).collect::<String>(),
+            right.metadata[ib].content.chars().take(50).collect::<String>()
+        );
+        let associative_id = chiral
+            .store_vector(&vector, content, energy)
+            .map_err(|e| StoreError::Other(format!("Failed to relate wavefronts: {e}")))?;
+
+        const PHASE_COUPLING: f32 = 0.15; // as Medium::relate_wavefronts
+        let right = &mut chiral.right;
+        let (pa, pb) = (right.phase[ia], right.phase[ib]);
+        right.phase[ia] += PHASE_COUPLING * (pb - pa).sin();
+        right.phase[ib] += PHASE_COUPLING * (pa - pb).sin();
         Ok(associative_id)
     }
     /// Cluster-prefilter candidate set for recall (refactor #4).
@@ -3716,6 +3770,51 @@ mod tests {
             "#630: inserted memory must survive save+reload on a chiral store"
         );
         assert_eq!(got.unwrap().content, CONTENT);
+    }
+
+    fn chiral_store_with(path: &std::path::Path, texts: &[&str]) -> (HrmStore, Vec<Uuid>) {
+        let mut store = HrmStore::new(make_test_pipeline(), path.to_path_buf());
+        store.upgrade_to_chiral();
+        let ids = texts
+            .iter()
+            .map(|t| {
+                let v = make_test_pipeline().encode_text(t).unwrap();
+                store.insert(HyperMemory::new(v, t.to_string())).unwrap()
+            })
+            .collect();
+        (store, ids)
+    }
+
+    /// #1133: on a chiral store `relate_wavefronts` wrote the association to
+    /// the flat medium, which is never saved, so the new row was gone at once.
+    #[test]
+    fn relate_survives_save_and_reload_on_a_chiral_store() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let (assoc, a, b) = {
+            let (mut store, ids) = chiral_store_with(&path, &["the lighthouse keeper", "the tide tables"]);
+            let assoc = store.relate_wavefronts(ids[0], ids[1]).unwrap();
+            assert!(store.get(&assoc).unwrap().is_some(), "the association must be in the live store");
+            store.flush().unwrap();
+            (assoc, ids[0], ids[1])
+        };
+        let reloaded = HrmStore::load(make_test_pipeline(), path).unwrap();
+        let got = reloaded.get(&assoc).unwrap().expect("#1133: the association must survive a reload");
+        assert!(got.content.starts_with("ASSOCIATION: [the lighthouse keeper]"), "{}", got.content);
+        assert!(reloaded.get(&a).unwrap().is_some() && reloaded.get(&b).unwrap().is_some(), "control: the related rows remain");
+    }
+
+    /// #1133: recall's observation lands on the flat medium, which a chiral
+    /// store never saves; marking dirty forced a full rewrite per recall.
+    #[test]
+    fn recall_does_not_dirty_a_chiral_store() {
+        let temp = NamedTempFile::new().unwrap();
+        let (mut store, _) = chiral_store_with(temp.path(), &["copper wire gauge", "a spool of copper"]);
+        store.flush().unwrap();
+        assert!(!store.dirty, "control: a flushed store starts clean");
+        let hits = store.resonate_query_inner("copper", 2).unwrap();
+        assert!(!hits.is_empty(), "control: the recall must actually return something");
+        assert!(!store.dirty, "a recall changed nothing persistent and must not force a save");
     }
 
     /// #965: energy is ranking weight and is capped at ENERGY_CAP on every boost
