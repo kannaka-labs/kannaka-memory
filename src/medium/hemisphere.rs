@@ -366,6 +366,17 @@ impl Hemisphere {
         content: String,
         importance: f32,
     ) -> Result<Uuid, MediumError> {
+        // Every insert path ends here, so this is where a bad amplitude is
+        // stopped: one NaN energy turns every phase in the hemisphere NaN, and
+        // an energy above ENERGY_CAP is never pruned (#1129).
+        if !importance.is_finite() {
+            return Err(MediumError::InvalidInput(format!("importance {importance} is not finite")));
+        }
+        if vector.iter().any(|v| !v.is_finite()) {
+            return Err(MediumError::InvalidInput("vector has a non-finite component".into()));
+        }
+        let importance = importance.clamp(0.0, ENERGY_CAP);
+
         // Adapt vector to hemisphere dimensions (truncate or zero-pad)
         let adapted = Self::adapt_vector(vector, self.dims);
 
@@ -1104,6 +1115,35 @@ impl Hemisphere {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_wavefront_clamps_importance_into_bounds() {
+        let mut h = Hemisphere::new(Hand::Left, 16);
+        let v: Vec<f32> = (0..16).map(|i| (i as f32 * 0.3).sin()).collect();
+        h.add_wavefront(&v, "high".into(), 5.0).unwrap();
+        h.add_wavefront(&v, "negative".into(), -1.0).unwrap();
+        h.add_wavefront(&v, "normal".into(), 0.7).unwrap();
+        assert_eq!(h.energy[0], ENERGY_CAP);
+        assert_eq!(h.energy[1], 0.0);
+        assert_eq!(h.energy[2], 0.7, "an in-range importance is stored unchanged");
+    }
+
+    #[test]
+    fn add_wavefront_refuses_non_finite_input() {
+        let mut h = Hemisphere::new(Hand::Right, 16);
+        let v = vec![0.5f32; 16];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(h.add_wavefront(&v, "bad importance".into(), bad).is_err());
+        }
+        let mut nan_v = v.clone();
+        nan_v[3] = f32::NAN;
+        assert!(h.add_wavefront(&nan_v, "nan vector".into(), 0.5).is_err());
+        let mut inf_v = v.clone();
+        inf_v[0] = f32::INFINITY;
+        assert!(h.add_wavefront(&inf_v, "inf vector".into(), 0.5).is_err());
+        assert_eq!(h.len, 0, "a refused insert must not take a slot");
+        assert!(h.phase.iter().all(|p| p.is_finite()));
+    }
 
     #[test]
     fn left_hemisphere_no_dampening() {

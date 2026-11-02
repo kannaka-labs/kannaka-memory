@@ -213,7 +213,12 @@ pub fn dispatch_tool(
             if content.is_empty() {
                 return ("remember requires non-empty content".into(), true);
             }
-            let importance = input.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
+            // The model's number, clamped like the reinforce floor (#1129).
+            let importance = input
+                .get("importance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
             let category = input.get("category").and_then(|v| v.as_str()).unwrap_or("semantic");
             // `remember_reporting`, not `remember_with_category`: a repeat is
             // reinforced rather than inserted, and on that path `importance` is

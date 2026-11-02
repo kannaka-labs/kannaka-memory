@@ -60,6 +60,8 @@ pub enum MediumError {
     Git(String),
     #[error("No git repository found")]
     NoGitRepo,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 // ---------------------------------------------------------------------------
