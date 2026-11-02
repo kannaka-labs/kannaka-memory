@@ -255,7 +255,13 @@ fn acquire_write_lock_blocking(timeout_secs: u64) -> Option<WriteLock> {
 /// values into the file). Stateless: does NOT touch the HRM and does NOT re-phase
 /// existing memories — that's `kannaka belief activate`.
 fn handle_belief_toggle(enable: bool) {
-    let mut cfg = KannakaConfig::load_unmodified();
+    let mut cfg = match KannakaConfig::load_unmodified() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
     cfg.belief.enabled = enable;
     match cfg.save() {
         Ok(()) => {
@@ -3475,7 +3481,7 @@ fn main() {
                 "status" => {
                     let enabled = kannaka_memory::medium::chiral::belief_phase_enabled();
                     let max_n = std::env::var("KANNAKA_BELIEF_MAX_N").ok().and_then(|v| v.parse::<u64>().ok());
-                    let file_cfg = KannakaConfig::load_unmodified();
+                    let file_cfg = KannakaConfig::load_unmodified_or_default();
                     let mem_count = sys.engine.store.all_memories().map(|m| m.len()).unwrap_or(0);
                     let full = args[command_start..].iter().any(|a| a == "--full");
                     let hrm = sys

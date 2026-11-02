@@ -790,7 +790,21 @@ impl KannakaConfig {
                         .unwrap_or(false);
                     toml::from_str::<KannakaConfig>(&text).unwrap_or_else(|e| {
                         eprintln!("[config] Warning: failed to parse {}: {}", path.display(), e);
-                        KannakaConfig::default()
+                        // Valid TOML with a type error elsewhere lands here. The
+                        // default's id is a fresh random one, so keep the id the
+                        // file named; if it named none, the persisted-id lookup
+                        // below supplies it - never a new id per process (#1127).
+                        let mut d = KannakaConfig::default();
+                        if id_came_from_config {
+                            if let Some(id) = text
+                                .parse::<toml::Value>()
+                                .ok()
+                                .and_then(|v| v.get("agent")?.get("id")?.as_str().map(|i| i.to_string()))
+                            {
+                                d.agent.id = id;
+                            }
+                        }
+                        d
                     })
                 }
                 Err(e) => {
@@ -1002,14 +1016,35 @@ impl KannakaConfig {
     /// persist unrelated env-only values (`KANNAKA_AGENT_ID`,
     /// `KANNAKA_NATS_URL`, etc.) back into the file (#99). Everything
     /// else should keep using `load()`.
-    pub fn load_unmodified() -> Self {
+    ///
+    /// A missing file yields defaults, but a file that exists and cannot be
+    /// read or parsed is an `Err` naming the path and the toml error (line
+    /// and column). Callers that WRITE must surface it and not save: saving
+    /// the default struct over a typo'd config would silently replace the
+    /// agent id, hub token and API key (#1127). Read-only callers use
+    /// `load_unmodified_or_default()`.
+    pub fn load_unmodified() -> Result<Self, String> {
         let path = Self::config_path();
-        if !path.exists() { return Self::default(); }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
-        toml::from_str(&content).unwrap_or_default()
+        if !path.exists() { return Ok(Self::default()); }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
+        toml::from_str(&content).map_err(|e| {
+            format!(
+                "config {} does not parse ({e}); refusing to overwrite it - \
+                 fix it or move it aside, then re-run",
+                path.display()
+            )
+        })
+    }
+
+    /// `load_unmodified()` for READ-ONLY callers: an unreadable or
+    /// unparseable file falls back to defaults (with a warning) because
+    /// nothing is written back.
+    pub fn load_unmodified_or_default() -> Self {
+        Self::load_unmodified().unwrap_or_else(|e| {
+            eprintln!("[config] Warning: {e}");
+            Self::default()
+        })
     }
 
     /// Backward-compatible helper: persist `agent_id` to `~/.kannaka/agent_id`
@@ -5334,6 +5369,82 @@ id = \"from-config\"
     }
 
     #[test]
+    fn unparseable_config_is_refused_and_left_untouched() {
+        let _lock = ID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = IdEnvGuard::take();
+        let dir = temp_data_dir("1127-bad");
+        let bad = "[agent]\nid = \"keep-me\"\n\n[llm\napi_key = \"sk-secret\"\n";
+        std::fs::write(dir.join("config.toml"), bad).unwrap();
+        std::env::set_var("KANNAKA_DATA_DIR", &dir);
+
+        // The write path: load, mutate, save. The load must stop it.
+        let attempt = KannakaConfig::load_unmodified().and_then(|mut c| {
+            c.belief.enabled = true;
+            c.save()
+        });
+        let err = attempt.expect_err("an unparseable config must be refused");
+        assert!(err.contains("config.toml"), "error must name the path: {err}");
+        assert!(err.contains("line 4"), "error must carry the line: {err}");
+        assert!(err.contains("column"), "error must carry the column: {err}");
+        assert_eq!(
+            std::fs::read(dir.join("config.toml")).unwrap(),
+            bad.as_bytes(),
+            "the file must be byte-for-byte unchanged"
+        );
+
+        // Read-only callers still get a usable default.
+        assert!(!KannakaConfig::load_unmodified_or_default().belief.enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_config_still_yields_defaults() {
+        let _lock = ID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = IdEnvGuard::take();
+        let dir = temp_data_dir("1127-missing");
+        std::env::set_var("KANNAKA_DATA_DIR", &dir);
+
+        let cfg = KannakaConfig::load_unmodified().expect("a missing file is not an error");
+        assert_eq!(cfg.belief.enabled, KannakaConfig::default().belief.enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1127: valid TOML with a type error fell back to a default whose id is
+    /// freshly random, and the persisted agent_id file was skipped.
+    #[test]
+    fn type_error_in_config_keeps_the_agent_id() {
+        let _lock = ID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = IdEnvGuard::take();
+        std::env::remove_var("KANNAKA_AGENT_ID");
+
+        // (a) config names no id: the persisted file supplies it.
+        let dir = temp_data_dir("1127-type-a");
+        std::fs::write(dir.join("agent_id"), "persisted-id").unwrap();
+        std::fs::write(dir.join("config.toml"), "[swarm]\nenabled = \"yes\"\n").unwrap();
+        std::env::set_var("KANNAKA_DATA_DIR", &dir);
+        assert_eq!(KannakaConfig::load().agent.id, "persisted-id");
+        assert_eq!(KannakaConfig::load().agent.id, "persisted-id");
+
+        // (b) config names an id: that one wins, as it does for a clean config.
+        // This is the half that failed before the fix (a fresh random id each run);
+        // (a) already passed and guards the existing persisted-id path.
+        let dir_b = temp_data_dir("1127-type-b");
+        std::fs::write(dir_b.join("agent_id"), "persisted-id").unwrap();
+        std::fs::write(
+            dir_b.join("config.toml"),
+            "[agent]\nid = \"from-config\"\n\n[swarm]\nenabled = \"yes\"\n",
+        )
+        .unwrap();
+        std::env::set_var("KANNAKA_DATA_DIR", &dir_b);
+        assert_eq!(KannakaConfig::load().agent.id, "from-config");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    #[test]
     fn env_var_still_outranks_the_legacy_file() {
         let _lock = ID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _restore = IdEnvGuard::take();
@@ -5495,7 +5606,7 @@ id = \"from-config\"
         let returned = run_init_wizard(overrides).expect("non-interactive re-run succeeds");
         assert_lived_in_values_survived(&returned, "returned config");
 
-        let back = KannakaConfig::load_unmodified();
+        let back = KannakaConfig::load_unmodified().unwrap();
         assert_lived_in_values_survived(&back, "config.toml after re-run");
         assert_eq!(
             std::fs::read_to_string(dir.join("agent_id")).unwrap().trim(),
@@ -5534,7 +5645,7 @@ id = \"from-config\"
             ..Default::default()
         };
         run_init_wizard(overrides).unwrap();
-        let back = KannakaConfig::load_unmodified();
+        let back = KannakaConfig::load_unmodified().unwrap();
         assert_eq!(back.agent.id, "renamed-node");
         assert_eq!(back.agent.persona, "I am the medium, speaking.");
         assert_eq!(back.llm.provider, "anthropic");
@@ -6416,7 +6527,7 @@ id = \"from-config\"
             b.join("kannaka.hrm").to_string_lossy()
         );
         assert_eq!(
-            KannakaConfig::load_unmodified().hrm.path,
+            KannakaConfig::load_unmodified().unwrap().hrm.path,
             abs("/elsewhere/kannaka.hrm")
         );
         let _ = std::fs::remove_dir_all(&b);

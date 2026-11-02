@@ -139,7 +139,13 @@ fn now_epoch() -> i64 {
 /// Persist a (new) KAX token to the config file. Loads the on-disk config
 /// unmodified (so env overrides aren't baked in) and saves 0600.
 fn persist_kax_token(token: &str) {
-    let mut on_disk = KannakaConfig::load_unmodified();
+    let mut on_disk = match KannakaConfig::load_unmodified() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  error: could not persist KAX token to config: {e}");
+            process::exit(1);
+        }
+    };
     on_disk.ghostsignals.kax_token = token.to_string();
     if let Err(e) = on_disk.save() {
         eprintln!("  warning: could not persist KAX token to config: {e}");
