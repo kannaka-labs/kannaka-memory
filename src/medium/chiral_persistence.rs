@@ -480,7 +480,29 @@ pub fn content_digest<P: AsRef<Path>>(path: P) -> Result<String, MediumError> {
 
 impl ChiralMedium {
     /// Save the chiral medium to a .hrm v2 file.
+    ///
+    /// Refuses, before any bytes are written, a hemisphere whose `metadata`
+    /// length differs from its count: the loader rejects such a file as
+    /// `CorruptHrm`, so writing it would replace a loadable store with one
+    /// that never loads (#1126). A short `timestamps` vec is not refused; the
+    /// writer pads it and the result loads (`save_recovers_from_short_timestamps_vec`).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), MediumError> {
+        for h in [&self.left, &self.right] {
+            if h.metadata.len() != h.count() {
+                return Err(MediumError::CorruptHrm(format!(
+                    "hemisphere {:?} refuses to save: count={} metadata={}",
+                    h.hand,
+                    h.count(),
+                    h.metadata.len()
+                )));
+            }
+        }
+        self.save_unchecked(path)
+    }
+
+    /// The writer behind [`Self::save`], without its consistency check. Tests
+    /// use it to produce the desynced file the loader must reject.
+    fn save_unchecked<P: AsRef<Path>>(&self, path: P) -> Result<(), MediumError> {
         let path_ref = path.as_ref();
         // Unique tmp path per save. Concurrent kannaka processes (substrate
         // run / swarm join / swarm serve / attention serve / ad-hoc ask)
@@ -1641,13 +1663,52 @@ mod tests {
 
         let dir = std::env::temp_dir();
         let path = dir.join("test_chiral_section_desync.hrm");
-        cm.save(&path).unwrap();
+        // `save` refuses this store (#1126); write it past the check.
+        cm.save_unchecked(&path).unwrap();
 
         match ChiralMedium::load(&path) {
             Err(MediumError::CorruptHrm(_)) => {}
             other => panic!("expected CorruptHrm on section-size desync, got {other:?}"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    // #1126: the same desync must fail the save and leave the live store as it was.
+    #[test]
+    fn save_refuses_metadata_desync_and_keeps_the_store() {
+        let mut cm = ChiralMedium::new();
+        let pipeline = test_pipeline();
+        for i in 0..6 {
+            cm.store(&format!("save desync probe {i}"), 0.8, &pipeline).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.hrm");
+        cm.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        cm.right.metadata.pop();
+        match cm.save(&path) {
+            Err(MediumError::CorruptHrm(msg)) => assert!(msg.contains("refuses to save"), "{msg}"),
+            other => panic!("expected CorruptHrm from save, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the live store must be untouched");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != "live.hrm")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file may be left behind: {leftovers:?}");
+
+        // Control: a consistent store still saves and round-trips.
+        let mut consistent = ChiralMedium::new();
+        for i in 0..4 {
+            consistent.store(&format!("round trip {i}"), 0.6, &pipeline).unwrap();
+        }
+        consistent.save(&path).unwrap();
+        let loaded = ChiralMedium::load(&path).unwrap();
+        assert_eq!(loaded.left.count(), consistent.left.count());
+        assert_eq!(loaded.right.count(), consistent.right.count());
+        assert_eq!(loaded.right.metadata.len(), loaded.right.count());
     }
 
     #[test]
