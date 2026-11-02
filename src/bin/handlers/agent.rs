@@ -466,8 +466,17 @@ pub fn handle_agent(sys: &mut KannakaMemorySystem, cfg: &KannakaConfig, args: &[
     let mut messages: Vec<Message> = Vec::new();
     let sess_path = session.as_deref().and_then(session_path);
     if let Some(p) = &sess_path {
-        if let Ok(h) = agent::load_session(p) {
-            messages = h;
+        match agent::load_session(p) {
+            Ok(h) => messages = h,
+            // Starting empty would save over the whole conversation on the
+            // first turn (#1128); refuse and leave the file as it is.
+            Err(e) => {
+                emit(json!({ "kind": "error", "text": format!(
+                    "session file {} is unreadable ({e}); left untouched. Move it aside to start a new session.",
+                    p.display()
+                ) }));
+                return;
+            }
         }
     }
 
@@ -532,7 +541,11 @@ pub fn handle_agent(sys: &mut KannakaMemorySystem, cfg: &KannakaConfig, args: &[
                     &emit,
                 );
                 if let Some(p) = &sess_path {
-                    let _ = agent::save_session(p, &messages);
+                    if let Err(e) = agent::save_session(p, &messages) {
+                        emit(json!({ "kind": "error", "text": format!(
+                            "could not save session {}: {e}", p.display()
+                        ) }));
+                    }
                 }
             }
             _ => continue, // stray approval with no pending request, etc.

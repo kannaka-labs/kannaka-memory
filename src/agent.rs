@@ -54,6 +54,8 @@ pub enum AgentError {
     Memory(#[from] crate::openclaw::SystemError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("session file {path}: {reason}")]
+    Session { path: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,7 +1319,7 @@ pub fn ask_with_opts(
 
     // Load or seed history.
     let mut history = match opts.session_path {
-        Some(path) => load_session(path).unwrap_or_default(),
+        Some(path) => load_session_for_turn(path)?,
         None => Vec::new(),
     };
     history.push(Message::user_text(prompt));
@@ -1354,7 +1356,10 @@ pub fn ask_with_opts(
     result.context = surfaced;
 
     if let Some(path) = opts.session_path {
-        let _ = save_session(path, &history);
+        save_session(path, &history).map_err(|e| AgentError::Session {
+            path: path.display().to_string(),
+            reason: format!("could not save this turn: {e}"),
+        })?;
     }
     Ok(result)
 }
@@ -1703,14 +1708,22 @@ pub fn load_session(path: &std::path::Path) -> std::io::Result<Vec<Message>> {
     Ok(msgs)
 }
 
-/// Persist a session's message history to disk (creates parent dirs).
+/// The history a turn starts from. An unreadable or unparsable session file
+/// is an error, not an empty history: the turn would otherwise save one
+/// message over the whole conversation (#1128).
+fn load_session_for_turn(path: &std::path::Path) -> Result<Vec<Message>, AgentError> {
+    load_session(path).map_err(|e| AgentError::Session {
+        path: path.display().to_string(),
+        reason: format!("unreadable, left untouched: {e}"),
+    })
+}
+
+/// Persist a session's message history to disk (creates parent dirs). The
+/// write is atomic, so a crash mid-write cannot leave a truncated file (#1128).
 pub fn save_session(path: &std::path::Path, history: &[Message]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(history)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, bytes)
+    crate::fs_util::atomic_write_bytes(path, &bytes).map_err(std::io::Error::other)
 }
 
 /// Multi-turn chat: surface fresh memories from the new user message, append
@@ -1987,6 +2000,37 @@ mod remote_ask_mode_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // #1128: a turn must not start from an empty history when the session
+    // file exists but cannot be read; that turn's save would erase it.
+    #[test]
+    fn unreadable_session_is_an_error_and_stays_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let truncated = br#"[{"role":"user","content":[{"type":"text","te"#;
+        std::fs::write(&path, truncated).unwrap();
+        match load_session_for_turn(&path) {
+            Err(AgentError::Session { reason, .. }) => assert!(reason.contains("left untouched"), "{reason}"),
+            other => panic!("expected AgentError::Session, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), truncated, "the file must not be modified");
+    }
+
+    #[test]
+    fn missing_session_starts_empty_and_saved_session_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("session.json");
+        assert!(load_session_for_turn(&path).unwrap().is_empty());
+        save_session(&path, &[Message::user_text("hello")]).unwrap();
+        let loaded = load_session_for_turn(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "hello"),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+        let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "the atomic write must leave no temp file");
+    }
 
     use crate::config::AgentConfig;
 
