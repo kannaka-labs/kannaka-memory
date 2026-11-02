@@ -2615,6 +2615,14 @@ impl SwarmTransport {
         self.ping().is_ok()
     }
 
+    /// The `connected` flag alone, with no PING. A live PING reads frames off
+    /// the shared socket and discards everything that is not a PONG, so on a
+    /// transport with an open subscription it eats that subscription's
+    /// messages (#1125).
+    fn connected_flag(&self) -> bool {
+        *self.connected.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Mark the connection as disconnected (used internally on I/O failure).
     fn mark_disconnected(&self) {
         *self.connected.lock().unwrap_or_else(|p| p.into_inner()) = false;
@@ -3114,7 +3122,10 @@ impl SwarmTransport {
             }
             None => {}
         }
-        if !self.is_connected() || event_probe_backing_off(&key) {
+        // The flag, not `is_connected()`: the probe handshake below already
+        // learns whether the broker answers, and a live PING here would read
+        // and drop frames meant for a subscription on this socket (#1125).
+        if !self.connected_flag() || event_probe_backing_off(&key) {
             return self.publish_raw(subject, payload);
         }
         let mut probe = match handshake(&self.url, self.explicit_creds.as_ref()) {
@@ -5228,6 +5239,54 @@ mod tests {
     ///
     /// Driven through `reply()` against a fake broker, so it proves the transport
     /// refuses, not that a predicate returns false.
+    /// #1125: `publish_memory_event` must not PING the shared socket. `swarm
+    /// serve` calls it on a transport whose recall subscription is open, and
+    /// `ping()` drops every frame that is not a PONG. The fake broker counts
+    /// PINGs per connection; the main connection's only one is the handshake.
+    #[test]
+    fn publish_memory_event_does_not_ping_the_shared_connection() {
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let pings: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let counts = pings.clone();
+        std::thread::spawn(move || {
+            for idx in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else { return };
+                counts.lock().unwrap().push(0);
+                let counts = counts.clone();
+                std::thread::spawn(move || {
+                    let _ = sock.write_all(b"INFO {\"server_id\":\"fake\",\"proto\":1,\"max_payload\":1048576}\r\n");
+                    let mut reader = BufReader::new(sock.try_clone().expect("clone"));
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+                        if line.starts_with("PING") {
+                            counts.lock().unwrap()[idx] += 1;
+                            let _ = sock.write_all(b"PONG\r\n");
+                        } else if line.starts_with("CONNECT") || line.starts_with("PUB") {
+                            let _ = sock.write_all(b"+OK\r\n");
+                        }
+                        let _ = sock.flush();
+                    }
+                });
+            }
+        });
+        let transport = SwarmTransport::connect(&format!("nats://{addr}")).expect("handshake");
+        let handshake_pings = pings.lock().unwrap()[0];
+        assert!(handshake_pings >= 1, "control: the handshake itself pings");
+
+        let _ = transport.publish_memory_event("KANNAKA.memory.issue1125", b"{}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            pings.lock().unwrap()[0],
+            handshake_pings,
+            "publish_memory_event sent a live PING on the shared connection"
+        );
+        drop(transport);
+    }
+
     #[test]
     fn reply_refuses_a_subject_that_is_not_an_inbox() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
