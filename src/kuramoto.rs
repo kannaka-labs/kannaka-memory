@@ -47,7 +47,10 @@ struct ClusterCacheEntry {
 }
 
 fn fingerprint_memories(mems: &[&HyperMemory]) -> u64 {
-    // Order-independent XOR fingerprint over every memory's (id, updated_at).
+    // Order-independent XOR fingerprint over every memory's (id, updated_at,
+    // phase). Phase is in it because clusters depend on it (the r-filter and
+    // mean_phase) and consolidation rewrites phase without touching updated_at
+    // (#1123).
     //
     // Pre-refactor this sampled only first/last/middle memories — any
     // mutation to a memory at an unsampled index (e.g. boost to memory #200
@@ -61,6 +64,7 @@ fn fingerprint_memories(mems: &[&HyperMemory]) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         m.id.hash(&mut h);
         m.updated_at.hash(&mut h);
+        m.phase.to_bits().hash(&mut h);
         acc ^= h.finish();
     }
     // Mix in the count so {n distinct mems} ≠ {0 mems with same XOR sum}.
@@ -81,22 +85,32 @@ fn sidecar_path(engine: &ResonanceEngine) -> Option<std::path::PathBuf> {
     Some(engine.store.hrm_path()?.with_extension("clusters.json"))
 }
 
-fn load_sidecar(engine: &ResonanceEngine, mtime: u64, min_size: usize) -> Option<Vec<MemoryCluster>> {
-    let path = sidecar_path(engine)?;
-    let data = std::fs::read(&path).ok()?;
+/// The sidecar's clusters, if it was written for exactly this store state.
+/// The whole-second mtime alone is not enough: an in-place phase rewrite, a
+/// rewrite within the same second or a restore that keeps the mtime would hand
+/// back clusters for memories that changed or no longer exist (#1123).
+fn load_sidecar(
+    path: &std::path::Path,
+    mtime: u64,
+    min_size: usize,
+    fp: u64,
+    n: usize,
+) -> Option<Vec<MemoryCluster>> {
+    let data = std::fs::read(path).ok()?;
     let entry: ClusterCacheEntry = serde_json::from_slice(&data).ok()?;
-    if entry.hrm_mtime_secs == mtime && entry.min_cluster_size == min_size {
-        Some(entry.clusters)
-    } else {
-        None
-    }
+    (entry.hrm_mtime_secs == mtime
+        && entry.min_cluster_size == min_size
+        && entry.fingerprint == fp
+        && entry.memory_count == n)
+        .then_some(entry.clusters)
 }
 
-fn save_sidecar(engine: &ResonanceEngine, entry: &ClusterCacheEntry) {
-    if let Some(path) = sidecar_path(engine) {
-        if let Ok(data) = serde_json::to_vec(entry) {
-            let _ = std::fs::write(path, data);
-        }
+fn save_sidecar(path: &std::path::Path, entry: &ClusterCacheEntry) {
+    let result = serde_json::to_vec(entry)
+        .map_err(|e| e.to_string())
+        .and_then(|data| crate::fs_util::atomic_write_bytes(path, &data));
+    if let Err(e) = result {
+        eprintln!("[kuramoto] could not write cluster sidecar {}: {e}", path.display());
     }
 }
 
@@ -669,7 +683,9 @@ impl KuramotoSync {
         }
         let mtime = hrm_mtime_secs(engine).unwrap_or(0);
         if !decone && mtime != 0 {
-            if let Some(clusters) = load_sidecar(engine, mtime, min_cluster_size) {
+            let hit = sidecar_path(engine)
+                .and_then(|p| load_sidecar(&p, mtime, min_cluster_size, fp, n));
+            if let Some(clusters) = hit {
                 // Populate process cache for future calls in this same run.
                 if let Ok(mut guard) = CLUSTER_CACHE.lock() {
                     *guard = Some(ClusterCacheEntry {
@@ -832,8 +848,9 @@ impl KuramotoSync {
         }
 
         // Cache: in-process + disk sidecar so the next `kannaka` invocation
-        // skips the O(n²d) recompute entirely.
-        let mtime = hrm_mtime_secs(engine).unwrap_or(0);
+        // skips the O(n²d) recompute entirely. `mtime` is the one read BEFORE
+        // the computation: re-reading it here could stamp clusters computed
+        // from the old state with a write that landed meanwhile (#1123).
         let entry = ClusterCacheEntry {
             fingerprint: fp,
             min_cluster_size,
@@ -847,7 +864,9 @@ impl KuramotoSync {
         // Don't persist the on-disk sidecar in decone mode: it's keyed by mtime+size,
         // not the decone flag, so a later non-decone run would wrongly load it.
         if !decone {
-            save_sidecar(engine, &entry);
+            if let Some(path) = sidecar_path(engine) {
+                save_sidecar(&path, &entry);
+            }
         }
 
         clusters
@@ -857,6 +876,38 @@ impl KuramotoSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1123: the disk sidecar must miss when the store changed behind an
+    // unchanged whole-second mtime.
+    #[test]
+    fn sidecar_hits_only_for_the_same_store_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kannaka.clusters.json");
+        let entry = ClusterCacheEntry {
+            fingerprint: 0xF00D,
+            min_cluster_size: 3,
+            clusters: Vec::new(),
+            hrm_mtime_secs: 1_700_000_000,
+            memory_count: 42,
+        };
+        save_sidecar(&path, &entry);
+        let load = |fp, n| load_sidecar(&path, 1_700_000_000, 3, fp, n);
+        assert!(load(0xF00D, 42).is_some(), "control: the same state must hit");
+        assert!(load(0xBEEF, 42).is_none(), "a changed fingerprint must miss");
+        assert!(load(0xF00D, 41).is_none(), "a changed memory count must miss");
+        assert!(load_sidecar(&path, 1_700_000_001, 3, 0xF00D, 42).is_none(), "a changed mtime must miss");
+    }
+
+    // #1123: consolidation rewrites phase without touching updated_at, and
+    // clusters depend on phase.
+    #[test]
+    fn fingerprint_changes_when_only_a_phase_changes() {
+        let mut m = HyperMemory::new(vec![0.5; 8], "phase probe".to_string());
+        let before = fingerprint_memories(&[&m]);
+        assert_eq!(fingerprint_memories(&[&m]), before, "control: the fingerprint is stable");
+        m.phase += 0.25;
+        assert_ne!(fingerprint_memories(&[&m]), before);
+    }
     use crate::codebook::Codebook;
     use crate::encoding::{EncodingPipeline, SimpleHashEncoder};
     use crate::memory::HyperMemory;
