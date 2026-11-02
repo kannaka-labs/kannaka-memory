@@ -942,7 +942,6 @@ fn _handle_serve_msg(
             decision,
             kannaka_memory::serve_guard::RateDecision::Requester { first_in_window: true, .. }
                 | kannaka_memory::serve_guard::RateDecision::Global { first_in_window: true, .. }
-                | kannaka_memory::serve_guard::RateDecision::TooManyRequesters { .. }
         );
         if first {
             eprintln!(
