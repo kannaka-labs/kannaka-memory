@@ -64,6 +64,43 @@ fn sidecar_path_from_env() -> Option<std::path::PathBuf> {
     Some(home.join("kannaka.metrics.json"))
 }
 
+/// Write the sidecar atomically (outside readers such as push-nats.js must
+/// never see a half-written file) and say so if it fails (#1130).
+fn write_sidecar(path: &std::path::Path, sidecar: &MetricsSidecar) {
+    let result = serde_json::to_vec(sidecar)
+        .map_err(|e| e.to_string())
+        .and_then(|data| crate::fs_util::atomic_write_bytes(path, &data));
+    if let Err(e) = result {
+        eprintln!("[consciousness] could not write metrics sidecar {}: {e}", path.display());
+    }
+}
+
+/// Rewrite the sidecar from the cached metrics after a setter changed one of
+/// them. The setters do not know the memory count, so it is kept from the
+/// sidecar on disk when that was written for the same fingerprint; otherwise
+/// `fallback_count` is used. Writing 0 here erased the count outside tools
+/// read on every `bridge::assess` pass (#1130).
+fn rewrite_sidecar(path: &std::path::Path, fp: u64, metrics: &ConsciousnessMetrics, fallback_count: usize) {
+    let total_memories = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<MetricsSidecar>(&b).ok())
+        .filter(|s| s.fingerprint == fp)
+        .map(|s| s.total_memories)
+        .unwrap_or(fallback_count);
+    write_sidecar(path, &MetricsSidecar {
+        version: METRICS_CACHE_VERSION,
+        fingerprint: fp,
+        phi: metrics.phi,
+        xi: metrics.xi,
+        order: metrics.order,
+        num_clusters: metrics.num_clusters,
+        irrationality: metrics.irrationality,
+        total_memories,
+        level: format!("{:?}", metrics.level),
+        total_skip_links: metrics.total_skip_links,
+    });
+}
+
 impl Medium {
     fn metrics_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -138,21 +175,7 @@ impl Medium {
                 metrics.total_skip_links = n;
                 // Re-persist sidecar with updated count.
                 if let Some(path) = sidecar_path_from_env() {
-                    let sidecar = MetricsSidecar {
-                        version: METRICS_CACHE_VERSION,
-                        fingerprint: fp,
-                        phi: metrics.phi,
-                        xi: metrics.xi,
-                        order: metrics.order,
-                        num_clusters: metrics.num_clusters,
-                        irrationality: metrics.irrationality,
-                        total_memories: 0, // unknown at this site, leave 0
-                        level: format!("{:?}", metrics.level),
-                        total_skip_links: n,
-                    };
-                    if let Ok(data) = serde_json::to_vec(&sidecar) {
-                        let _ = std::fs::write(path, data);
-                    }
+                    rewrite_sidecar(&path, fp, metrics, self.wavefront_count());
                 }
             }
         }
@@ -169,21 +192,7 @@ impl Medium {
             if let Some((fp, ref mut metrics)) = *guard {
                 metrics.num_clusters = n;
                 if let Some(path) = sidecar_path_from_env() {
-                    let sidecar = MetricsSidecar {
-                        version: METRICS_CACHE_VERSION,
-                        fingerprint: fp,
-                        phi: metrics.phi,
-                        xi: metrics.xi,
-                        order: metrics.order,
-                        num_clusters: n,
-                        irrationality: metrics.irrationality,
-                        total_memories: 0, // unknown at this site, leave 0
-                        level: format!("{:?}", metrics.level),
-                        total_skip_links: metrics.total_skip_links,
-                    };
-                    if let Ok(data) = serde_json::to_vec(&sidecar) {
-                        let _ = std::fs::write(path, data);
-                    }
+                    rewrite_sidecar(&path, fp, metrics, self.wavefront_count());
                 }
             }
         }
@@ -292,9 +301,7 @@ impl Medium {
                 level: format!("{:?}", metrics.level),
                 total_skip_links: metrics.total_skip_links,
             };
-            if let Ok(data) = serde_json::to_vec(&sidecar) {
-                let _ = std::fs::write(path, data);
-            }
+            write_sidecar(&path, &sidecar);
         }
 
         metrics
@@ -1347,4 +1354,40 @@ fn generate_insight(
     }
 
     insights.join("; ")
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::*;
+
+    fn read(path: &std::path::Path) -> MetricsSidecar {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    // #1130: the setters rewrote the sidecar with total_memories 0 on every
+    // bridge::assess pass, erasing the count outside tools read.
+    #[test]
+    fn rewrite_keeps_the_memory_count_for_the_same_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kannaka.metrics.json");
+        let mut metrics = Medium::new().consciousness_metrics();
+        write_sidecar(&path, &MetricsSidecar {
+            version: METRICS_CACHE_VERSION, fingerprint: 7, phi: 0.0, xi: 0.0, order: 0.0,
+            num_clusters: 1, irrationality: 0.0, total_memories: 1234,
+            level: String::new(), total_skip_links: 0,
+        });
+
+        metrics.total_skip_links = 99;
+        rewrite_sidecar(&path, 7, &metrics, 0);
+        let s = read(&path);
+        assert_eq!(s.total_memories, 1234, "the count must survive a setter's rewrite");
+        assert_eq!(s.total_skip_links, 99, "control: the setter's own change is written");
+
+        // A different fingerprint means the count on disk is for another
+        // field; use the caller's count instead.
+        rewrite_sidecar(&path, 8, &metrics, 42);
+        assert_eq!(read(&path).total_memories, 42);
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "the atomic write must leave no temp file");
+    }
 }
