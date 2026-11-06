@@ -990,6 +990,12 @@ fn _handle_serve_msg(
     let inbound_hops = kannaka_memory::serve_guard::hops_of(&req);
     kannaka_memory::serve_guard::set_serving_hops(Some(inbound_hops));
 
+    // Everything below can outrun WatchdogSec (the broadcast probe is a full
+    // recall, then the model call), and the serve loop pings only between
+    // messages. Started here, past the cheap refusals and the rate limit, so
+    // spam that is dropped above never costs a thread.
+    let _watchdog = AskWatchdogKeeper::start(ask_watchdog_grace());
+
     // Self-throttle on broadcast: only reply if local recall has resonance ≥ threshold.
     if is_broadcast {
         let probe = recall_q.unwrap_or(text);
@@ -2940,6 +2946,148 @@ fn sd_notify(state: &str) {
 
 #[cfg(all(feature = "nats", not(unix)))]
 fn sd_notify(_state: &str) {}
+
+/// How long one served ask may keep the watchdog fed. A full-recall ask on
+/// the 1-vCPU hub runs 60-150 s of scan plus the model call — longer than the
+/// unit's 90 s `WatchdogSec`, and the serve loop only pings BETWEEN messages,
+/// so every such ask got the daemon killed mid-answer and the caller saw only
+/// a timeout. Past this grace the keeper goes quiet and
+/// the watchdog fires as before, so a wedged handler is still caught.
+#[cfg(feature = "nats")]
+const ASK_WATCHDOG_GRACE_DEFAULT_SECS: u64 = 600;
+
+#[cfg(feature = "nats")]
+fn ask_watchdog_grace() -> std::time::Duration {
+    let secs = std::env::var("KANNAKA_SERVE_ASK_WATCHDOG_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(ASK_WATCHDOG_GRACE_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Feeds the systemd watchdog from a side thread while one served message is
+/// handled, for at most `grace`. Dropping it stops the thread at once: the
+/// thread waits on a channel whose sender the keeper holds, so the drop wakes
+/// it instead of a sleep running out. A zero grace means no keeper at all.
+#[cfg(feature = "nats")]
+struct AskWatchdogKeeper {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "nats")]
+impl AskWatchdogKeeper {
+    fn start(grace: std::time::Duration) -> Self {
+        Self::start_with(std::time::Duration::from_secs(10), grace, sd_notify)
+    }
+
+    fn start_with(
+        interval: std::time::Duration,
+        grace: std::time::Duration,
+        notify: fn(&str),
+    ) -> Self {
+        use std::sync::mpsc::RecvTimeoutError;
+        if grace.is_zero() {
+            return Self { stop: None, handle: None };
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("serve-watchdog".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                loop {
+                    let left = grace.saturating_sub(started.elapsed());
+                    if left.is_zero() {
+                        eprintln!(
+                            "[swarm serve] one message has run past {}s — no longer feeding the watchdog",
+                            grace.as_secs()
+                        );
+                        return;
+                    }
+                    match rx.recv_timeout(interval.min(left)) {
+                        Err(RecvTimeoutError::Timeout) => {
+                            if started.elapsed() < grace {
+                                notify("WATCHDOG=1");
+                            }
+                        }
+                        // The keeper was dropped: the message is done.
+                        _ => return,
+                    }
+                }
+            })
+            .ok();
+        Self { stop: Some(tx), handle }
+    }
+}
+
+#[cfg(feature = "nats")]
+impl Drop for AskWatchdogKeeper {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "nats"))]
+mod ask_watchdog_tests {
+    use super::AskWatchdogKeeper;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static PINGS_WHILE_HELD: AtomicUsize = AtomicUsize::new(0);
+    static PINGS_PAST_GRACE: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_held(state: &str) {
+        assert_eq!(state, "WATCHDOG=1");
+        PINGS_WHILE_HELD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn count_grace(_state: &str) {
+        PINGS_PAST_GRACE.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn feeds_while_held_and_stops_on_drop() {
+        let keeper = AskWatchdogKeeper::start_with(
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            count_held,
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        drop(keeper);
+        let at_drop = PINGS_WHILE_HELD.load(Ordering::SeqCst);
+        assert!(at_drop >= 3, "expected several pings while held, got {at_drop}");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(PINGS_WHILE_HELD.load(Ordering::SeqCst), at_drop, "pinged after drop");
+    }
+
+    #[test]
+    fn zero_grace_spawns_nothing() {
+        let keeper =
+            AskWatchdogKeeper::start_with(Duration::from_millis(20), Duration::ZERO, count_never);
+        assert!(keeper.handle.is_none());
+    }
+
+    fn count_never(_state: &str) {
+        panic!("a zero-grace keeper must never ping");
+    }
+
+    #[test]
+    fn goes_quiet_past_grace_so_a_wedge_is_still_caught() {
+        let _keeper = AskWatchdogKeeper::start_with(
+            Duration::from_millis(20),
+            Duration::from_millis(150),
+            count_grace,
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        let at_grace = PINGS_PAST_GRACE.load(Ordering::SeqCst);
+        assert!(at_grace >= 2, "expected pings inside the grace, got {at_grace}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(PINGS_PAST_GRACE.load(Ordering::SeqCst), at_grace, "pinged past grace");
+    }
+}
 
 #[cfg(all(test, feature = "nats"))]
 mod serve_hardness_tests {
