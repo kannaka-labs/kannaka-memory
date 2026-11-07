@@ -10,10 +10,15 @@ name: Publish Channels
 #     own GITHUB_TOKEN never fire events for other workflows.
 #   - workflow_dispatch for backfill/re-push of an already-released version.
 #
-# npm requires an NPM_TOKEN repo secret — a granular automation token with
-# "Bypass two-factor authentication" enabled (the account's 2FA is passkey-only,
-# so a non-bypass token dead-ends in an interactive EOTP web flow). The job
-# skips cleanly when the secret is absent.
+# npm publishes through npm Trusted Publishing (OIDC) when the package has a
+# trusted publisher configured on npmjs.com: the job asks GitHub for an
+# id-token and npm exchanges it for a short-lived publish credential, so no
+# long-lived token can expire (the NPM_TOKEN from 07-25 expired before
+# v0.16.18). Trusted publishing needs npm >= 11.5.1, hence the npm upgrade.
+# The NPM_TOKEN repo secret (a granular automation token with "Bypass
+# two-factor authentication"; the account's 2FA is passkey-only) remains a
+# fallback: npm uses OIDC when it can and the token otherwise. With neither,
+# the publish step fails loudly instead of skipping.
 
 on:
   workflow_call:
@@ -76,31 +81,26 @@ jobs:
 
   npm-publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check for NPM_TOKEN
-        id: token
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -n "$NPM_TOKEN" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::NPM_TOKEN secret not set — skipping npm publish (add a granular token with bypass-2FA to enable)."
-          fi
-
       - uses: actions/setup-node@v4
-        if: steps.token.outputs.present == 'true'
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # Node 22 ships npm 10; trusted publishing needs npm >= 11.5.1.
+      - name: Upgrade npm
+        run: npm install -g npm@^11.5.1 && npm --version
+
       - name: Publish to npm
-        if: steps.token.outputs.present == 'true'
         working-directory: packaging/npm
         env:
+          # Fallback only: npm prefers the OIDC exchange when a trusted
+          # publisher is configured for the package.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           # postinstall must not run inside the publish environment
           KANNAKA_SKIP_DOWNLOAD: "1"
