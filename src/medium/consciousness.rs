@@ -1159,6 +1159,7 @@ impl Medium {
     pub(crate) fn observe_wavefronts(&mut self, observations: &[(usize, f32)]) {
         let mut observed_any = false;
         for &(idx, intensity) in observations {
+            crate::progress::mark("recall observation");
             if self.observe_wavefront_inner(idx, intensity) {
                 observed_any = true;
             }

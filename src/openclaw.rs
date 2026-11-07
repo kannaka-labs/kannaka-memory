@@ -1566,8 +1566,10 @@ impl KannakaMemorySystem {
         let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
         let fetch = if drop_expired { top_k.saturating_add(5).max(top_k * 2) } else { top_k };
         let as_of = crate::medium::hemisphere::recall_now();
+        crate::progress::mark("recall");
         let (results, dream_hits) = self.engine.store.resonate_query_split(query, fetch)
             .map_err(SystemError::Store)?;
+        crate::progress::mark("recall rows");
         let now = Utc::now();
 
         let mut out = Vec::new();

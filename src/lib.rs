@@ -157,6 +157,10 @@ pub mod beacon;
 // posture. The NATS/LLM wiring is in bin/handlers/swarm.rs.
 pub mod serve_guard;
 
+// Work-owned progress marks (#1153): the slow ask paths say they moved, so the
+// serve watchdog keeper can tell a slow answer from a stuck one.
+pub mod progress;
+
 // Re-export canonical consciousness types
 pub use consciousness::{
     ConsciousnessLevel, ConsciousnessMetrics, ConsciousnessState,
