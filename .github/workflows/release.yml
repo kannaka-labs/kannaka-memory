@@ -331,6 +331,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # npm Trusted Publishing in publish-channels.yml
     with:
       version: ${{ github.ref_name }}
     secrets: inherit
