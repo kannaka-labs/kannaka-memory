@@ -1048,7 +1048,7 @@ impl LlmClient {
             LlmClient::Ollama(c) => c.timeout,
             LlmClient::OpenAI(c) => c.timeout,
         };
-        crate::progress::mark_bounded("model request", timeout + Duration::from_secs(30));
+        crate::progress::mark_bounded("model request", timeout.saturating_add(Duration::from_secs(30)));
     }
 
     /// Per-call max_tokens override. Chat paths use this with

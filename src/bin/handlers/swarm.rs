@@ -1001,8 +1001,8 @@ fn _handle_serve_msg(
     // Declared before the keeper so the keeper drops (and stops) first.
     let progress = kannaka_memory::progress::Progress::new();
     let _progress_scope = kannaka_memory::progress::install(progress.clone());
-    let _watchdog =
-        AskWatchdogKeeper::start(ask_watchdog_grace(), ask_watchdog_stall(), progress);
+    let (grace, stall) = ask_watchdog_windows();
+    let _watchdog = AskWatchdogKeeper::start(grace, stall, progress);
 
     // Self-throttle on broadcast: only reply if local recall has resonance ≥ threshold.
     if is_broadcast {
@@ -2967,7 +2967,7 @@ const ASK_WATCHDOG_GRACE_DEFAULT_SECS: u64 = 600;
 
 #[cfg(feature = "nats")]
 fn ask_watchdog_grace() -> std::time::Duration {
-    env_secs("KANNAKA_SERVE_ASK_WATCHDOG_GRACE_SECS", ASK_WATCHDOG_GRACE_DEFAULT_SECS)
+    env_secs("KANNAKA_SERVE_ASK_WATCHDOG_GRACE_SECS", ASK_WATCHDOG_GRACE_DEFAULT_SECS, &GRACE_ENV_WARNED)
 }
 
 /// The stall window S (#1153): the longest an ask may go without a progress
@@ -2980,16 +2980,57 @@ const ASK_WATCHDOG_STALL_DEFAULT_SECS: u64 = 120;
 
 #[cfg(feature = "nats")]
 fn ask_watchdog_stall() -> std::time::Duration {
-    env_secs("KANNAKA_SERVE_ASK_WATCHDOG_STALL_SECS", ASK_WATCHDOG_STALL_DEFAULT_SECS)
+    env_secs("KANNAKA_SERVE_ASK_WATCHDOG_STALL_SECS", ASK_WATCHDOG_STALL_DEFAULT_SECS, &STALL_ENV_WARNED)
 }
 
+/// The grace and the stall window for one served ask. A stall window at or
+/// past the grace can never fire before the hard cap, which is worth one line.
 #[cfg(feature = "nats")]
-fn env_secs(var: &str, default: u64) -> std::time::Duration {
-    let secs = std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default);
+fn ask_watchdog_windows() -> (std::time::Duration, std::time::Duration) {
+    let (grace, stall) = (ask_watchdog_grace(), ask_watchdog_stall());
+    if !grace.is_zero() && !stall.is_zero() && stall >= grace {
+        warn_once(
+            &STALL_GE_GRACE_WARNED,
+            &format!(
+                "[swarm serve] KANNAKA_SERVE_ASK_WATCHDOG_STALL_SECS ({}s) is not below the grace ({}s): \
+                 a stalled ask is caught only by the grace",
+                stall.as_secs(),
+                grace.as_secs()
+            ),
+        );
+    }
+    (grace, stall)
+}
+
+// These are read per message, so each warning is printed once per process.
+#[cfg(feature = "nats")]
+static GRACE_ENV_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "nats")]
+static STALL_ENV_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "nats")]
+static STALL_GE_GRACE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "nats")]
+fn env_secs(var: &str, default: u64, warned: &std::sync::atomic::AtomicBool) -> std::time::Duration {
+    let secs = match std::env::var(var) {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            warn_once(
+                warned,
+                &format!("[swarm serve] {var}={v:?} is not a whole number of seconds; using {default}"),
+            );
+            default
+        }),
+        Err(_) => default,
+    };
     std::time::Duration::from_secs(secs)
+}
+
+/// Whether systemd is listening for `WATCHDOG=1`. Without a `NOTIFY_SOCKET`
+/// every feed is dropped, so a keeper thread would only burn a spawn per ask.
+#[cfg(feature = "nats")]
+fn notify_socket_set() -> bool {
+    std::env::var_os("NOTIFY_SOCKET").is_some_and(|s| !s.is_empty())
 }
 
 /// Feeds the systemd watchdog from a side thread while one served message is
@@ -2998,7 +3039,8 @@ fn env_secs(var: &str, default: u64) -> std::time::Duration {
 /// it stops, for either reason, it does not resume for that message. Dropping
 /// it stops the thread at once: the thread waits on a channel whose sender
 /// the keeper holds, so the drop wakes it instead of a sleep running out. A
-/// zero grace means no keeper at all; a zero stall skips the progress check.
+/// zero grace, or no `NOTIFY_SOCKET` (not under systemd), means no keeper at
+/// all; a zero stall skips the progress check.
 #[cfg(feature = "nats")]
 struct AskWatchdogKeeper {
     stop: Option<std::sync::mpsc::Sender<()>>,
@@ -3012,6 +3054,7 @@ impl AskWatchdogKeeper {
         stall: std::time::Duration,
         progress: std::sync::Arc<kannaka_memory::progress::Progress>,
     ) -> Self {
+        let grace = if notify_socket_set() { grace } else { std::time::Duration::ZERO };
         Self::start_with(std::time::Duration::from_secs(10), grace, stall, progress, sd_notify)
     }
 
@@ -3045,10 +3088,14 @@ impl AskWatchdogKeeper {
                             if started.elapsed() >= grace {
                                 continue; // the cap is logged at the top
                             }
-                            let window = stall.max(progress.allowance());
-                            if !stall.is_zero() && progress.since_last() > window {
+                            // One snapshot: the time and the allowance of the
+                            // same mark (#1153 round two).
+                            let (silent, allowance) = progress.snapshot();
+                            let window = stall.max(allowance);
+                            if !stall.is_zero() && silent > window {
                                 eprintln!(
-                                    "[swarm serve] no progress for {}s in phase {} — no longer feeding the watchdog",
+                                    "[swarm serve] no progress for {}s (window {}s) in phase {} — no longer feeding the watchdog",
+                                    silent.as_secs(),
                                     window.as_secs(),
                                     progress.phase()
                                 );
@@ -3116,7 +3163,11 @@ mod ask_watchdog_tests {
     fn count_never(_state: &str) {
         panic!("a zero-grace keeper must never ping");
     }
-    fn ignore(_state: &str) {}
+    static FEEDS_THAT_MARKED: AtomicUsize = AtomicUsize::new(0);
+    fn mark_on_feed(_state: &str) {
+        progress::mark("keeper fed");
+        FEEDS_THAT_MARKED.fetch_add(1, Ordering::SeqCst);
+    }
 
     /// Mark `phase` every TICK for `dur`, as a handler making progress would.
     fn work_for(dur: Duration, phase: &'static str) {
@@ -3198,14 +3249,24 @@ mod ask_watchdog_tests {
     }
 
     #[test]
-    fn the_keeper_cannot_create_progress() {
-        // Nothing marks: if the keeper advanced the mark itself it would feed
-        // forever. It must stop after one window with the count still zero.
+    fn a_feed_does_not_count_as_progress() {
+        // The keeper's own thread marks on every feed (as code it called would
+        // if the keeper ever reached into recall or the model client). Those
+        // marks must not count: only the thread that installed the progress
+        // advances it, so with the handler silent the keeper still stops
+        // after one window. Installing the progress on the keeper thread
+        // would feed forever and fail this.
         let p = Progress::new();
-        let keeper =
-            AskWatchdogKeeper::start_with(TICK, LONG, Duration::from_millis(50), p.clone(), ignore);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(keeper_done(&keeper));
+        let keeper = AskWatchdogKeeper::start_with(
+            TICK,
+            LONG,
+            Duration::from_millis(100),
+            p.clone(),
+            mark_on_feed,
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(FEEDS_THAT_MARKED.load(Ordering::SeqCst) >= 1, "fixture: the keeper fed and marked");
+        assert!(keeper_done(&keeper), "a feed was taken for progress");
         assert_eq!(p.marks(), 0);
     }
 
@@ -3226,6 +3287,23 @@ mod ask_watchdog_tests {
         assert!(keeper_done(&keeper), "kept running past the hard cap");
         work_for(Duration::from_millis(150), "recall scan");
         assert_eq!(PINGS_PAST_GRACE.load(Ordering::SeqCst), at_grace, "pinged past grace");
+    }
+
+    #[test]
+    fn the_serve_handler_installs_its_progress_before_the_keeper() {
+        // The keeper reads the progress the handler installed; if the handler
+        // stopped installing it (or let the scope drop at once), every mark
+        // in recall and the model client would land nowhere and each ask
+        // would be cut off one stall window in.
+        let src = include_str!("swarm.rs");
+        let body = &src[src.find("fn _handle_serve_msg(").expect("serve handler not found")..];
+        let install = body
+            .find("let _progress_scope = kannaka_memory::progress::install(progress.clone());")
+            .expect("the serve handler must install its progress for the whole message");
+        let keeper = body
+            .find("AskWatchdogKeeper::start(grace, stall, progress)")
+            .expect("the serve handler must hand that progress to the keeper");
+        assert!(install < keeper, "the scope must be live before the keeper starts");
     }
 
     #[test]

@@ -167,6 +167,43 @@ fn seed_order<'a>(mems: Vec<&'a HyperMemory>, drive_ctx: &str) -> Vec<&'a HyperM
     }
 }
 
+/// Pair similarities per progress mark in the all-pairs scan (#1153). At
+/// d = 10 000 one pair costs a fraction of a millisecond on the 1-vCPU hub,
+/// so a chunk this size is a few seconds there.
+const PAIRS_PER_MARK: usize = 1 << 14;
+
+/// Rows of the all-pairs scan to run between two progress marks: about
+/// [`PAIRS_PER_MARK`] pairs, and never fewer rows than threads.
+fn rows_per_mark(n: usize, threads: usize) -> usize {
+    (PAIRS_PER_MARK / n.max(1)).max(threads).max(1)
+}
+
+/// For every row `i`, the `j > i` with `linked(i, j)`. Rows run in parallel,
+/// `rows` at a time, and the calling thread marks progress before each chunk
+/// (#1153). A mark reaches only the progress installed on the thread that
+/// makes it; rayon's workers have none, so a mark inside the parallel
+/// closure would be lost, and the coordinating thread is the one a served
+/// ask installed. The result is the same as one parallel pass over all rows.
+fn neighbor_rows<F>(n: usize, rows: usize, linked: F) -> Vec<Vec<usize>>
+where
+    F: Fn(usize, usize) -> bool + Sync,
+{
+    use rayon::prelude::*;
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0;
+    while start < n {
+        crate::progress::mark("assess clusters");
+        let end = start.saturating_add(rows.max(1)).min(n);
+        let chunk: Vec<Vec<usize>> = (start..end)
+            .into_par_iter()
+            .map(|i| ((i + 1)..n).filter(|&j| linked(i, j)).collect())
+            .collect();
+        out.extend(chunk);
+        start = end;
+    }
+    out
+}
+
 /// Mean-center `vecs` and project out their top-`k` principal components, returning
 /// the residual vectors (same order). The PCs are estimated from a bounded, evenly
 /// spaced sample (≤ `SAMPLE` rows) via power iteration on the sample Gram, so the
@@ -199,6 +236,7 @@ fn decone_vectors(vecs: &[&[f32]], k: usize) -> Vec<Vec<f32>> {
     if k > 0 && s >= 2 {
         let mut gram = vec![0.0f32; s * s];
         for a in 0..s {
+            crate::progress::mark("assess clusters"); // serial, s dots per row (#1153)
             for b in a..s {
                 let dot: f32 = cs[a].iter().zip(cs[b].iter()).map(|(x, y)| x * y).sum();
                 gram[a * s + b] = dot;
@@ -607,6 +645,8 @@ impl KuramotoSync {
             // Build adjacency list with higher threshold
             let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
             for (i, &idx_i) in component_indices.iter().enumerate() {
+                // Serial, O(n) cosines per row: mark each row (#1153).
+                crate::progress::mark("assess clusters");
                 for (j, &idx_j) in component_indices.iter().enumerate().skip(i + 1) {
                     let sim = cosine_similarity(&all_memories[idx_i].vector, &all_memories[idx_j].vector);
                     if sim > threshold {
@@ -712,8 +752,8 @@ impl KuramotoSync {
         // float ops per call — ~30-90 s on commodity hardware. We parallelize
         // across the outer `i` loop with rayon and build per-row neighbor lists
         // that are stitched back into an adjacency list. Each pair is visited
-        // once (j > i) so there's no redundant work.
-        use rayon::prelude::*;
+        // once (j > i) so there's no redundant work. `neighbor_rows` runs the
+        // rows in chunks so a served ask sees progress during it (#1153).
         // num_clusters fix: optionally "decone" the vectors before the graph (see
         // cluster_decone_enabled). Only the EDGES change — themes/phases/order below
         // still use the original vectors. Lower threshold for the residual cosine scale.
@@ -724,20 +764,15 @@ impl KuramotoSync {
             Vec::new()
         };
         let threshold = if decone { 0.30 } else { self.coupling_threshold };
-        let neighbors_per_i: Vec<Vec<usize>> = (0..n).into_par_iter().map(|i| {
-            let mut neigh = Vec::new();
-            for j in (i + 1)..n {
-                let sim = if decone {
-                    cosine_similarity(&dvecs[i], &dvecs[j])
-                } else {
-                    cosine_similarity(&all[i].vector, &all[j].vector)
-                };
-                if sim > threshold {
-                    neigh.push(j);
-                }
-            }
-            neigh
-        }).collect();
+        let rows = rows_per_mark(n, rayon::current_num_threads());
+        let neighbors_per_i = neighbor_rows(n, rows, |i, j| {
+            let sim = if decone {
+                cosine_similarity(&dvecs[i], &dvecs[j])
+            } else {
+                cosine_similarity(&all[i].vector, &all[j].vector)
+            };
+            sim > threshold
+        });
         let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
         for (i, neigh) in neighbors_per_i.iter().enumerate() {
             for &j in neigh {
@@ -876,6 +911,30 @@ impl KuramotoSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1153: the all-pairs scan marks the installed progress between chunks,
+    // from the calling thread, and chunking does not change the graph.
+    #[test]
+    fn the_pair_scan_marks_between_chunks_and_keeps_the_graph() {
+        let n = 40;
+        let linked = |i: usize, j: usize| (i * 7 + j * 3) % 5 == 0;
+        let whole: Vec<Vec<usize>> =
+            (0..n).map(|i| ((i + 1)..n).filter(|&j| linked(i, j)).collect()).collect();
+
+        let p = crate::progress::Progress::new();
+        let _scope = crate::progress::install(p.clone());
+        assert_eq!(neighbor_rows(n, 4, linked), whole);
+        assert_eq!(p.marks(), 10, "one mark per 4-row chunk of 40 rows");
+        assert_eq!(p.phase(), "assess clusters");
+    }
+
+    #[test]
+    fn a_chunk_is_a_few_seconds_of_pairs_on_one_cpu() {
+        assert_eq!(rows_per_mark(558, 1), 29); // O1-sized store: ~20 marks
+        assert_eq!(rows_per_mark(100_000, 1), 1);
+        assert_eq!(rows_per_mark(100_000, 8), 8);
+        assert_eq!(rows_per_mark(0, 0), PAIRS_PER_MARK);
+    }
 
     // #1123: the disk sidecar must miss when the store changed behind an
     // unchanged whole-second mtime.

@@ -21,13 +21,20 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub struct Progress {
     anchor: Instant,
-    /// Milliseconds after `anchor` of the latest mark.
-    last_ms: AtomicU64,
-    /// Longest silence the latest mark declared it may need (a blocking call
-    /// with its own timeout); 0 = none beyond the reader's stall window.
-    allow_ms: AtomicU64,
+    /// The latest mark, packed so a reader sees one consistent pair: the high
+    /// 32 bits are the silence it declared it may need (ms; a blocking call
+    /// with its own timeout, 0 = none beyond the reader's stall window), the
+    /// low 32 bits are when it landed (ms after `anchor`). Kept apart, a
+    /// reader could see a new plain mark's zero allowance with the previous
+    /// bounded mark's old time and call a healthy ask stalled.
+    latest: AtomicU64,
     marks: AtomicU64,
     phase: Mutex<&'static str>,
+}
+
+/// Milliseconds as `u32`, saturating (49 days is far past any ask).
+fn ms32(d: Duration) -> u64 {
+    u64::from(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
 }
 
 impl Progress {
@@ -35,22 +42,29 @@ impl Progress {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             anchor: Instant::now(),
-            last_ms: AtomicU64::new(0),
-            allow_ms: AtomicU64::new(0),
+            latest: AtomicU64::new(0),
             marks: AtomicU64::new(0),
             phase: Mutex::new("start"),
         })
     }
 
+    /// One consistent reading of the latest mark: the time since it, and the
+    /// silence it declared it may need (zero for a plain mark).
+    pub fn snapshot(&self) -> (Duration, Duration) {
+        let latest = self.latest.load(Ordering::Acquire);
+        let last = Duration::from_millis(latest & u64::from(u32::MAX));
+        let allow = Duration::from_millis(latest >> 32);
+        (self.anchor.elapsed().saturating_sub(last), allow)
+    }
+
     /// Time since the latest mark.
     pub fn since_last(&self) -> Duration {
-        let last = Duration::from_millis(self.last_ms.load(Ordering::Acquire));
-        self.anchor.elapsed().saturating_sub(last)
+        self.snapshot().0
     }
 
     /// Silence the latest mark said it may need (zero for a plain mark).
     pub fn allowance(&self) -> Duration {
-        Duration::from_millis(self.allow_ms.load(Ordering::Acquire))
+        self.snapshot().1
     }
 
     /// Number of marks so far.
@@ -65,8 +79,8 @@ impl Progress {
 
     fn advance(&self, phase: &'static str, allow: Duration) {
         *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase;
-        self.allow_ms.store(allow.as_millis() as u64, Ordering::Release);
-        self.last_ms.store(self.anchor.elapsed().as_millis() as u64, Ordering::Release);
+        let latest = (ms32(allow) << 32) | ms32(self.anchor.elapsed());
+        self.latest.store(latest, Ordering::Release);
         self.marks.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -154,5 +168,50 @@ mod tests {
         mark("model replied");
         assert_eq!(p.allowance(), Duration::ZERO);
         assert!(p.since_last() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_reader_never_sees_a_torn_mark() {
+        // #1153 round two. The writer alternates a bounded mark (big
+        // allowance) and, after a silence longer than the window, a plain one.
+        // Kept as two fields, a reader could catch the plain mark's zero
+        // allowance with the bounded mark's old time and see a false stall.
+        // Counted only while the completed-mark count is odd and unchanged
+        // across the read (the bounded mark is the latest finished one), so a
+        // writer merely descheduled after its plain mark is not miscounted.
+        let p = Progress::new();
+        let window = Duration::from_millis(2);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (p, done) = (p.clone(), done.clone());
+            std::thread::spawn(move || {
+                let _scope = install(p);
+                for _ in 0..400 {
+                    mark_bounded("model request", Duration::from_secs(3600));
+                    std::thread::sleep(Duration::from_millis(4));
+                    mark("model reply");
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let mut torn = 0u64;
+        while !done.load(Ordering::Acquire) {
+            let before = p.marks();
+            let (since, allow) = p.snapshot();
+            if before % 2 == 1 && p.marks() == before && allow.is_zero() && since > window {
+                torn += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(torn, 0, "{torn} readings of a moving mark looked stalled");
+    }
+
+    #[test]
+    fn huge_durations_saturate_instead_of_wrapping() {
+        let p = Progress::new();
+        let _scope = install(p.clone());
+        mark_bounded("model request", Duration::from_secs(u64::MAX / 4));
+        assert_eq!(p.allowance(), Duration::from_millis(u64::from(u32::MAX)));
+        assert!(p.since_last() < Duration::from_secs(5), "the time half must be intact");
     }
 }

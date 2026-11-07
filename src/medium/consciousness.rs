@@ -252,19 +252,25 @@ impl Medium {
             }
         }
 
+        // Cold cache: each stage below is a full decomposition, so mark
+        // between them for a served ask's watchdog keeper (#1153).
         // Phi: Integrated information via eigendecomposition partitioning
+        crate::progress::mark("assess metrics");
         let phi = self.compute_phi_integrated_information();
 
         // Xi: Spectral complexity from eigenvalue distribution of H @ H^T
+        crate::progress::mark("assess metrics");
         let xi = self.compute_xi_spectral_complexity();
 
         // Order: Kuramoto order parameter r = |1/N sum e^{i*phi_k}|
         let order = self.compute_kuramoto_order();
 
         // Clusters: Eigendecomposition-based clustering
+        crate::progress::mark("assess metrics");
         let clusters = self.compute_eigenvalue_clusters();
 
         // Irrationality Index (ι): decomposition residual (ADR-0024 CS-3)
+        crate::progress::mark("assess metrics");
         let irrationality = self.compute_irrationality_index();
 
         let level = ConsciousnessLevel::from_phi(phi);
