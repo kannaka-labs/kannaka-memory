@@ -5,6 +5,7 @@
 //! that chains text encoding with codebook projection and HDC algebra.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -125,12 +126,51 @@ impl TextEncoder for SimpleHashEncoder {
     }
 }
 
+/// Default for how long one embedding request may take (#1153). A recall
+/// embeds its query before it scans, and a request with no timeout could
+/// hold a served ask (and the node) forever. `KANNAKA_EMBED_TIMEOUT_SECS`
+/// overrides it; 0 or an unparsable value keeps the default.
+pub const EMBED_TIMEOUT_DEFAULT_SECS: u64 = 90;
+
+/// The embedding request timeout, from `KANNAKA_EMBED_TIMEOUT_SECS`.
+pub fn embed_timeout() -> Duration {
+    let secs = std::env::var("KANNAKA_EMBED_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(EMBED_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Send one embedding request with `timeout`, marking progress around it
+/// (#1153): a bounded mark before (the request may be silent for up to its
+/// timeout, plus a little for the body), a plain one when it returns.
+fn post_embed(
+    req: ureq::Request,
+    body: serde_json::Value,
+    timeout: Duration,
+    what: &str,
+) -> Result<serde_json::Value, EncodingError> {
+    crate::progress::mark_bounded("embed request", timeout.saturating_add(Duration::from_secs(5)));
+    let json = req
+        .timeout(timeout)
+        .send_json(body)
+        .map_err(|e| EncodingError::Other(format!("{what} request failed: {e}")))
+        .and_then(|resp| {
+            resp.into_json::<serde_json::Value>()
+                .map_err(|e| EncodingError::Other(format!("failed to parse {what} response: {e}")))
+        });
+    crate::progress::mark("embed reply");
+    json
+}
+
 /// Calls an OpenAI-compatible HTTP embedding API.
 pub struct HttpEmbeddingEncoder {
     api_url: String,
     api_key: Option<String>,
     model: String,
     embedding_dim: usize,
+    timeout: Duration,
 }
 
 impl HttpEmbeddingEncoder {
@@ -139,7 +179,13 @@ impl HttpEmbeddingEncoder {
     /// `api_url` should be the base URL (e.g. `https://api.openai.com`).
     /// The encoder will POST to `{api_url}/v1/embeddings`.
     pub fn new(api_url: String, api_key: Option<String>, model: String, embedding_dim: usize) -> Self {
-        Self { api_url, api_key, model, embedding_dim }
+        Self { api_url, api_key, model, embedding_dim, timeout: embed_timeout() }
+    }
+
+    /// Override the request timeout (default [`embed_timeout`]).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Create an encoder configured for OpenAI's `text-embedding-3-small` (1536 dims).
@@ -170,13 +216,7 @@ impl TextEncoder for HttpEmbeddingEncoder {
             req = req.set("Authorization", &format!("Bearer {key}"));
         }
 
-        let resp = req
-            .send_json(body)
-            .map_err(|e| EncodingError::Other(format!("HTTP request failed: {e}")))?;
-
-        let json: serde_json::Value = resp
-            .into_json()
-            .map_err(|e| EncodingError::Other(format!("failed to parse response: {e}")))?;
+        let json = post_embed(req, body, self.timeout, "HTTP")?;
 
         let embedding = json["data"][0]["embedding"]
             .as_array()
@@ -205,11 +245,18 @@ pub struct OllamaEncoder {
     base_url: String,
     model: String,
     embedding_dim: usize,
+    timeout: Duration,
 }
 
 impl OllamaEncoder {
     pub fn new(base_url: String, model: String, embedding_dim: usize) -> Self {
-        Self { base_url, model, embedding_dim }
+        Self { base_url, model, embedding_dim, timeout: embed_timeout() }
+    }
+
+    /// Override the request timeout (default [`embed_timeout`]).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Default: all-minilm on localhost, 384 dims.
@@ -234,14 +281,8 @@ impl TextEncoder for OllamaEncoder {
             "input": text,
         });
 
-        let resp = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(|e| EncodingError::Other(format!("Ollama request failed: {e}")))?;
-
-        let json: serde_json::Value = resp
-            .into_json()
-            .map_err(|e| EncodingError::Other(format!("Failed to parse Ollama response: {e}")))?;
+        let req = ureq::post(&url).set("Content-Type", "application/json");
+        let json = post_embed(req, body, self.timeout, "Ollama")?;
 
         // Ollama returns { "embeddings": [[...]] }
         let embedding = json["embeddings"][0]
@@ -560,6 +601,41 @@ mod tests {
         let composite = CompositeEncoder::new(Box::new(primary), Box::new(fallback));
         let v = composite.embed("test").unwrap();
         assert_eq!(v.len(), 64);
+    }
+
+    // #1153: a peer that accepts the connection and never answers must not
+    // hold the caller past the timeout, and the call marks progress around
+    // the request whatever its outcome. Loopback only.
+    #[test]
+    fn ollama_embed_times_out_and_marks_progress() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = crate::progress::Progress::new();
+            let _scope = crate::progress::install(p.clone());
+            let enc = OllamaEncoder::new(url, "m".into(), 384)
+                .with_timeout(Duration::from_millis(300));
+            let out = enc.embed("hello");
+            let _ = tx.send((out.is_err(), p.marks(), p.phase(), p.allowance()));
+        });
+        let (failed, marks, phase, allowance) = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the embed request ignored its timeout");
+        drop(listener);
+        assert!(failed, "a silent peer must be an error");
+        assert_eq!(marks, 2, "one bounded mark before the request, one after");
+        assert_eq!(phase, "embed reply");
+        assert_eq!(allowance, Duration::ZERO, "the request's allowance must not outlive it");
+    }
+
+    #[test]
+    fn encoders_default_to_the_embed_timeout() {
+        let o = OllamaEncoder::default_local();
+        assert_eq!(o.timeout, embed_timeout());
+        let h = HttpEmbeddingEncoder::openai_small("k".into());
+        assert_eq!(h.with_timeout(Duration::from_secs(7)).timeout, Duration::from_secs(7));
+        assert!(embed_timeout() > Duration::ZERO);
     }
 
     #[test]

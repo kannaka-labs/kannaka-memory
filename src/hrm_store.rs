@@ -1580,6 +1580,7 @@ impl HrmStore {
             // and get the existing bilateral observation flow.
             let results = chiral.recall(query, top_k, &self.pipeline)
                 .map_err(|e| StoreError::Other(format!("chiral recall failed: {e}")))?;
+            crate::progress::mark("recall observation");
 
             // Observation: recall reshapes the field — attention IS computation.
             // Batched: one field-settle pass per recall, not per result.
@@ -1630,6 +1631,7 @@ impl HrmStore {
     fn apply_observation(&mut self, results: &[Resonance]) {
         if results.is_empty() { return; }
         if !Self::recall_observation_enabled() { return; }
+        crate::progress::mark("recall observation");
         let observations: Vec<(usize, f32)> = results.iter().enumerate()
             .filter_map(|(i, resonance)| {
                 self.medium.get_wavefront_index(&resonance.id).map(|index| {

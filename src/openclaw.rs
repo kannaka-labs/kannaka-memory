@@ -1566,8 +1566,10 @@ impl KannakaMemorySystem {
         let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
         let fetch = if drop_expired { top_k.saturating_add(5).max(top_k * 2) } else { top_k };
         let as_of = crate::medium::hemisphere::recall_now();
+        crate::progress::mark("recall");
         let (results, dream_hits) = self.engine.store.resonate_query_split(query, fetch)
             .map_err(SystemError::Store)?;
+        crate::progress::mark("recall rows");
         let now = Utc::now();
 
         let mut out = Vec::new();
@@ -3271,6 +3273,48 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         env::temp_dir().join(format!("kannaka_octest_{}_{}", name, Uuid::new_v4()))
+    }
+
+    // #1153 round two: the production pieces a served ask runs (recall_split,
+    // then the assess behind the system prompt) advance the progress the
+    // serve handler installs. A hash-only pipeline and a discarding event
+    // sink keep it off the network.
+    #[test]
+    fn recall_and_assess_advance_an_installed_progress() {
+        struct Discard;
+        impl crate::remember_events::RememberEventSink for Discard {
+            fn publish(&mut self, _: &str, _: &serde_json::Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let pipeline = || {
+            EncodingPipeline::new(
+                Box::new(SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, CODEBOOK_SEED)),
+                Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED),
+            )
+        };
+        let dir = temp_dir("progress_wiring");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::hrm_store::HrmStore::new(pipeline(), dir.join("kannaka.hrm"));
+        let engine = ResonanceEngine::new(Box::new(store), pipeline());
+        let mut sys = KannakaMemorySystem::init_with_engine(dir.clone(), engine).unwrap();
+        sys.set_remember_sink(Box::new(Discard));
+        for i in 0..12 {
+            sys.remember(&format!("progress wiring fixture {i}: the hub answers asks {}", Uuid::new_v4()))
+                .unwrap();
+        }
+
+        let p = crate::progress::Progress::new();
+        let _scope = crate::progress::install(p.clone());
+        sys.recall_split("how does the hub answer asks", 5).unwrap();
+        let after_recall = p.marks();
+        assert!(after_recall >= 3, "recall made only {after_recall} marks");
+        let _ = sys.assess();
+        let in_assess = p.marks() - after_recall;
+        // metrics + clusters + at least one chunk of the pair scan + integration
+        assert!(in_assess >= 4, "assess made only {in_assess} marks");
+        assert!(p.since_last() < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

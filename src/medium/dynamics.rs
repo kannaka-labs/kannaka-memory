@@ -45,11 +45,15 @@ impl Medium {
         let eta = 0.02; // Dampening rate — gentle, field stays biased
 
         // Compute pairwise interference matrix
+        crate::progress::mark("field settle");
         let interference_matrix = self.compute_interference_matrix(threshold);
 
         // Apply f(x) - constructive interference term
         let mut growth_terms = vec![0.0f32; n];
         for i in 0..n {
+            if i % 256 == 0 {
+                crate::progress::mark("field settle");
+            }
             for j in 0..n {
                 if i != j && interference_matrix[[i, j]] > 0.0 {
                     // Phase alignment factor

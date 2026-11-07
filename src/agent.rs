@@ -1028,11 +1028,27 @@ impl LlmClient {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<Value, AgentError> {
-        match self {
+        self.mark_request();
+        let out = match self {
             LlmClient::Anthropic(c) => c.send(system, messages, tools),
             LlmClient::Ollama(c) => c.send(system, messages, tools),
             LlmClient::OpenAI(c) => c.send(system, messages, tools),
-        }
+        };
+        crate::progress::mark("model reply");
+        out
+    }
+
+    /// Progress mark (#1153) before a blocking, non-streaming request. The
+    /// request can be silent for up to its HTTP timeout, which bounds it, so
+    /// the mark declares that much (plus slack for the body read) instead of
+    /// letting a long answer look like a stall.
+    fn mark_request(&self) {
+        let timeout = match self {
+            LlmClient::Anthropic(c) => c.timeout,
+            LlmClient::Ollama(c) => c.timeout,
+            LlmClient::OpenAI(c) => c.timeout,
+        };
+        crate::progress::mark_bounded("model request", timeout.saturating_add(Duration::from_secs(30)));
     }
 
     /// Per-call max_tokens override. Chat paths use this with
@@ -1045,11 +1061,14 @@ impl LlmClient {
         tools: &[Tool],
         max_tokens: u32,
     ) -> Result<Value, AgentError> {
-        match self {
+        self.mark_request();
+        let out = match self {
             LlmClient::Anthropic(c) => c.send_with_max(system, messages, tools, max_tokens),
             LlmClient::Ollama(c) => c.send_with_max(system, messages, tools, max_tokens),
             LlmClient::OpenAI(c) => c.send_with_max(system, messages, tools, max_tokens),
-        }
+        };
+        crate::progress::mark("model reply");
+        out
     }
 
     /// Streaming send. Only Anthropic supports SSE in this codebase right
@@ -1300,12 +1319,14 @@ pub fn ask_with_opts(
 
     // Surface memories per the chosen recall mode.
     let query = opts.recall_query.unwrap_or(prompt);
+    crate::progress::mark("ask recall");
     let surfaced = match opts.recall {
         RecallMode::None => Vec::new(),
         RecallMode::Full { top_k } => sys.recall(query, top_k).unwrap_or_default(),
         RecallMode::Attention { beam_size, top_k } => {
             let beam = attention_beam_for_prompt(sys, query, beam_size);
             lap("attention_beam", &mut t);
+            crate::progress::mark("attention beam");
             if beam.is_empty() {
                 Vec::new()
             } else {
@@ -1314,6 +1335,7 @@ pub fn ask_with_opts(
         }
     };
     lap("recall", &mut t);
+    crate::progress::mark("system prompt");
     let system = system_prompt(sys, &cfg.agent, &surfaced, opts.arm);
     lap("system_prompt(assess)", &mut t);
 
