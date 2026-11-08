@@ -33,6 +33,29 @@ pub enum EngineError {
 }
 
 // ---------------------------------------------------------------------------
+// DeletedRow (#1157)
+// ---------------------------------------------------------------------------
+
+/// #1157: one row a store removed, journaled at the moment of removal so the
+/// system can announce it with a `MemoryForget` after the delete is durable.
+///
+/// Everything a later reader needs is captured here, because once the row is
+/// gone the store can no longer say whether it was a facet or bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedRow {
+    pub id: Uuid,
+    /// The row a merge folded this one into, when the removal was a merge.
+    pub merged_into: Option<Uuid>,
+    /// Why the store removed it, when the store itself knows (native dream
+    /// prune or merge). `None` for a plain `delete`, whose reason the caller
+    /// supplies.
+    pub reason: Option<&'static str>,
+    /// An ADR-0049 facet or a `__consolidation*` bookkeeping row: never
+    /// announced, like their `remember` events (#1057).
+    pub internal: bool,
+}
+
+// ---------------------------------------------------------------------------
 // QueryResult
 // ---------------------------------------------------------------------------
 
@@ -281,6 +304,14 @@ pub trait MediumBackend: Send + Sync {
     /// `MemoryRemember` per id after a successful flush. A backend without a
     /// journal reports none, and so publishes nothing.
     fn take_new_memory_ids(&mut self) -> Vec<Uuid> {
+        Vec::new()
+    }
+
+    /// #1157: the rows removed since the last call, draining the journal.
+    /// `KannakaMemorySystem::save` publishes one `MemoryForget` per announced
+    /// row after a successful flush. A read-only store persists nothing, so
+    /// it reports nothing. A backend without a journal reports none.
+    fn take_deleted_rows(&mut self) -> Vec<DeletedRow> {
         Vec::new()
     }
 

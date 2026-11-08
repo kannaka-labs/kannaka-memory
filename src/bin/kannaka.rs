@@ -823,6 +823,24 @@ pub(crate) fn warn_if_hash_adopted(sys: &KannakaMemorySystem) {
     }
 }
 
+/// #1157 (B1): whether `cmd` (the command and its arguments) deletes rows
+/// and so must hold the write lock. Dry runs do not.
+fn deleting_invocation(cmd: &[String]) -> bool {
+    let rest = cmd.get(1..).unwrap_or(&[]);
+    match cmd.first().map(String::as_str) {
+        Some("forget") => true,
+        Some("prune-prefix") => !rest.iter().any(|a| a == "--dry-run"),
+        // Mirrors the triage arm's parsing: the last of --apply/--dry-run wins.
+        Some("triage") => rest
+            .iter()
+            .filter(|a| *a == "--apply" || *a == "--dry-run")
+            .last()
+            .map(|a| a == "--apply")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// The `.hrm` file a command operates on: `cfg.hrm.path` verbatim when it
 /// names a file (relative paths resolve against `data_dir`), else
 /// `data_dir/kannaka.hrm`.
@@ -2261,6 +2279,56 @@ fn main() {
         process::exit(0);
     }
 
+    // #1158: `stats --attribution` counts what each row records about its
+    // origin. It opens the store READ-ONLY and builds no memory system, so it
+    // writes nothing (no save, no status cache, no encoder stamp) and runs no
+    // O(n^2) assess. Dispatched here, before the load below.
+    if args[command_start] == "stats" && args[command_start + 1..].iter().any(|a| a == "--attribution") {
+        let json = args[command_start + 1..].iter().any(|a| a == "--json");
+        let hrm_path = hrm_path_for(&dir, &cfg);
+        match kannaka_memory::attribution::from_hrm_path(&hrm_path) {
+            Ok(s) if json => println!("{}", serde_json::to_string_pretty(&s).unwrap()),
+            Ok(s) => print!("{}", s.render()),
+            Err(e) => {
+                eprintln!("stats --attribution: cannot read {}: {e}", hrm_path.display());
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // #1157 (B1): a delete must not race the long-running writer. `swarm
+    // join` holds the whole store in RAM and its next save rewrites the .hrm
+    // without merging, which would bring a deleted row back AFTER its forget
+    // event announced the delete. So the deleting verbs take the write lock
+    // before the load and hold it to exit, and refuse (deleting nothing,
+    // announcing nothing) while another process holds it. Dry runs need no lock.
+    let _delete_lock = if deleting_invocation(&args[command_start..]) {
+        match try_acquire_write_lock() {
+            Some(lock) => {
+                #[cfg(not(unix))]
+                eprintln!(
+                    "[{}] NOTE: the write lock is advisory-only on this platform — confirm no \
+                     kannaka writer daemon is running.",
+                    args[command_start]
+                );
+                Some(lock)
+            }
+            None => {
+                eprintln!(
+                    "[{}] REFUSING: another process holds the HRM write lock (a swarm join \
+                     writer or a running dream). Its next save would undo this delete after \
+                     the forget event announced it. Nothing was deleted. Stop the writer, or \
+                     run this when no dream is running.",
+                    args[command_start]
+                );
+                process::exit(3);
+            }
+        }
+    } else {
+        None
+    };
+
     // HRM is the sole backend
     let quiet = std::env::var("KANNAKA_QUIET").is_ok();
     let mut sys = {
@@ -2291,6 +2359,11 @@ fn main() {
     match kannaka_memory::remember_events::RememberLevel::parse(&cfg.events.remember) {
         Ok(level) => sys.set_remember_level(level),
         Err(e) => eprintln!("[events] {e}; using the per-origin default"),
+    }
+    // #1157: forget events, `[events] forget` (env KANNAKA_EVENTS_FORGET).
+    match kannaka_memory::forget_events::ForgetLevel::parse(&cfg.events.forget) {
+        Ok(level) => sys.set_forget_level(level),
+        Err(e) => eprintln!("[events] {e}; using ids"),
     }
 
     // ADR-0031 Phase 3: install the dream-cycle auto-triage policy from config
@@ -2882,8 +2955,25 @@ fn main() {
                 eprintln!("Invalid UUID: {e}");
                 process::exit(1);
             });
-            match sys.forget(&id) {
-                Ok(true) => println!("Forgotten: {id}"),
+            warn_if_readonly("forget");
+            // #1157: save now (not at exit through Drop), so the forget event
+            // goes out after the delete is durable, and say whether it did.
+            let result = sys.with_forget_origin(
+                kannaka_memory::remember_events::VIA_CLI,
+                kannaka_memory::forget_events::REASON_OPERATOR,
+                |s| {
+                    let removed = s.forget(&id)?;
+                    if removed {
+                        s.save()?;
+                    }
+                    Ok::<bool, kannaka_memory::openclaw::SystemError>(removed)
+                },
+            );
+            match result {
+                Ok(true) => {
+                    println!("Forgotten: {id}");
+                    println!("{}", sys.take_forget_outcome().summary_line());
+                }
                 Ok(false) => {
                     eprintln!("Memory not found: {id}");
                     process::exit(1);
@@ -2952,18 +3042,27 @@ fn main() {
             // CPU — 2.9s per deletion — computing 1,269 assessments that the
             // next delete immediately invalidated. Only the final state is
             // observable, so it is refreshed once, at the end.
-            let (ok, miss) = match sys.forget_many(&to_forget) {
+            let (ok, miss) = match sys.with_forget_origin(
+                kannaka_memory::remember_events::VIA_CLI,
+                kannaka_memory::forget_events::REASON_PREFIX,
+                |s| s.forget_many(&to_forget),
+            ) {
                 Ok(counts) => counts,
                 Err(e) => {
                     eprintln!("prune-prefix: {e}");
                     process::exit(1);
                 }
             };
-            if let Err(e) = sys.save() {
+            if let Err(e) = sys.with_forget_origin(
+                kannaka_memory::remember_events::VIA_CLI,
+                kannaka_memory::forget_events::REASON_PREFIX,
+                |s| s.save(),
+            ) {
                 eprintln!("Failed to persist HRM after prune: {e}");
                 process::exit(1);
             }
             println!("[prune-prefix] forgotten={ok} not_found={miss}");
+            println!("[prune-prefix] {}", sys.take_forget_outcome().summary_line());
         }
         "triage" => {
             // ADR-0031 Phase 1 — value-based, Ξ-preserving online prune that
@@ -2976,7 +3075,9 @@ fn main() {
             // rather than lowering it (the #118 ear-loop failure mode).
             //
             // DRY-RUN BY DEFAULT. Pass --apply to actually forget+save. Each
-            // eviction is a normal forget (replayable via ADR-0028 events).
+            // eviction is a normal forget, announced by a MemoryForget event
+            // after the save (#1157, best-effort: the summary line says
+            // whether the events went out).
             // Defaults come from `[triage]` config (per-agent tunable, Phase 3);
             // flags override per-invocation. --include-long-term restores the
             // Phase-1 reach (Pinned is never evicted either way).
@@ -3054,8 +3155,15 @@ fn main() {
                 );
                 if apply && !ids.is_empty() {
                     warn_if_readonly("triage --max-total --apply");
-                    match sys.triage_forget(&ids) {
-                        Ok(n) => println!("[triage] evicted={n} (lowest effective-strength first; pinned protected)"),
+                    match sys.with_forget_origin(
+                        kannaka_memory::remember_events::VIA_CLI,
+                        kannaka_memory::forget_events::REASON_TRIAGE_CAP,
+                        |s| s.triage_forget(&ids),
+                    ) {
+                        Ok(n) => {
+                            println!("[triage] evicted={n} (lowest effective-strength first; pinned protected)");
+                            println!("[triage] {}", sys.take_forget_outcome().summary_line());
+                        }
                         Err(e) => {
                             eprintln!("Failed to persist HRM after size cap: {e}");
                             process::exit(1);
@@ -3098,8 +3206,15 @@ fn main() {
             }
             warn_if_readonly("triage --apply");
 
-            match sys.triage_forget(&sel.to_forget) {
-                Ok(n) => println!("[triage] evicted={n} (Ξ-preserving; representatives retained)"),
+            match sys.with_forget_origin(
+                kannaka_memory::remember_events::VIA_CLI,
+                kannaka_memory::forget_events::REASON_TRIAGE_REDUNDANT,
+                |s| s.triage_forget(&sel.to_forget),
+            ) {
+                Ok(n) => {
+                    println!("[triage] evicted={n} (Ξ-preserving; representatives retained)");
+                    println!("[triage] {}", sys.take_forget_outcome().summary_line());
+                }
                 Err(e) => {
                     eprintln!("Failed to persist HRM after triage: {e}");
                     process::exit(1);
@@ -3725,6 +3840,11 @@ fn main() {
                     );
                     if report.emerged {
                         println!("  Emergence detected!");
+                    }
+                    // #1157: what the dream removed, and whether it said so.
+                    let fo = sys.take_forget_outcome();
+                    if fo.announced > 0 {
+                        println!("  Forget events: {} removed, {}", fo.announced, fo.summary_line());
                     }
                     // ADR-0037 L6 instrument: append this dream to the telemetry
                     // time-series (cores / order / winding / Φ / dream stats over time).
@@ -8271,4 +8391,30 @@ fn fetch_audio_to_temp(url: &str, secs: u64) -> Result<std::path::PathBuf, Strin
         return Err(format!("got only {total} bytes; URL did not yield audio"));
     }
     Ok(tmp)
+}
+
+#[cfg(test)]
+mod deleting_invocation_tests {
+    use super::deleting_invocation;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #1157 (B1): every verb that deletes takes the write lock; dry runs and
+    /// everything else do not.
+    #[test]
+    fn deleting_verbs_need_the_lock_and_dry_runs_do_not() {
+        assert!(deleting_invocation(&v(&["forget", "00000000-0000-0000-0000-000000000000"])));
+        assert!(deleting_invocation(&v(&["prune-prefix", "spam:"])));
+        assert!(!deleting_invocation(&v(&["prune-prefix", "spam:", "--dry-run"])));
+        assert!(deleting_invocation(&v(&["triage", "--apply"])));
+        assert!(deleting_invocation(&v(&["triage", "--max-total", "10", "--apply"])));
+        assert!(!deleting_invocation(&v(&["triage"])));
+        assert!(!deleting_invocation(&v(&["triage", "--apply", "--dry-run"])));
+        assert!(deleting_invocation(&v(&["triage", "--dry-run", "--apply"])));
+        assert!(!deleting_invocation(&v(&["recall", "forget"])));
+        assert!(!deleting_invocation(&v(&["stats", "--attribution"])));
+        assert!(!deleting_invocation(&[]));
+    }
 }

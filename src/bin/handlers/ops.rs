@@ -125,7 +125,7 @@ pub(crate) fn handle_config(cfg: &KannakaConfig, args: &[String]) {
                     eprintln!("      hrm.path, hrm.wavefront_dim, updates.auto_check,");
                     eprintln!("      triage.enabled, triage.redundancy, triage.min_amplitude,");
                     eprintln!("      triage.min_age_hours, triage.max_evict, triage.xi_trigger,");
-                    eprintln!("      events.remember (off|ids|content|default)");
+                    eprintln!("      events.remember (off|ids|content|default), events.forget (off|ids)");
                     eprintln!();
                     eprintln!("Booleans accept: true/false, 1/0, yes/no, on/off (case-insensitive).");
                     process::exit(1);
@@ -258,6 +258,17 @@ pub(crate) fn handle_config(cfg: &KannakaConfig, args: &[String]) {
                     _ => { eprintln!("triage.xi_trigger expects a float in [0,1] (0 disables auto-trigger), got: {value}"); process::exit(1); }
                 },
                 // #1057: remember-event payload level (off|ids|content|default).
+                // #1157: forget-event payload level (off|ids|default).
+                "events.forget" => {
+                    match kannaka_memory::forget_events::ForgetLevel::parse(value) {
+                        Ok(kannaka_memory::forget_events::ForgetLevel::Ids) => new_cfg.events.forget.clear(),
+                        Ok(level) => new_cfg.events.forget = level.as_str().to_string(),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            process::exit(1);
+                        }
+                    }
+                }
                 "events.remember" => {
                     match kannaka_memory::remember_events::RememberLevel::parse(value) {
                         Ok(Some(level)) => new_cfg.events.remember = level.as_str().to_string(),

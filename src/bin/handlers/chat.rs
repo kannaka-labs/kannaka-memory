@@ -143,9 +143,35 @@ pub(crate) fn handle_chat(
                     Err(e) => ("error", format!("recall error: {e}")),
                 },
                 "forget" if !rest.is_empty() => match uuid::Uuid::parse_str(rest) {
-                    Ok(id) => match sys.forget(&id) {
-                        Ok(_) => ("slash", format!("[forgot {id}]")),
-                        Err(e) => ("error", format!("forget error: {e}")),
+                    // #1157: refuse while another writer holds the store (its
+                    // next save would bring the row back after the forget
+                    // event said it was gone), save at once instead of at
+                    // exit, and say whether the forget event went out.
+                    Ok(id) => match super::try_acquire_write_lock() {
+                        None => (
+                            "error",
+                            "forget refused: another process holds the HRM write lock \
+                             (a swarm join writer or a dream); its next save would undo the delete"
+                                .to_string(),
+                        ),
+                        Some(_lock) => match sys.with_forget_origin(
+                            kannaka_memory::remember_events::VIA_CHAT,
+                            kannaka_memory::forget_events::REASON_OPERATOR,
+                            |s| {
+                                let removed = s.forget(&id)?;
+                                if removed {
+                                    s.save()?;
+                                }
+                                Ok::<bool, kannaka_memory::openclaw::SystemError>(removed)
+                            },
+                        ) {
+                            Ok(true) => (
+                                "slash",
+                                format!("[forgot {id}] {}", sys.take_forget_outcome().summary_line()),
+                            ),
+                            Ok(false) => ("error", format!("forget: no memory {id}")),
+                            Err(e) => ("error", format!("forget error: {e}")),
+                        },
                     },
                     Err(_) => ("error", "forget: invalid uuid".to_string()),
                 },
