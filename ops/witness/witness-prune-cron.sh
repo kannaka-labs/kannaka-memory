@@ -64,7 +64,8 @@ cp "$HRM" "${HRM}.pre-prune-$(date +%s)" 2>/dev/null || true
 
 for prefix in "audio:heard" "audio:/tmp/" "audio:/var/tmp/"; do
   echo "[witness-prune $TS] prune-prefix \"$prefix\""
-  "$KANNAKA" prune-prefix "$prefix" 2>&1 | tail -1
+  # Count line + forget-event summary (#1157 made the summary the last line).
+  "$KANNAKA" prune-prefix "$prefix" 2>&1 | grep '^\[prune-prefix\]'
 done
 
 sudo systemctl start "$SERVICE"
