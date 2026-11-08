@@ -2232,9 +2232,18 @@ pub enum EventPayload<'a> {
     },
     /// A memory was deleted. Replay drops the matching memory_id.
     /// Subject: `KANNAKA.events.memory.<agent_id>.forget`
+    ///
+    /// #1157: published from every delete path (CLI, chat, triage, dedupe,
+    /// dream prune/merge) after the delete is durable. `via` names who removed
+    /// it, `reason` why (`crate::forget_events::REASON_*`), and `merged_into`
+    /// the row a merge folded it into; that key is omitted when there is
+    /// none. Never carries the deleted text or a hash of it.
     MemoryForget {
         agent_id: &'a str,
         memory_id: &'a uuid::Uuid,
+        via: &'a str,
+        reason: &'a str,
+        merged_into: Option<&'a uuid::Uuid>,
     },
     /// A daemon-served recall returned these memories, best first. The
     /// durable record of a memory being *used* by someone other than its
@@ -2330,9 +2339,15 @@ impl<'a> EventPayload<'a> {
                 obj.insert("modality".into(), serde_json::json!(modality));
                 obj.insert("via".into(), serde_json::json!(via));
             }
-            EventPayload::MemoryForget { agent_id, memory_id } => {
+            EventPayload::MemoryForget { agent_id, memory_id, via, reason, merged_into } => {
                 obj.insert("agent_id".into(), serde_json::json!(agent_id));
                 obj.insert("memory_id".into(), serde_json::json!(memory_id));
+                obj.insert("via".into(), serde_json::json!(via));
+                obj.insert("reason".into(), serde_json::json!(reason));
+                // Absent, not null, when the removal was not a merge.
+                if let Some(keeper) = merged_into {
+                    obj.insert("merged_into".into(), serde_json::json!(keeper));
+                }
             }
             EventPayload::MemoryRecall {
                 agent_id, memory_ids, similarities, top_k, query_sha256, via,

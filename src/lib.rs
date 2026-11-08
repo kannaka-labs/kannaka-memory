@@ -17,6 +17,10 @@ pub mod remember_events;
 /// #1156: `kannaka digest` — a read-only commitment to the memory set that
 /// can be balanced against the remember/forget event stream.
 pub mod digest;
+/// #1157: `MemoryForget` from every delete path — origins, reasons, outcome.
+pub mod forget_events;
+/// #1158: read-only count of the store by what each row records about its origin.
+pub mod attribution;
 /// Opt-in `KANNAKA_ASK_LOG`: one JSON line per answered ask, context + answer.
 pub mod ask_log;
 pub mod codebook;

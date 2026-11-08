@@ -144,6 +144,41 @@ agents contribute over time.
 }
 ```
 
+> **As built (#1157, 2026-11-08).** The sketches in this section are the
+> original proposal; three things differ in the code, for every memory event:
+> the subject is `KANNAKA.events.memory.<agent_id>.<kind>` (not
+> `KANNAKA.events.<agent_id>.memory.<kind>`), `ts` is unix milliseconds (a
+> number, not ISO8601), and the envelope carries `"schema_version": "1.0"`.
+>
+> `forget` was defined here but never published until #1157. It is now
+> published from every delete path (`kannaka forget`, chat `/forget`,
+> `prune-prefix`, `triage --apply`, `dedupe --apply`, and a dream's own
+> prunes, merges and auto-triage), once per removed memory, after the save
+> that made the delete durable. Its payload adds three keys to the ones
+> above:
+>
+> ```json
+> {
+>   "event_id": "uuid", "schema_version": "1.0", "ts": 1762600000000,
+>   "agent_id": "kannaka-prime", "memory_id": "uuid",
+>   "via": "cli | chat | dream | api",
+>   "reason": "operator | prefix | triage-redundant | triage-cap | dedupe-fold | dream-anneal | dream-merge | dream-evict | dream-compact | dream-unattributed | unspecified",
+>   "merged_into": "uuid (present only when the row was folded into another)"
+> }
+> ```
+>
+> It never carries the deleted text or a hash of it: the memory lane is
+> readable by `anon` (ADR-0039), and a hash of short text identifies it.
+> `[events] forget = off|ids` (env `KANNAKA_EVENTS_FORGET`), default `ids`.
+>
+> **Limits, stated plainly.** The event is best-effort: with no agent id,
+> NATS down, a denied publish, or a crash between the flush and the publish,
+> the delete stands and its event is lost. The CLI prints a line saying how
+> many events were and were not published, so the loss is not silent, but
+> the event log alone is not a complete replay record of deletes. Events are
+> unsigned, so anyone who can publish on the memory lane can forge one. The
+> stream keeps them 90 days. A durable outbox and a signature are follow-ups.
+
 **substrate.absorb** (already defined in ADR-0027 — moves to events
 namespace and adds event_id for idempotency):
 ```json

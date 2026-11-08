@@ -84,7 +84,13 @@ pub(crate) fn handle_dedupe(
         }
     }
 
-    let report = match sys.collapse_exact_duplicates(apply) {
+    // #1157: folded copies are announced as `via=cli reason=dedupe-fold`
+    // with `merged_into` = the keeper.
+    let report = match sys.with_forget_origin(
+        kannaka_memory::remember_events::VIA_CLI,
+        kannaka_memory::forget_events::REASON_DEDUPE_FOLD,
+        |s| s.collapse_exact_duplicates(apply),
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[dedupe] failed: {e}");
@@ -162,6 +168,7 @@ pub(crate) fn handle_dedupe(
         println!("[dedupe] nothing to collapse.");
     } else {
         println!("[dedupe] flushed to disk.");
+        println!("[dedupe] {}", sys.take_forget_outcome().summary_line());
     }
 
     drop(lock);

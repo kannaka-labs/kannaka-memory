@@ -451,6 +451,22 @@ pub struct KannakaMemorySystem {
     nats_sink: Option<crate::remember_events::NatsRememberSink>,
     /// Rows that existed when the running dream began; `Some` only mid-dream.
     dream_ids_before: Option<std::collections::HashSet<Uuid>>,
+
+    /// #1157 — forget events. See `crate::forget_events`. Seeded from
+    /// `KANNAKA_EVENTS_FORGET`; the bin sets it from `[events] forget`.
+    forget_level: crate::forget_events::ForgetLevel,
+    /// Who is deleting (`via`) and why (`reason`) for deletes not yet tagged.
+    forget_via: &'static str,
+    forget_reason: &'static str,
+    /// Removals awaiting a successful save, tagged with origin and reason.
+    pending_forget: Vec<crate::forget_events::ForgetRecord>,
+    /// What happened to the forget events published since the last
+    /// `take_forget_outcome`, so a caller can say it instead of guessing.
+    forget_outcome: crate::forget_events::ForgetPublishOutcome,
+    /// Facet and bookkeeping rows among `dream_ids_before`: the fallback diff
+    /// at the end of a dream must not announce them, and once they are gone
+    /// their status can no longer be read.
+    dream_internal_before: std::collections::HashSet<Uuid>,
 }
 
 /// ADR-0031 triage policy parameters (Phase 1–3).
@@ -590,6 +606,12 @@ impl KannakaMemorySystem {
             #[cfg(feature = "nats")]
             nats_sink: None,
             dream_ids_before: None,
+            forget_level: crate::forget_events::ForgetLevel::from_env(),
+            forget_via: crate::remember_events::VIA_API,
+            forget_reason: crate::forget_events::REASON_UNSPECIFIED,
+            pending_forget: Vec::new(),
+            forget_outcome: Default::default(),
+            dream_internal_before: std::collections::HashSet::new(),
         })
     }
 
@@ -663,12 +685,26 @@ impl KannakaMemorySystem {
     /// with the caller's origin and publish them a second time at the end.
     fn begin_dream_writes(&mut self) {
         self.collect_new_writes(self.write_origin);
+        // #1157: deletes made before the dream keep their own origin.
+        self.collect_deletes(self.forget_via, self.forget_reason, None);
+        let facets = self.engine.store.facet_row_ids();
+        let mut internal = std::collections::HashSet::new();
         let ids = self
             .engine
             .store
             .all_memories()
-            .map(|ms| ms.into_iter().map(|m| m.id).collect())
+            .map(|ms| {
+                ms.into_iter()
+                    .map(|m| {
+                        if facets.contains(&m.id) || m.content.starts_with("__consolidation") {
+                            internal.insert(m.id);
+                        }
+                        m.id
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
+        self.dream_internal_before = internal;
         self.dream_ids_before = Some(ids);
     }
 
@@ -678,19 +714,47 @@ impl KannakaMemorySystem {
     /// the dream created and removed again are absent from both sets, so a
     /// transient row is never announced.
     fn end_dream_writes(&mut self) {
+        if self.dream_ids_before.is_none() {
+            return;
+        }
+        // #1157: whatever the dream's stages removed and did not label yet.
+        self.collect_deletes(
+            crate::remember_events::VIA_DREAM,
+            crate::forget_events::REASON_DREAM_UNATTRIBUTED,
+            None,
+        );
         let Some(before) = self.dream_ids_before.take() else { return };
+        let internal = std::mem::take(&mut self.dream_internal_before);
         // The journal's entries are a subset of the diff (or were deleted).
         let _ = self.engine.store.take_new_memory_ids();
-        let created: Vec<Uuid> = self
+        let now: std::collections::HashSet<Uuid> = self
             .engine
             .store
             .all_memories()
-            .map(|ms| ms.into_iter().map(|m| m.id).filter(|id| !before.contains(id)).collect())
+            .map(|ms| ms.into_iter().map(|m| m.id).collect())
             .unwrap_or_default();
-        for id in created {
-            if !self.pending_remember.iter().any(|(p, _)| *p == id) {
-                self.pending_remember.push((id, crate::remember_events::VIA_DREAM));
+        for id in now.iter().filter(|id| !before.contains(id)) {
+            if !self.pending_remember.iter().any(|(p, _)| p == id) {
+                self.pending_remember.push((*id, crate::remember_events::VIA_DREAM));
             }
+        }
+        // #1157 fallback: a pre-dream row that is gone but that no journal
+        // entry covered (a removal path that bypasses both `delete` and the
+        // store's native-pass diff). Announced, but honestly unattributed.
+        let mut missed: Vec<Uuid> = before
+            .iter()
+            .filter(|id| !now.contains(id) && !internal.contains(id))
+            .filter(|id| !self.pending_forget.iter().any(|f| f.id == **id))
+            .copied()
+            .collect();
+        missed.sort();
+        for id in missed {
+            self.pending_forget.push(crate::forget_events::ForgetRecord {
+                id,
+                via: crate::remember_events::VIA_DREAM,
+                reason: crate::forget_events::REASON_DREAM_UNATTRIBUTED,
+                merged_into: None,
+            });
         }
     }
 
@@ -780,6 +844,154 @@ impl KannakaMemorySystem {
         }
         #[cfg(not(feature = "nats"))]
         drop(pending);
+    }
+
+    // -- #1157: forget events -----------------------------------------------
+
+    /// Payload level for forget events (`off` publishes nothing).
+    pub fn set_forget_level(&mut self, level: crate::forget_events::ForgetLevel) {
+        self.forget_level = level;
+    }
+
+    /// Run `f` with `via`/`reason` as the delete origin, then restore the
+    /// previous one. Deletes `f` made are tagged even if saved later.
+    pub fn with_forget_origin<R>(
+        &mut self,
+        via: &'static str,
+        reason: &'static str,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prev = (self.forget_via, self.forget_reason);
+        self.forget_via = via;
+        self.forget_reason = reason;
+        let out = f(self);
+        if self.dream_ids_before.is_none() {
+            self.collect_deletes(via, reason, None);
+        }
+        (self.forget_via, self.forget_reason) = prev;
+        out
+    }
+
+    /// Removals that have not been published yet.
+    pub fn pending_forget_events(&self) -> &[crate::forget_events::ForgetRecord] {
+        &self.pending_forget
+    }
+
+    /// What happened to the forget events since the last call (and reset).
+    pub fn take_forget_outcome(&mut self) -> crate::forget_events::ForgetPublishOutcome {
+        std::mem::take(&mut self.forget_outcome)
+    }
+
+    /// Move the store's delete journal into `pending_forget`. A row the store
+    /// labelled itself (native dream prune/merge) keeps its own reason and
+    /// carrier. Facets and bookkeeping rows are never announced. Mid-dream, a
+    /// row the dream created and removed again was never announced, so its
+    /// removal is not either.
+    fn collect_deletes(&mut self, via: &'static str, reason: &'static str, merged_into: Option<Uuid>) {
+        for row in self.engine.store.take_deleted_rows() {
+            if row.internal {
+                continue;
+            }
+            if let Some(before) = &self.dream_ids_before {
+                if !before.contains(&row.id) {
+                    continue;
+                }
+            }
+            if self.pending_forget.iter().any(|f| f.id == row.id) {
+                continue;
+            }
+            self.pending_forget.push(crate::forget_events::ForgetRecord {
+                id: row.id,
+                via,
+                reason: row.reason.unwrap_or(reason),
+                merged_into: row.merged_into.or(merged_into),
+            });
+        }
+    }
+
+    /// A memory written and removed before any save was never announced:
+    /// publish neither its remember nor its forget.
+    fn drop_unannounced_pairs(&mut self) {
+        if self.pending_forget.is_empty() || self.pending_remember.is_empty() {
+            return;
+        }
+        let remembered: std::collections::HashSet<Uuid> =
+            self.pending_remember.iter().map(|(id, _)| *id).collect();
+        let both: std::collections::HashSet<Uuid> = self
+            .pending_forget
+            .iter()
+            .map(|f| f.id)
+            .filter(|id| remembered.contains(id))
+            .collect();
+        if both.is_empty() {
+            return;
+        }
+        self.pending_remember.retain(|(id, _)| !both.contains(id));
+        self.pending_forget.retain(|f| !both.contains(&f.id));
+    }
+
+    /// Publish one `MemoryForget` per pending removal. Called only after a
+    /// successful flush, so an event never announces a delete that failed.
+    /// Best-effort, but never silent: every removal that does not reach the
+    /// bus is counted in `forget_outcome` with the reason.
+    fn publish_pending_forgets(&mut self) {
+        if self.pending_forget.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_forget);
+        let mut out = crate::forget_events::ForgetPublishOutcome {
+            announced: pending.len(),
+            ..Default::default()
+        };
+        let not_published = |out: &mut crate::forget_events::ForgetPublishOutcome, n: usize, why: String| {
+            out.not_published += n;
+            out.reason = Some(why);
+        };
+        if self.forget_level == crate::forget_events::ForgetLevel::Off {
+            not_published(&mut out, pending.len(), "events.forget = off".into());
+            self.forget_outcome.merge(&out);
+            return;
+        }
+        #[cfg(feature = "nats")]
+        {
+            let agent_id = self
+                .agent_id
+                .clone()
+                .or_else(|| std::env::var("KANNAKA_AGENT_ID").ok())
+                .unwrap_or_default();
+            if agent_id.is_empty() {
+                not_published(&mut out, pending.len(), "no agent id".into());
+            } else {
+                let url = self.resolved_nats_url();
+                let sink: &mut dyn crate::remember_events::RememberEventSink =
+                    match self.remember_sink.as_mut() {
+                        Some(s) => s.as_mut(),
+                        None => self
+                            .nats_sink
+                            .get_or_insert_with(|| crate::remember_events::NatsRememberSink::new(url)),
+                    };
+                for rec in &pending {
+                    let (subject, payload) = crate::forget_events::build_forget_event(&agent_id, rec);
+                    match sink.publish(&subject, &payload) {
+                        Ok(()) => out.published += 1,
+                        // A denied identity is reported once by the transport
+                        // (#1071) and then skipped; it still did not publish.
+                        Err(e) => not_published(&mut out, 1, e),
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "nats"))]
+        not_published(&mut out, pending.len(), "built without the nats feature".into());
+        if out.not_published > 0 {
+            eprintln!(
+                "[events] {}/{} forget event(s) not published: {}",
+                out.not_published,
+                out.announced,
+                out.reason.as_deref().unwrap_or("unknown")
+            );
+        }
+        self.forget_outcome.merge(&out);
     }
 
     /// Resolve the NATS URL for best-effort publishes. Prefers the URL
@@ -1445,6 +1657,12 @@ impl KannakaMemorySystem {
                         }
                     }
                 }
+                // #1157: each folded copy is announced as merged into its keeper.
+                self.collect_deletes(
+                    self.forget_via,
+                    crate::forget_events::REASON_DEDUPE_FOLD,
+                    Some(keeper_id),
+                );
             } else if promote_tier {
                 report.tier_promotions += 1;
             }
@@ -1463,7 +1681,9 @@ impl KannakaMemorySystem {
         }
 
         if apply && !report.groups.is_empty() {
-            self.engine.store.flush().map_err(SystemError::Store)?;
+            // `save`, not a bare flush: it also publishes the forget events
+            // for the folded copies once they are durable (#1157).
+            self.save()?;
             // The memory count moved, so Observatory's fast-path cache is now
             // wrong — same obligation `forget` has (#730).
             self.refresh_status_cache_counts();
@@ -1905,9 +2125,11 @@ impl KannakaMemorySystem {
     }
 
     /// ADR-0031: forget a precomputed eviction set and persist. Returns the
-    /// count actually forgotten. Each eviction is a normal delete (replayable
-    /// via ADR-0028 events); the status cache is refreshed once for the batch
-    /// via `forget_many`, not once per eviction (#1061).
+    /// count actually forgotten. Each eviction is a normal delete, announced
+    /// by a `MemoryForget` event after the save (#1157; best-effort, so the
+    /// event log is not by itself a complete replay record). The status cache
+    /// is refreshed once for the batch via `forget_many`, not once per
+    /// eviction (#1061).
     pub fn triage_forget(&mut self, ids: &[Uuid]) -> Result<usize, SystemError> {
         let (n, _not_found) = self.forget_many(ids)?;
         if n > 0 {
@@ -2153,7 +2375,19 @@ impl KannakaMemorySystem {
         // same-cycle hard-delete). So the BENEFICIAL particle consolidation
         // (strengthen, skip-links, kuramoto, hallucination bridges) runs under
         // belief too, instead of the earlier blunt skip. Default path byte-identical.
+        // #1157: label what the native passes and the merge removed before
+        // the particle stages run, so their plain deletes get their own label.
+        self.collect_deletes(
+            crate::remember_events::VIA_DREAM,
+            crate::forget_events::REASON_DREAM_UNATTRIBUTED,
+            None,
+        );
         let consol_report = self.dream_state.engine.consolidate(&mut self.engine, 0, 2);
+        self.collect_deletes(
+            crate::remember_events::VIA_DREAM,
+            crate::forget_events::REASON_DREAM_COMPACT,
+            None,
+        );
 
         let total_strengthened = wave_report.wavefronts_strengthened + consol_report.memories_strengthened;
         let total_pruned = wave_report.wavefronts_dissolved + consol_report.memories_pruned;
@@ -2195,6 +2429,12 @@ impl KannakaMemorySystem {
                         Ok(_) => {}
                         Err(e) => eprintln!("[dream] triage auto-trigger failed: {e}"),
                     }
+                    // #1157: triage_forget saved mid-dream; the dream owns these.
+                    self.collect_deletes(
+                        crate::remember_events::VIA_DREAM,
+                        crate::forget_events::REASON_TRIAGE_REDUNDANT,
+                        None,
+                    );
                 }
             }
         }
@@ -2229,6 +2469,11 @@ impl KannakaMemorySystem {
                     Ok(_) => {}
                     Err(e) => eprintln!("[dream] size cap failed: {e}"),
                 }
+                self.collect_deletes(
+                    crate::remember_events::VIA_DREAM,
+                    crate::forget_events::REASON_TRIAGE_CAP,
+                    None,
+                );
             }
         }
 
@@ -2626,7 +2871,11 @@ impl KannakaMemorySystem {
         // a dream the announcement waits for the dream's own end.
         if self.dream_ids_before.is_none() {
             self.collect_new_writes(self.write_origin);
+            // #1157: deletes too, after the same flush, remembers first.
+            self.collect_deletes(self.forget_via, self.forget_reason, None);
+            self.drop_unannounced_pairs();
             self.publish_pending_remembers();
+            self.publish_pending_forgets();
         }
         Ok(())
     }
@@ -5669,6 +5918,303 @@ mod tests {
                 assert!(!mem.content.starts_with("__consolidation"), "bookkeeping row announced");
             }
             assert!(evs[..before].iter().all(|p| p["via"] == re::VIA_API));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // ── #1157: every delete path publishes MemoryForget ──────────────────
+
+    #[cfg(feature = "nats")]
+    mod forget_events_1157 {
+        use super::*;
+        use crate::forget_events::{self as fe, ForgetLevel};
+        use crate::remember_events::{self as re, RememberEventSink};
+        use std::sync::{Arc, Mutex};
+
+        type Captured = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+        struct Capture(Captured);
+        impl RememberEventSink for Capture {
+            fn publish(&mut self, subject: &str, payload: &serde_json::Value) -> Result<(), String> {
+                self.0.lock().unwrap().push((subject.to_string(), payload.clone()));
+                Ok(())
+            }
+        }
+
+        fn system(name: &str) -> (KannakaMemorySystem, PathBuf, Captured) {
+            let dir = temp_dir(name);
+            let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            sys.set_agent_id("agent-under-test".into());
+            sys.set_remember_level(None);
+            // Independent of whatever KANNAKA_EVENTS_FORGET the test env has.
+            sys.set_forget_level(ForgetLevel::Ids);
+            let cap: Captured = Arc::default();
+            sys.set_remember_sink(Box::new(Capture(cap.clone())));
+            (sys, dir, cap)
+        }
+
+        fn forgets(cap: &Captured) -> Vec<serde_json::Value> {
+            cap.lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| s.ends_with(".forget"))
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+
+        fn remembers(cap: &Captured) -> Vec<serde_json::Value> {
+            cap.lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| s.ends_with(".remember"))
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+
+        fn id_of(p: &serde_json::Value) -> Uuid {
+            p["memory_id"].as_str().unwrap().parse().unwrap()
+        }
+
+        /// The `kannaka forget` flow: one event after the save, via/reason set,
+        /// no merged_into, and the outcome line says it was published.
+        #[test]
+        fn cli_forget_publishes_one_event_after_the_save() {
+            let (mut sys, dir, cap) = system("fe_cli");
+            let id = sys.remember("the heron stands in the shallows").unwrap();
+            let removed = sys
+                .with_forget_origin(re::VIA_CLI, fe::REASON_OPERATOR, |s| {
+                    let r = s.forget(&id)?;
+                    s.save()?;
+                    Ok::<bool, SystemError>(r)
+                })
+                .unwrap();
+            assert!(removed);
+            let fs = forgets(&cap);
+            assert_eq!(fs.len(), 1, "{fs:?}");
+            assert_eq!(cap.lock().unwrap().last().unwrap().0, "KANNAKA.events.memory.agent-under-test.forget");
+            assert_eq!(id_of(&fs[0]), id);
+            assert_eq!(fs[0]["via"], "cli");
+            assert_eq!(fs[0]["reason"], "operator");
+            assert!(fs[0].get("merged_into").is_none());
+            let out = sys.take_forget_outcome();
+            assert_eq!((out.announced, out.published, out.not_published), (1, 1, 0));
+            assert_eq!(out.summary_line(), "forget event: published 1");
+            // Nothing pending: a later save publishes nothing more.
+            sys.save().unwrap();
+            assert_eq!(forgets(&cap).len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A forget without a save (the old CLI flow, saved by Drop) is NOT
+        /// announced until a save makes it durable.
+        #[test]
+        fn nothing_is_announced_before_the_save() {
+            let (mut sys, dir, cap) = system("fe_nosave");
+            let id = sys.remember("written then forgotten").unwrap();
+            sys.forget(&id).unwrap();
+            assert!(forgets(&cap).is_empty());
+            assert_eq!(sys.pending_forget_events().len(), 0, "collected only at save");
+            sys.save().unwrap();
+            assert_eq!(forgets(&cap).len(), 1);
+            assert_eq!(forgets(&cap)[0]["via"], re::VIA_API);
+            assert_eq!(forgets(&cap)[0]["reason"], fe::REASON_UNSPECIFIED);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn prune_and_triage_paths_carry_their_reason() {
+            let (mut sys, dir, cap) = system("fe_reasons");
+            let a = sys.remember("prefix:one").unwrap();
+            let b = sys.remember("prefix:two").unwrap();
+            let c = sys.remember("the cap takes this one").unwrap();
+            sys.with_forget_origin(re::VIA_CLI, fe::REASON_PREFIX, |s| {
+                s.forget_many(&[a, b]).unwrap();
+                s.save().unwrap();
+            });
+            sys.with_forget_origin(re::VIA_CLI, fe::REASON_TRIAGE_CAP, |s| s.triage_forget(&[c]))
+                .unwrap();
+            let fs = forgets(&cap);
+            assert_eq!(fs.len(), 3, "{fs:?}");
+            for p in &fs[..2] {
+                assert_eq!(p["reason"], "prefix");
+                assert!([a, b].contains(&id_of(p)));
+            }
+            assert_eq!(id_of(&fs[2]), c);
+            assert_eq!(fs[2]["reason"], "triage-cap");
+            assert_eq!(fs[2]["via"], "cli");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// B5: written and removed before any save → neither event.
+        #[test]
+        fn remember_then_forget_before_a_save_publishes_neither() {
+            let (mut sys, dir, cap) = system("fe_pair");
+            sys.set_auto_save(false);
+            let id = sys.remember("never announced").unwrap();
+            sys.forget(&id).unwrap();
+            sys.save().unwrap();
+            assert!(remembers(&cap).iter().all(|p| id_of(p) != id));
+            assert!(forgets(&cap).is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Off publishes nothing, and the outcome says so instead of nothing.
+        #[test]
+        fn off_publishes_nothing_but_says_so() {
+            let (mut sys, dir, cap) = system("fe_off");
+            sys.set_forget_level(ForgetLevel::Off);
+            let id = sys.remember("silenced forget").unwrap();
+            sys.forget(&id).unwrap();
+            sys.save().unwrap();
+            assert!(forgets(&cap).is_empty());
+            let out = sys.take_forget_outcome();
+            assert_eq!((out.announced, out.not_published), (1, 1));
+            assert!(out.summary_line().contains("NOT published 1 (events.forget = off)"), "{out:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// B2: no agent id → nothing on the bus, and the caller is told.
+        #[test]
+        fn no_agent_id_is_reported_not_silent() {
+            let (mut sys, dir, cap) = system("fe_noagent");
+            let id = sys.remember("anonymous").unwrap();
+            sys.set_agent_id(String::new());
+            // KANNAKA_AGENT_ID would fill in; only meaningful when it is unset.
+            if std::env::var("KANNAKA_AGENT_ID").is_err() {
+                sys.forget(&id).unwrap();
+                sys.save().unwrap();
+                assert!(forgets(&cap).is_empty());
+                let out = sys.take_forget_outcome();
+                assert_eq!(out.not_published, 1);
+                assert_eq!(out.reason.as_deref(), Some("no agent id"));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn readonly_store_announces_no_delete() {
+            let (mut sys, dir, cap) = system("fe_readonly");
+            let id = sys.remember("on disk").unwrap();
+            if let Some(hrm) = sys
+                .engine
+                .store
+                .as_any_mut()
+                .downcast_mut::<crate::hrm_store::HrmStore>()
+            {
+                hrm.set_readonly(true);
+            }
+            sys.forget(&id).unwrap();
+            sys.save().unwrap();
+            assert!(forgets(&cap).is_empty());
+            assert_eq!(sys.take_forget_outcome().announced, 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Dedupe: each folded copy names its keeper in `merged_into`.
+        #[test]
+        fn dedupe_fold_carries_merged_into() {
+            let (mut sys, dir, cap) = system("fe_dedupe");
+            sys.set_reinforce_on_repeat(false);
+            let a = sys.remember("an exact duplicate line").unwrap();
+            let b = sys.remember("an exact duplicate line").unwrap();
+            assert_ne!(a, b, "the test needs two rows");
+            let report = sys
+                .with_forget_origin(re::VIA_CLI, fe::REASON_DEDUPE_FOLD, |s| {
+                    s.collapse_exact_duplicates(true)
+                })
+                .unwrap();
+            assert_eq!(report.groups.len(), 1);
+            let keeper = report.groups[0].keeper;
+            let folded = report.groups[0].folded[0];
+            let fs = forgets(&cap);
+            assert_eq!(fs.len(), 1, "{fs:?}");
+            assert_eq!(id_of(&fs[0]), folded);
+            assert_eq!(fs[0]["reason"], "dedupe-fold");
+            assert_eq!(fs[0]["via"], "cli");
+            assert_eq!(fs[0]["merged_into"], keeper.to_string());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// B3: a delete inside a dream (auto-triage saves mid-dream) is the
+        /// dream's, not the caller's, and is published once at the end. A row
+        /// the dream created and removed again is announced neither way.
+        #[test]
+        fn mid_dream_triage_is_via_dream_and_transients_are_silent() {
+            let (mut sys, dir, cap) = system("fe_dream_triage");
+            let old = sys.remember("an old redundant extra").unwrap();
+            sys.set_forget_level(ForgetLevel::Ids);
+            sys.with_forget_origin(re::VIA_CLI, fe::REASON_OPERATOR, |s| {
+                s.begin_dream_writes();
+                let transient = s.remember("made and unmade inside the dream").unwrap();
+                s.forget(&transient).unwrap();
+                s.triage_forget(&[old]).unwrap(); // saves mid-dream
+                assert!(forgets(&cap).is_empty(), "nothing published mid-dream");
+                s.collect_deletes(re::VIA_DREAM, fe::REASON_TRIAGE_REDUNDANT, None);
+                s.end_dream_writes();
+                s.save().unwrap();
+            });
+            let fs = forgets(&cap);
+            assert_eq!(fs.len(), 1, "{fs:?}");
+            assert_eq!(id_of(&fs[0]), old);
+            assert_eq!(fs[0]["via"], "dream");
+            assert_eq!(fs[0]["reason"], "triage-redundant");
+            assert!(
+                remembers(&cap).iter().all(|p| p["memory_id"] != fs[0]["memory_id"] || p["via"] != "dream"),
+                "{:?}",
+                remembers(&cap)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Replay: (rows before) + remembered - forgotten == rows after, for a
+        /// deep and a lite dream. Every forget is via=dream, published once,
+        /// for a row that existed before and is gone now.
+        #[test]
+        fn dream_forgets_replay_to_the_store() {
+            let (mut sys, dir, cap) = system("fe_dream_replay");
+            for i in 0..40 {
+                sys.remember(&format!("the tide pool holds creature number {} of cluster {}", i, i % 4))
+                    .unwrap();
+            }
+            let live = |s: &KannakaMemorySystem| -> std::collections::HashSet<Uuid> {
+                let facets = s.engine.store.facet_row_ids();
+                s.engine
+                    .store
+                    .all_memories()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|m| !facets.contains(&m.id) && !m.content.starts_with("__consolidation"))
+                    .map(|m| m.id)
+                    .collect()
+            };
+            let before = live(&sys);
+            let n_before = cap.lock().unwrap().len();
+            sys.dream().unwrap();
+            sys.dream_lite().unwrap();
+            let after = live(&sys);
+            let evs: Vec<(String, serde_json::Value)> = cap.lock().unwrap()[n_before..].to_vec();
+            let mut replay = before.clone();
+            let mut seen = std::collections::HashSet::new();
+            let mut forgot = 0usize;
+            for (subject, p) in &evs {
+                let id = id_of(p);
+                if subject.ends_with(".remember") {
+                    replay.insert(id);
+                } else if subject.ends_with(".forget") {
+                    forgot += 1;
+                    assert_eq!(p["via"], "dream", "{p}");
+                    assert!(seen.insert(id), "forget published twice: {id}");
+                    assert!(before.contains(&id), "forget for a row that never existed: {p}");
+                    assert!(!after.contains(&id), "forget for a row still present: {p}");
+                    replay.remove(&id);
+                }
+            }
+            eprintln!(
+                "[#1157] 40 memories, deep+lite dream: {forgot} forget event(s), store {} -> {}",
+                before.len(),
+                after.len()
+            );
+            assert_eq!(replay, after, "before + remember - forget must equal after");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

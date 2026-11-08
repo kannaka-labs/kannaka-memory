@@ -17,6 +17,12 @@ use crate::medium::types::{Tier, ConsolidateOpts, ConsolidateMode, ConsolidateRe
 use crate::medium::types::{DEFAULT_BELIEF_ABSORB_FRAC, ENERGY_CAP};
 use crate::medium::chiral::{ChiralMedium, ChiralConsciousness};
 
+/// #1157: consolidation's layer-summary rows are bookkeeping, not memories;
+/// the dream stages and the #1057 remember events skip them by this prefix.
+fn is_bookkeeping(content: &str) -> bool {
+    content.starts_with("__consolidation")
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // ADR-0036 belief-safe merge — the single grouping pass shared by
 // `plan_consolidation` (read-only) and `apply_consolidation` (mutating).
@@ -466,6 +472,14 @@ pub struct HrmStore {
     /// publishes one `MemoryRemember` per id still present — the one place
     /// every write path passes through.
     new_ids: Vec<Uuid>,
+    /// #1157: rows removed since the last `take_deleted_rows`, captured at
+    /// removal (facet/bookkeeping status is unknowable afterwards). The
+    /// system drains it after a successful save and publishes one
+    /// `MemoryForget` per announced row.
+    deleted: Vec<crate::store::DeletedRow>,
+    /// #1157: absorbed id -> carrier from the last resonance-merge apply, so
+    /// the forget journal can name the row each absorbed memory went into.
+    merge_carriers: HashMap<Uuid, Uuid>,
 }
 
 impl HrmStore {
@@ -534,6 +548,8 @@ impl HrmStore {
             include_dreams_override: None,
             readonly: Self::env_readonly(),
             new_ids: Vec::new(),
+            deleted: Vec::new(),
+            merge_carriers: HashMap::new(),
         }
     }
 
@@ -615,6 +631,8 @@ impl HrmStore {
                     include_dreams_override: None,
                     readonly: Self::env_readonly(),
                     new_ids: Vec::new(),
+                    deleted: Vec::new(),
+                    merge_carriers: HashMap::new(),
                 };
                 // Populate flat medium view for backward compat (observe, coherence matrix, etc.)
                 store.sync_medium_from_chiral();
@@ -651,6 +669,8 @@ impl HrmStore {
                     include_dreams_override: None,
                     readonly: Self::env_readonly(),
                     new_ids: Vec::new(),
+                    deleted: Vec::new(),
+                    merge_carriers: HashMap::new(),
                 };
                 // #1008: the flat path needs the same clamp as the chiral one.
                 store.clamp_persisted_energy();
@@ -2296,6 +2316,8 @@ impl HrmStore {
         //         Runs on memory_cache, which still holds every pre-merge entry;
         //         rebuild_cache (next) snapshots from it, and the absorbed
         //         entries themselves drop out because they're gone from the store.
+        // #1157: remembered so the forget journal can say where each went.
+        self.merge_carriers = absorbed_to_carrier.clone();
         if !absorbed_to_carrier.is_empty() {
             // 1. Gather absorbed members' outbound links, intra-group targets
             //    collapsed to the carrier, grouped by the carrier that inherits.
@@ -2367,6 +2389,59 @@ impl HrmStore {
             chiral.right.id_to_index.contains_key(id)
         } else {
             self.medium.store.id_to_index.contains_key(id)
+        }
+    }
+
+    /// #1157: whether `id` is an ADR-0049 facet row (right hemisphere meta).
+    fn is_facet_row(&self, id: &Uuid) -> bool {
+        match self.chiral {
+            Some(ref chiral) => chiral
+                .right
+                .id_to_index
+                .get(id)
+                .and_then(|&i| chiral.right.metadata.get(i))
+                .map(|m| m.is_facet)
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// #1157: every cached row, mapped to whether it is internal (facet or
+    /// bookkeeping), taken before a native pass that can remove rows without
+    /// going through `delete`. Empty on a read-only store (nothing to journal).
+    fn removal_snapshot(&self) -> HashMap<Uuid, bool> {
+        if self.readonly {
+            return HashMap::new();
+        }
+        let facets = MediumBackend::facet_row_ids(self);
+        self.memory_cache
+            .values()
+            .map(|m| (m.id, facets.contains(&m.id) || is_bookkeeping(&m.content)))
+            .collect()
+    }
+
+    /// #1157: journal each row in `before` that the native pass removed.
+    /// A row the last merge absorbed is journaled as a merge into its
+    /// carrier; every other one with `reason`.
+    fn journal_native_removals(&mut self, before: HashMap<Uuid, bool>, reason: &'static str) {
+        let carriers = std::mem::take(&mut self.merge_carriers);
+        if before.is_empty() {
+            return;
+        }
+        let mut gone: Vec<(Uuid, bool)> = before
+            .into_iter()
+            .filter(|(id, _)| !self.memory_cache.contains_key(id))
+            .collect();
+        // Deterministic order for the events.
+        gone.sort_by_key(|(id, _)| *id);
+        for (id, internal) in gone {
+            let merged_into = carriers.get(&id).copied();
+            self.deleted.push(crate::store::DeletedRow {
+                id,
+                merged_into,
+                reason: Some(if merged_into.is_some() { "dream-merge" } else { reason }),
+                internal,
+            });
         }
     }
 
@@ -3057,6 +3132,16 @@ impl MediumBackend for HrmStore {
         Ok(id)
     }
 
+    fn take_deleted_rows(&mut self) -> Vec<crate::store::DeletedRow> {
+        let rows = std::mem::take(&mut self.deleted);
+        // Same rule as `take_new_memory_ids`: a read-only store persists
+        // nothing, so a delete there is not a delete anyone will ever see.
+        if self.readonly {
+            return Vec::new();
+        }
+        rows
+    }
+
     fn take_new_memory_ids(&mut self) -> Vec<Uuid> {
         let ids = std::mem::take(&mut self.new_ids);
         // A read-only store never persists (`save_medium` is a no-op), so its
@@ -3160,7 +3245,17 @@ impl MediumBackend for HrmStore {
     }
 
     fn delete(&mut self, id: &Uuid) -> Result<bool, StoreError> {
-        if self.memory_cache.remove(id).is_some() {
+        // #1157: whether the row is a facet must be read before it is gone.
+        let is_facet = self.is_facet_row(id);
+        if let Some(removed) = self.memory_cache.remove(id) {
+            if !self.readonly {
+                self.deleted.push(crate::store::DeletedRow {
+                    id: *id,
+                    merged_into: None,
+                    reason: None,
+                    internal: is_facet || is_bookkeeping(&removed.content),
+                });
+            }
             // Remove from flat medium (best-effort).
             if let Err(e) = self.medium.remove_wavefront(id) {
                 // Log error but don't fail - cache was already updated
@@ -3220,7 +3315,13 @@ impl MediumBackend for HrmStore {
         temperature: Option<f32>,
         chiral_eta: f32,
     ) -> Result<crate::medium::types::DreamReport, StoreError> {
-        Ok(Self::dream_native(self, cycles, temperature, chiral_eta))
+        // #1157: annealing prunes low-energy wavefronts inside the medium,
+        // past `delete`, so the journal learns of them by a before/after diff
+        // taken here, while each row's facet/bookkeeping status is still known.
+        let before = self.removal_snapshot();
+        let report = Self::dream_native(self, cycles, temperature, chiral_eta);
+        self.journal_native_removals(before, "dream-anneal");
+        Ok(report)
     }
 
     fn callosal_kuramoto(&mut self, dt: f32) {
@@ -3228,7 +3329,9 @@ impl MediumBackend for HrmStore {
     }
 
     fn chiral_dream(&mut self, deep: bool, cycles: usize) {
+        let before = self.removal_snapshot();
         Self::chiral_dream(self, deep, cycles);
+        self.journal_native_removals(before, "dream-anneal");
     }
 
     fn flush_reactivation(&self) {
@@ -3272,7 +3375,15 @@ impl MediumBackend for HrmStore {
                 ConsolidateReport { mode: "off".to_string(), ..Default::default() }
             }
             ConsolidateMode::DryRun => Self::plan_consolidation(self, opts),
-            ConsolidateMode::Apply => Self::apply_consolidation(self, opts),
+            ConsolidateMode::Apply => {
+                // #1157: absorbed rows carry their carrier; decay evictions
+                // carry none.
+                let before = self.removal_snapshot();
+                self.merge_carriers.clear();
+                let report = Self::apply_consolidation(self, opts);
+                self.journal_native_removals(before, "dream-evict");
+                report
+            }
         }
     }
 

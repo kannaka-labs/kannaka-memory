@@ -153,3 +153,66 @@ fn documents_missing_required_schema_version_and_ts() {
         "legacy `timestamp` (RFC-3339 string) should still be present until `ts` lands"
     );
 }
+
+// ── #1157: `KANNAKA.events.memory.<agent>.forget` ───────────────────────────
+//
+// ADR-0028 defined `MemoryForget` as `{agent_id, memory_id}` plus the
+// envelope; #1157 adds `via`, `reason` and (only for a merge) `merged_into`.
+// The two original keys keep their names and types, and the event never
+// carries the deleted text or a hash of it.
+
+#[cfg(feature = "nats")]
+mod forget_contract {
+    use kannaka_memory::forget_events::{build_forget_event, ForgetRecord};
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    fn keys(p: &Value) -> BTreeSet<String> {
+        p.as_object().expect("payload is an object").keys().cloned().collect()
+    }
+
+    fn set(ks: &[&str]) -> BTreeSet<String> {
+        ks.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn forget_subject_and_exact_key_set() {
+        let id = uuid::Uuid::new_v4();
+        let (subject, p) = build_forget_event(
+            "kannaka-prime",
+            &ForgetRecord { id, via: "cli", reason: "operator", merged_into: None },
+        );
+        assert_eq!(subject, "KANNAKA.events.memory.kannaka-prime.forget");
+        assert_eq!(
+            keys(&p),
+            set(&["event_id", "schema_version", "ts", "agent_id", "memory_id", "via", "reason"]),
+            "no extra keys, merged_into absent (not null) without a merge: {p}"
+        );
+        assert_eq!(p["agent_id"].as_str(), Some("kannaka-prime"));
+        assert_eq!(p["memory_id"].as_str(), Some(id.to_string().as_str()));
+        assert_eq!(p["via"].as_str(), Some("cli"));
+        assert_eq!(p["reason"].as_str(), Some("operator"));
+        assert_eq!(p["schema_version"].as_str(), Some("1.0"));
+        assert!(p["ts"].is_i64(), "ts is unix-ms: {p}");
+        assert!(p["event_id"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()).is_some());
+    }
+
+    #[test]
+    fn forget_merge_adds_only_merged_into() {
+        let id = uuid::Uuid::new_v4();
+        let keeper = uuid::Uuid::new_v4();
+        let (_, p) = build_forget_event(
+            "a",
+            &ForgetRecord { id, via: "dream", reason: "dream-merge", merged_into: Some(keeper) },
+        );
+        assert_eq!(
+            keys(&p),
+            set(&[
+                "event_id", "schema_version", "ts", "agent_id", "memory_id", "via", "reason",
+                "merged_into",
+            ])
+        );
+        assert_eq!(p["merged_into"].as_str(), Some(keeper.to_string().as_str()));
+        assert!(p.get("content").is_none() && p.get("content_sha256").is_none());
+    }
+}

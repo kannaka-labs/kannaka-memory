@@ -66,6 +66,13 @@ pub struct KannakaConfig {
 pub struct EventsConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub remember: String,
+    /// #1157: `forget = "off" | "ids"` for
+    /// `KANNAKA.events.memory.<agent>.forget`, published by every delete path
+    /// after a successful save. Empty (the default) means `ids`: memory id,
+    /// via, reason and merged_into; never the deleted text. Env override:
+    /// `KANNAKA_EVENTS_FORGET`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub forget: String,
 }
 
 /// Text-encoder selection for the HRM pipeline.
@@ -930,6 +937,7 @@ impl KannakaConfig {
         if let Ok(v) = std::env::var("KANNAKA_LLM_BASE_URL") { self.llm.base_url = v; }
         if let Ok(v) = std::env::var("KANNAKA_NATS_URL") { self.swarm.nats_url = v; }
         if let Ok(v) = std::env::var(crate::remember_events::RememberLevel::ENV) { self.events.remember = v; }
+        if let Ok(v) = std::env::var(crate::forget_events::ForgetLevel::ENV) { self.events.forget = v; }
         if let Ok(v) = std::env::var("OLLAMA_URL") { self.llm.base_url = v; }
         // Constellation + GhostSignals endpoint overrides (#98). The
         // config module advertises env-var precedence for these and
