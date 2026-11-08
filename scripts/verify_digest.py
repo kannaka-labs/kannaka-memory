@@ -41,6 +41,11 @@ def commit(count, root):
     return h(COUNT, count.to_bytes(8, "little"), root)
 
 
+def canon(i):
+    """Canonical lowercase hyphenated form, so case/format never fakes a gap."""
+    return str(uuid.UUID(i))
+
+
 def ids_root(ids):
     ids = sorted({uuid.UUID(i).bytes for i in ids})
     return commit(len(ids), tree([h(ID_LEAF, i) for i in ids])).hex()
@@ -69,8 +74,13 @@ def main(argv):
         return 0 if ok else 1
     if cmd == "reconcile":
         d1, d2 = json.load(open(argv[2], encoding="utf-8")), json.load(open(argv[3], encoding="utf-8"))
-        for d in (d1, d2):
-            assert ids_root(d["ids"]) == d["ids_root"], "published ids do not match ids_root"
+        for name, d in (("D1", d1), ("D2", d2)):
+            if ids_root(d["ids"]) != d["ids_root"]:
+                print(f"{name}: published ids do not match ids_root")
+                return 1
+        if d1.get("agent_id") != d2.get("agent_id"):
+            print("D1 and D2 are for different agents")
+            return 2
         added, removed = set(), set()
         for line in open(argv[4], encoding="utf-8"):
             if not line.strip():
@@ -79,10 +89,15 @@ def main(argv):
             p = ev.get("payload") or ev.get("data") or {}
             if d2.get("agent_id") and p.get("agent_id") != d2["agent_id"]:
                 continue
+            # The lane also carries .recall events (memory_ids, plural);
+            # only remember/forget move the set.
             kind = ev["subject"].rsplit(".", 1)[-1]
-            (added if kind == "remember" else removed if kind == "forget" else set()).add(p["memory_id"])
-        expected = (set(d1["ids"]) | added) - removed
-        actual = set(d2["ids"])
+            if kind == "remember":
+                added.add(canon(p["memory_id"]))
+            elif kind == "forget":
+                removed.add(canon(p["memory_id"]))
+        expected = ({canon(i) for i in d1["ids"]} | added) - removed
+        actual = {canon(i) for i in d2["ids"]}
         unlogged_new = sorted(actual - expected)
         unlogged_gone = sorted(expected - actual)
         print(json.dumps({"balanced": not unlogged_new and not unlogged_gone,
