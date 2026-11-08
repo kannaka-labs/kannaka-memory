@@ -176,8 +176,15 @@ agents contribute over time.
 > the delete stands and its event is lost. The CLI prints a line saying how
 > many events were and were not published, so the loss is not silent, but
 > the event log alone is not a complete replay record of deletes. Events are
-> unsigned, so anyone who can publish on the memory lane can forge one. The
-> stream keeps them 90 days. A durable outbox and a signature are follow-ups.
+> unsigned, so anyone who can publish on the memory lane can forge one.
+> The write lock that `forget`, `prune-prefix`, `triage --apply` and chat
+> `/forget` take only refuses while another process already holds it; it
+> does not stop a writer that starts mid-forget. `swarm join` takes its lock
+> after it has loaded the store, `acquire_write_lock_blocking(60)` proceeds
+> unlocked after 60 s, and plain `remember`/`hear` take no lock at all, so
+> such a writer's next save can bring a deleted row back after its event
+> went out. Operational rule: stop the writer, forget, start the writer. The
+> stream keeps forget events 90 days. A durable outbox and a signature are follow-ups.
 
 **substrate.absorb** (already defined in ADR-0027 — moves to events
 namespace and adds event_id for idempotency):

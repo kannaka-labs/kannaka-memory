@@ -23,7 +23,9 @@
 //! outside `total`.
 //!
 //! [`from_data_dir`] opens the store READ-ONLY and builds no memory system, so
-//! it writes nothing: no `.hrm` save, no status cache, no encoder stamp.
+//! it writes nothing: no `.hrm` save, no status cache, no encoder stamp, no
+//! NATS. (`HrmStore::load` does sweep `.kannaka-tmp-*` litter older than an
+//! hour, as every open of the store does.)
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -69,7 +71,9 @@ pub struct AttributionStats {
 const NOTE: &str = "The store does not save which agent or person wrote a row \
 (origin_agent is not persisted; every row loaded from disk reads \"local\"). \
 These buckets count only what each row itself records: a provenance prefix, \
-or the dream flag.";
+or the dream flag. Rows made through the hallucinate() API set the dream flag \
+only after insert, so it is not saved and they count as unattributed: dream_made \
+is an undercount.";
 
 /// Which bucket a memory falls in. `None` for facets/bookkeeping is decided by
 /// the caller; this only reads content and the dream flag.

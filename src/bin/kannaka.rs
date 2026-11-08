@@ -2281,8 +2281,8 @@ fn main() {
 
     // #1158: `stats --attribution` counts what each row records about its
     // origin. It opens the store READ-ONLY and builds no memory system, so it
-    // writes nothing (no save, no status cache, no encoder stamp) and runs no
-    // O(n^2) assess. Dispatched here, before the load below.
+    // writes nothing (no save, no status cache, no encoder stamp; the load
+    // only sweeps hour-old `.kannaka-tmp-*` litter) and runs no O(n^2) assess. Dispatched here, before the load below.
     if args[command_start] == "stats" && args[command_start + 1..].iter().any(|a| a == "--attribution") {
         let json = args[command_start + 1..].iter().any(|a| a == "--json");
         let hrm_path = hrm_path_for(&dir, &cfg);

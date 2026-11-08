@@ -38,7 +38,9 @@ if [ "$hrm_mb" -ge "$SIZE_MB" ]; then
   sudo systemctl stop kannaka-radio kannaka-memory
   sleep 1
   cp "$HRM" "${HRM}.pre-prune-$(date +%s)"
-  "$KANNAKA" prune-prefix "audio:heard" "audio:/tmp/" "audio:/var/tmp/" 2>&1 | tail -1
+  # Log the "forgotten=N not_found=M" count and the forget-event summary
+  # (since #1157 the summary is the last line, so `tail -1` dropped the count).
+  "$KANNAKA" prune-prefix "audio:heard" "audio:/tmp/" "audio:/var/tmp/" 2>&1 | grep '^\[prune-prefix\]'
   sudo systemctl start kannaka-memory kannaka-radio
   echo "[hrm-guard $TS] pruned — hrm now $(du -m "$HRM" | cut -f1) MB"
   ls -1t "${HRM}".pre-prune-* 2>/dev/null | tail -n +3 | xargs -r rm -f

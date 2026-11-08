@@ -220,7 +220,7 @@ impl NatsRememberSink {
             }
             Err(e) => {
                 eprintln!(
-                    "[events] NATS unavailable at {}: {e}; remember events skipped",
+                    "[events] NATS unavailable at {}: {e}; memory events skipped",
                     self.url
                 );
                 self.last_failed = Some(std::time::Instant::now());
