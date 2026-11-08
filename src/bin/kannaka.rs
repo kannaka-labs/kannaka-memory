@@ -823,6 +823,166 @@ pub(crate) fn warn_if_hash_adopted(sys: &KannakaMemorySystem) {
     }
 }
 
+/// The `.hrm` file a command operates on: `cfg.hrm.path` verbatim when it
+/// names a file (relative paths resolve against `data_dir`), else
+/// `data_dir/kannaka.hrm`.
+fn hrm_path_for(data_dir: &Path, cfg: &KannakaConfig) -> PathBuf {
+    if !cfg.hrm.path.is_empty() {
+        let p = PathBuf::from(&cfg.hrm.path);
+        if p.file_name().is_some() {
+            if p.is_absolute() {
+                p
+            } else {
+                data_dir.join(p)
+            }
+        } else {
+            // Bare directory or empty filename — fall back to default.
+            data_dir.join("kannaka.hrm")
+        }
+    } else {
+        data_dir.join("kannaka.hrm")
+    }
+}
+
+const DIGEST_USAGE: &str = "Usage: kannaka digest [--json] [--ids] [--leaves] [--hrm PATH]";
+
+/// #1156 `kannaka digest`: a read-only commitment to the memory set.
+///
+/// Reads the `.hrm` with `ChiralMedium::load` only — never `HrmStore`, so no
+/// temp-litter sweep, sidecar load, encoder stamp, `Drop` autosave or NATS.
+/// A missing store is exit 2 and creates nothing. Returns the exit code.
+fn handle_digest(cfg: &KannakaConfig, args: &[String]) -> i32 {
+    use kannaka_memory::digest;
+    let mut json = false;
+    let mut ids = false;
+    let mut leaves = false;
+    let mut hrm: Option<PathBuf> = None;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--ids" => ids = true,
+            "--leaves" => leaves = true,
+            "--hrm" => match it.next() {
+                Some(p) => hrm = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("{DIGEST_USAGE}");
+                    return 2;
+                }
+            },
+            other => {
+                eprintln!("digest: unknown argument {other}
+{DIGEST_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let path = hrm.unwrap_or_else(|| hrm_path_for(&store_dir(cfg), cfg));
+    if !path.is_file() {
+        eprintln!("digest: no store at {} (nothing read, nothing created)", path.display());
+        return 2;
+    }
+    let (d, excluded, source) = match digest::digest_hrm_file(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("digest: {e}");
+            return 1;
+        }
+    };
+    let remember_level = match kannaka_memory::remember_events::RememberLevel::parse(&cfg.events.remember) {
+        Ok(Some(l)) => l.as_str().to_string(),
+        Ok(None) => "default".to_string(),
+        Err(_) => "default".to_string(),
+    };
+    let ctx = digest::LogContext { agent_id: cfg.agent.id.clone(), remember_level };
+    let label = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "kannaka.hrm".to_string());
+    let report =
+        digest::report_json(&d, &excluded, &source, &ctx, &label, chrono::Utc::now(), ids, leaves);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+    } else {
+        println!("{} ({})", digest::SCHEMA, label);
+        println!("  memories:     {}", d.count);
+        println!("  ids_root:     {}", report["ids_root"].as_str().unwrap_or(""));
+        println!("  merkle_root:  {}", report["merkle_root"].as_str().unwrap_or(""));
+        println!("  set_hash:     {}", report["set_hash"].as_str().unwrap_or(""));
+        println!(
+            "  excluded:     {} facet(s), {} bookkeeping row(s)",
+            excluded.facets, excluded.bookkeeping
+        );
+        println!("  read:         {} bytes, saved {}", source.hrm_size, source.hrm_mtime);
+        if !(ctx.remember_events_on() && digest::FORGET_EVENTS_EMITTED) {
+            println!(
+                "  log:          not expected to balance yet (remember events {}, forget events {})",
+                if ctx.remember_events_on() { "on" } else { "off" },
+                if digest::FORGET_EVENTS_EMITTED { "on" } else { "not emitted by this build" }
+            );
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod digest_cli_tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        std::iter::once("digest").chain(extra.iter().copied()).map(String::from).collect()
+    }
+
+    fn files(dir: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                    e.metadata().unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    #[test]
+    fn missing_store_exits_2_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hrm = dir.path().join("kannaka.hrm");
+        let cfg = KannakaConfig::default();
+        let code = handle_digest(&cfg, &args(&["--json", "--hrm", hrm.to_str().unwrap()]));
+        assert_eq!(code, 2);
+        assert!(files(dir.path()).is_empty(), "digest created a file");
+    }
+
+    #[test]
+    fn digest_of_a_real_store_leaves_every_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let hrm = dir.path().join("kannaka.hrm");
+        {
+            let pipeline = EncodingPipeline::new(
+                Box::new(SimpleHashEncoder::new(384, 42)),
+                Codebook::new(384, kannaka_memory::WAVEFRONT_DIM, 42),
+            );
+            let v = pipeline.encode_text("a memory to commit to").unwrap();
+            let mut store = HrmStore::new(pipeline, hrm.clone());
+            store.insert(kannaka_memory::memory::HyperMemory::new(v, "a memory to commit to".into())).unwrap();
+            store.flush().unwrap();
+        }
+        let before = files(dir.path());
+        let cfg = KannakaConfig::default();
+        let p = hrm.to_str().unwrap();
+        assert_eq!(handle_digest(&cfg, &args(&["--json", "--ids", "--hrm", p])), 0);
+        assert_eq!(handle_digest(&cfg, &args(&["--hrm", p])), 0);
+        assert_eq!(files(dir.path()), before, "digest wrote to the data dir");
+        assert_eq!(handle_digest(&cfg, &args(&["--bogus"])), 2);
+    }
+}
+
 fn init_with_hrm(
     data_dir: PathBuf,
     quiet: bool,
@@ -849,21 +1009,7 @@ fn init_with_hrm(
     // `~/.kannaka/nested/custom-store.hrm` collapsed to the default
     // `kannaka.hrm` because the parent-match guard from #81 only let
     // through paths whose parent literally equaled `data_dir`.
-    let hrm_path = if !cfg.hrm.path.is_empty() {
-        let p = PathBuf::from(&cfg.hrm.path);
-        if p.file_name().is_some() {
-            if p.is_absolute() {
-                p
-            } else {
-                data_dir.join(p)
-            }
-        } else {
-            // Bare directory or empty filename — fall back to default.
-            data_dir.join("kannaka.hrm")
-        }
-    } else {
-        data_dir.join("kannaka.hrm")
-    };
+    let hrm_path = hrm_path_for(&data_dir, cfg);
 
     // Try to load existing HRM file, create new if not found
     let store = if hrm_path.exists() {
@@ -1359,6 +1505,7 @@ fn is_builtin_subcommand(verb: &str) -> bool {
         | "research" | "dispatch" | "research-suggest"
         // consolidation + introspection
         | "dream" | "belief" | "observe" | "status" | "assess" | "stats" | "clusters"
+        | "digest"
         | "kannaktopus"
         | "neighbors" | "cmf" | "invariant" | "topology" | "bias"
         // perception
@@ -1936,6 +2083,16 @@ fn main() {
             }
             _ => {}
         }
+    }
+
+    // #1156 `kannaka digest` is read-only end to end. KANNAKA_READONLY before
+    // the config load, so a node with no persisted agent id does not get one
+    // written; the handler never opens an HrmStore (no temp sweep, no
+    // sidecars, no encoder stamp, no Drop autosave) and never touches NATS.
+    if args[command_start] == "digest" {
+        std::env::set_var("KANNAKA_READONLY", "1");
+        let cfg = KannakaConfig::load();
+        process::exit(handle_digest(&cfg, &args[command_start..]));
     }
 
     // Load config once: env vars > config.toml > built-in defaults.

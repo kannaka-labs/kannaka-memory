@@ -306,6 +306,19 @@ For belief/spiral order + winding without the (slower) eigendecomp, use `kannaka
         ))
         .subcommand(passthrough("assess", "Full consciousness level assessment (Phi/Xi/order)"))
         .subcommand(passthrough("stats", "Memory + cluster statistics"))
+        .subcommand(passthrough_doc(
+            "digest",
+            "Read-only commitment to the memory set (count + roots), for balancing against memory events",
+            r#"Print a deterministic commitment to the memories in the store: count, ids_root, merkle_root, set_hash (schema kannaka-digest/v1, docs/digest-v1.md). Read-only: the store file is read, never opened for writing; no NATS.
+
+FLAGS:
+  --json       machine-readable output
+  --ids        include the sorted memory id list (safe to publish: ids reveal no content)
+  --leaves     include (id, content_sha256) per memory - LOCAL USE ONLY, do not publish
+  --hrm PATH   digest this .hrm file instead of the configured store
+
+Between two digests, ids that appeared need a remember event and ids that disappeared need a forget event; scripts/verify_digest.py reconcile checks that."#,
+        ))
         .subcommand(passthrough("clusters", "List clusters (optionally drill into one with --with-members)"))
         .subcommand(passthrough("kannaktopus", "Kannaktopus — resident octopus: arms grip cluster exemplars; aggregate memory + characteristics (observe|step, --json, --members)"))
         .subcommand(passthrough("neighbors", "Find nearest-neighbor memories for a query"))
