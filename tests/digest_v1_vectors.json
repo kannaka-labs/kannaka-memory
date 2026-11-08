@@ -1,0 +1,77 @@
+{
+  "schema": "kannaka-digest/v1",
+  "note": "Golden vectors for docs/digest-v1.md. Checked by src/digest.rs tests and scripts/verify_digest.py.",
+  "vectors": [
+    {
+      "name": "empty",
+      "memories": [],
+      "count": 0,
+      "set_hash": "ba878b036527d6586bd0ac0ce11140e1ac0859b1e4accf2252e8930780a18221",
+      "merkle_root": "c6c0aa07f27493d2f2e5cff56c890a353a20086d6c25ec825128e12ae752b2d9",
+      "ids_root": "c6c0aa07f27493d2f2e5cff56c890a353a20086d6c25ec825128e12ae752b2d9"
+    },
+    {
+      "name": "one",
+      "memories": [
+        {
+          "id": "6f1c2b4e-8d3a-4f5b-9c7e-0a1b2c3d4e5f",
+          "content": "the heron stands in the shallows"
+        }
+      ],
+      "count": 1,
+      "set_hash": "9b32179469902a378375c5be891ccffaa26d818c316ad03dd1177a6e1f681952",
+      "merkle_root": "02c93225e4ef10089f42309ef68ac51a17cc1bac2f0e51ed4a671d2c40e3e846",
+      "ids_root": "3d336234560339296eb1b37fd826b5ac51c0f242b424b35206f17cd1d644635f"
+    },
+    {
+      "name": "three",
+      "memories": [
+        {
+          "id": "6f1c2b4e-8d3a-4f5b-9c7e-0a1b2c3d4e5f",
+          "content": "the heron stands in the shallows"
+        },
+        {
+          "id": "0b9e7d6c-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
+          "content": "Nick said the radio is hers to run"
+        },
+        {
+          "id": "f0e1d2c3-b4a5-4968-8776-655443322110",
+          "content": "ünïcödé — and a second line\nwith a newline"
+        }
+      ],
+      "count": 3,
+      "set_hash": "80b6e0a58c73f68951e87f556c3c44e0005815c9475f0d0bb4b0e4aa7a84b9b3",
+      "merkle_root": "4a4623b862e9dea2b01395b4b8223a94513552759fa791c2571c35d240979b3c",
+      "ids_root": "481209d4d32a3252e3cfdf0fca53b481402e82710e543112c52618a47f5456a1"
+    },
+    {
+      "name": "five",
+      "memories": [
+        {
+          "id": "6f1c2b4e-8d3a-4f5b-9c7e-0a1b2c3d4e5f",
+          "content": "the heron stands in the shallows"
+        },
+        {
+          "id": "0b9e7d6c-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
+          "content": "Nick said the radio is hers to run"
+        },
+        {
+          "id": "f0e1d2c3-b4a5-4968-8776-655443322110",
+          "content": "ünïcödé — and a second line\nwith a newline"
+        },
+        {
+          "id": "12345678-9abc-4def-8123-456789abcdef",
+          "content": "five"
+        },
+        {
+          "id": "a1a2a3a4-b1b2-4c1c-9d1d-e1e2e3e4e5e6",
+          "content": ""
+        }
+      ],
+      "count": 5,
+      "set_hash": "bbadb06f99b4db4215d7f30d8058ff1480d8e25ed4b7b97b1b3f1cd2dd1e59ce",
+      "merkle_root": "7f2fe33414179c2e918220bc203b132d1ddf9d75c1f34f24ecb3472d40747525",
+      "ids_root": "0e0fef900e9409732653a78781d32704d74679b8933630efd914ba35ef63646c"
+    }
+  ]
+}

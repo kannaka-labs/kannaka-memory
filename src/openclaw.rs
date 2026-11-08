@@ -731,13 +731,15 @@ impl KannakaMemorySystem {
             let mut events = Vec::with_capacity(pending.len());
             for (id, via) in pending {
                 let level = RememberLevel::resolve(self.remember_level, via);
-                if level == RememberLevel::Off || facets.contains(&id) {
+                if level == RememberLevel::Off {
                     continue;
                 }
                 let Ok(Some(mem)) = self.engine.store.get(&id) else { continue };
-                // Consolidation's layer-summary rows are bookkeeping, not
-                // memories; the dream stages skip them by the same prefix.
-                if mem.content.starts_with("__consolidation") {
+                // Facets and consolidation's layer-summary rows are not
+                // memories the log answers for. One predicate shared with
+                // `kannaka digest` (#1156), so the digest counts exactly the
+                // rows this can ever announce.
+                if !crate::digest::is_committed_memory(&mem.content, facets.contains(&id)) {
                     continue;
                 }
                 let modality = mem.modality.to_string();
@@ -5567,6 +5569,41 @@ mod tests {
                 second_took < std::time::Duration::from_secs(10),
                 "second write took {second_took:?}: the retry window did not stop a dial"
             );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1156: the digest commits to exactly the rows the remember
+        /// publisher can announce. Facets and `__consolidation*` rows sit in
+        /// the store but never get an event, so the digest must leave them
+        /// out too or it can never balance against the log.
+        #[test]
+        fn digest_counts_exactly_the_announced_rows() {
+            let _on = crate::facet::decompose_for_test(true);
+            let (mut sys, dir, cap) = system("re_digest_b1");
+            const COMPOUND: &str = "The harbor beacon channel moved to twentyseven last spring.                 The lighthouse keeper still logs every crossing by hand.                 Gulls avoid the eastern pier when the foghorn is running.";
+            assert!(crate::facet::decompose(COMPOUND).len() >= 2, "fixture no longer decomposes");
+            sys.remember(COMPOUND).unwrap();
+            sys.remember("hello harbor").unwrap();
+            let summary = crate::memory::HyperMemory::new(
+                sys.engine.store.all_memories().unwrap()[0].vector.clone(),
+                "__consolidation_summary_L1 harbor".into(),
+            );
+            sys.engine.store.insert(summary).unwrap();
+            sys.save().unwrap();
+            assert!(
+                !sys.engine.store.facet_row_ids().is_empty(),
+                "fixture minted no facets"
+            );
+
+            let (d, ex, _) = crate::digest::digest_hrm_file(&dir.join("kannaka.hrm")).unwrap();
+            let announced: std::collections::BTreeSet<Uuid> = events(&cap)
+                .iter()
+                .map(|p| p["memory_id"].as_str().unwrap().parse().unwrap())
+                .collect();
+            let committed: std::collections::BTreeSet<Uuid> = d.ids().into_iter().collect();
+            assert_eq!(committed, announced, "digest set != announced set (excluded {ex:?})");
+            assert_eq!(d.count, 2);
+            assert!(ex.facets >= 2 && ex.bookkeeping == 1, "{ex:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
