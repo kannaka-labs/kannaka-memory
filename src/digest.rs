@@ -58,11 +58,11 @@ use crate::medium::WavefrontMeta;
 pub const SCHEMA: &str = "kannaka-digest/v1";
 
 /// Whether this build publishes a `forget` event for every row a delete
-/// removes. Until it does, every delete (CLI forget, dream prune, dedupe,
-/// rollback) shows up as an unexplained shortfall between two digests, and
-/// the digest output says the log is not expected to balance. The forget
-/// lane flips this when deletes emit `MemoryForget`.
-pub const FORGET_EVENTS_EMITTED: bool = false;
+/// removes. #1157/#1161 made every delete (CLI forget, prune-prefix, triage,
+/// chat `/forget`, dream prune, dedupe fold) publish `MemoryForget`, so this
+/// is `true`. Whether a given store's log can balance also depends on its
+/// configuration (`[events] forget`, agent id): see [`LogContext`].
+pub const FORGET_EVENTS_EMITTED: bool = true;
 
 const TAG_LEAF: u8 = 0x00;
 const TAG_NODE: u8 = 0x01;
@@ -281,12 +281,25 @@ pub struct LogContext {
     pub agent_id: String,
     /// Configured `[events] remember` level, or `"default"` (per-origin).
     pub remember_level: String,
+    /// Configured `[events] forget` level (`"ids"` or `"off"`).
+    pub forget_level: String,
 }
 
 impl LogContext {
     /// Remember events are published at all for this configuration.
     pub fn remember_events_on(&self) -> bool {
         !self.agent_id.is_empty() && self.remember_level != "off"
+    }
+
+    /// Forget events are published at all by this build and configuration.
+    pub fn forget_events_on(&self) -> bool {
+        FORGET_EVENTS_EMITTED && !self.agent_id.is_empty() && self.forget_level != "off"
+    }
+
+    /// Both lanes are on, so two digests and the events between them should
+    /// reconcile (best-effort: a lost publish still shows up as a gap).
+    pub fn expected_to_balance(&self) -> bool {
+        self.remember_events_on() && self.forget_events_on()
     }
 }
 
@@ -323,8 +336,9 @@ pub fn report_json(
             "remember_level": ctx.remember_level,
             "agent_id_set": !ctx.agent_id.is_empty(),
             "remember_events": ctx.remember_events_on(),
-            "forget_events": FORGET_EVENTS_EMITTED,
-            "expected_to_balance": ctx.remember_events_on() && FORGET_EVENTS_EMITTED,
+            "forget_level": ctx.forget_level,
+            "forget_events": ctx.forget_events_on(),
+            "expected_to_balance": ctx.expected_to_balance(),
         },
     });
     if include_ids {
@@ -484,14 +498,18 @@ mod tests {
     }
 
     #[test]
-    fn report_has_no_paths_and_says_the_log_cannot_balance_yet() {
+    fn report_has_no_paths_and_says_whether_the_log_can_balance() {
         let d = MemoryDigest::from_contents(three());
         let src = SourceInfo {
             hrm_size: 1,
             hrm_mtime: "2026-11-08T00:00:00.000Z".into(),
             hrm_content_id: "00".into(),
         };
-        let ctx = LogContext { agent_id: "kannaka".into(), remember_level: "default".into() };
+        let ctx = LogContext {
+            agent_id: "kannaka".into(),
+            remember_level: "default".into(),
+            forget_level: "ids".into(),
+        };
         let now = chrono::Utc::now();
         let j = report_json(&d, &Excluded::default(), &src, &ctx, "kannaka.hrm", now, true, false);
         assert_eq!(j["schema"], SCHEMA);
@@ -499,12 +517,21 @@ mod tests {
         assert_eq!(j["ids"].as_array().unwrap().len(), 3);
         assert!(j.get("leaves_private").is_none());
         assert_eq!(j["log"]["remember_events"], true);
-        assert_eq!(j["log"]["expected_to_balance"], FORGET_EVENTS_EMITTED);
+        assert_eq!(j["log"]["forget_events"], true);
+        assert_eq!(j["log"]["forget_level"], "ids");
+        assert_eq!(j["log"]["expected_to_balance"], true);
         let s = j.to_string();
         assert!(!s.contains("/home/") && !s.contains(":\\\\"), "no paths: {s}");
-        let off = LogContext { agent_id: String::new(), remember_level: "default".into() };
+        let forget_off = LogContext { forget_level: "off".into(), ..ctx.clone() };
+        let j = report_json(&d, &Excluded::default(), &src, &forget_off, "kannaka.hrm", now, false, false);
+        assert_eq!(j["log"]["remember_events"], true);
+        assert_eq!(j["log"]["forget_events"], false);
+        assert_eq!(j["log"]["expected_to_balance"], false);
+        let off = LogContext { agent_id: String::new(), ..ctx };
         let j = report_json(&d, &Excluded::default(), &src, &off, "kannaka.hrm", now, false, true);
         assert_eq!(j["log"]["remember_events"], false);
+        assert_eq!(j["log"]["forget_events"], false);
+        assert_eq!(j["log"]["expected_to_balance"], false);
         assert!(j.get("ids").is_none());
         assert_eq!(j["leaves_private"].as_array().unwrap().len(), 3);
     }

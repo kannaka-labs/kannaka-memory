@@ -912,7 +912,11 @@ fn handle_digest(cfg: &KannakaConfig, args: &[String]) -> i32 {
         Ok(None) => "default".to_string(),
         Err(_) => "default".to_string(),
     };
-    let ctx = digest::LogContext { agent_id: cfg.agent.id.clone(), remember_level };
+    let forget_level = kannaka_memory::forget_events::ForgetLevel::parse(&cfg.events.forget)
+        .unwrap_or(kannaka_memory::forget_events::ForgetLevel::Ids)
+        .as_str()
+        .to_string();
+    let ctx = digest::LogContext { agent_id: cfg.agent.id.clone(), remember_level, forget_level };
     let label = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -932,11 +936,11 @@ fn handle_digest(cfg: &KannakaConfig, args: &[String]) -> i32 {
             excluded.facets, excluded.bookkeeping
         );
         println!("  read:         {} bytes, saved {}", source.hrm_size, source.hrm_mtime);
-        if !(ctx.remember_events_on() && digest::FORGET_EVENTS_EMITTED) {
+        if !ctx.expected_to_balance() {
             println!(
-                "  log:          not expected to balance yet (remember events {}, forget events {})",
+                "  log:          not expected to balance (remember events {}, forget events {})",
                 if ctx.remember_events_on() { "on" } else { "off" },
-                if digest::FORGET_EVENTS_EMITTED { "on" } else { "not emitted by this build" }
+                if ctx.forget_events_on() { "on" } else { "off" }
             );
         }
     }

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### `kannaka digest` reports forget events as on (follow-up to #1161)
+
+`digest::FORGET_EVENTS_EMITTED` is now `true`, so `kannaka digest` no longer prints "forget events not emitted by this build" and `log.expected_to_balance` is `true` when both lanes are on. `log.forget_events` now also honours `[events] forget` (env `KANNAKA_EVENTS_FORGET`) and the agent id, and the JSON gains `log.forget_level`. The digest itself (`count`, the roots, `set_hash`) is unchanged. Test: `report_has_no_paths_and_says_whether_the_log_can_balance`.
+
 ## [0.16.19] — 2026-11-08
 
 What lands for the people who read Kannaka's memory from outside: a digest anyone can recompute (#1159), a forget event for every delete (#1161) and an attribution count that says only what rows record (#1161), plus the review follow-ups (#1163) and npm Trusted Publishing (#1154). All three are best-effort or read-only, as the sections below say. Nothing here changes recall, dream scoring or the store format.
