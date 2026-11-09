@@ -75,8 +75,9 @@ implementation.
     "remember_level": "default",
     "agent_id_set": true,
     "remember_events": true,
-    "forget_events": false,
-    "expected_to_balance": false
+    "forget_level": "ids",
+    "forget_events": true,
+    "expected_to_balance": true
   },
   "ids": ["…sorted…"]
 }
@@ -86,9 +87,13 @@ implementation.
   state that was read: its size, mtime and #984 content id. Saves replace the
   file atomically, and the digest retries if the file changed while it was
   being read.
-- `log` says whether the event stream should account for everything. It is
-  `false` when remember events are off (`[events] remember = "off"`, or no
-  agent id) or when this build does not emit forget events.
+- `log` says whether the event stream should account for everything.
+  `expected_to_balance` is `false` when remember events are off
+  (`[events] remember = "off"`, or no agent id) or forget events are off
+  (`[events] forget = "off"` / `KANNAKA_EVENTS_FORGET=off`, or no agent id).
+  0.16.19 always reported `forget_events: false` because
+  `digest::FORGET_EVENTS_EMITTED` was not flipped when #1161 shipped, although
+  0.16.19 does publish forget events.
 - The output contains no paths, host names or user names.
 
 ## Balancing two digests against the log
@@ -116,11 +121,10 @@ calling them missing.
 
 ### Things that make it not balance (expected today)
 
-- **Deletes publish nothing yet.** Until the forget lane lands
-  (`digest::FORGET_EVENTS_EMITTED` = true), every CLI forget, dream prune,
-  dedupe fold and hallucination rollback shows up as
-  `missing_from_d2_without_forget`. That shortfall measures what the log
-  misses today.
+- **Deletes by a build older than 0.16.19 publish nothing.** Since #1161
+  (0.16.19) every CLI forget, prune-prefix, triage, dream prune and dedupe
+  fold publishes a forget event. An older binary writing the same store, or
+  `[events] forget = "off"`, shows up as `missing_from_d2_without_forget`.
 - `[events] remember = "off"`, or no agent id configured.
 - `kannaka remember --batch` forces the remember level to off.
 - A publish that fails is dropped. Events are best-effort and there is no
