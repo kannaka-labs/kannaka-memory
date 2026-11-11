@@ -346,6 +346,10 @@ pub fn build_consciousness_payload(
 /// deterministic hash fallback). Public so one-shot data tools — e.g. the #107
 /// re-encode migration binary — refresh wavefronts with the SAME pipeline the
 /// running system uses, not a test stand-in.
+///
+/// #1166: the fallback is counted (`encoding::fallback_count`), warned about
+/// on stderr and never cached. `KANNAKA_ENCODER_FALLBACK=off` removes it, so a
+/// failed embed is an error instead of a hash vector among semantic ones.
 pub fn make_pipeline() -> EncodingPipeline {
     let ollama = OllamaEncoder::default_local(); // all-minilm, 384-dim
     let hash_fallback = SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, CODEBOOK_SEED);
@@ -358,7 +362,8 @@ pub fn make_pipeline() -> EncodingPipeline {
 /// A pipeline with **no hash fallback**, for bulk re-encoding.
 ///
 /// [`make_pipeline`] composes `OllamaEncoder` over `SimpleHashEncoder`, so a
-/// failed embed does not fail — it silently returns a pseudo-embedding. That is
+/// failed embed does not fail — it returns a pseudo-embedding (with a stderr
+/// warning since #1166, unless `KANNAKA_ENCODER_FALLBACK=off`). That is
 /// tolerable for a single absorb; it is *corrupting* for a bulk re-encode, where
 /// an embedder that dies partway through would leave some vectors semantic and
 /// the rest hashed, in one store, under one `.encoder` stamp that cannot express

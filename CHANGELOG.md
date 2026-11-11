@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### The encoder's hash fallback is loud, counted and never cached; `KANNAKA_ENCODER_FALLBACK=off` removes it (#1166)
+
+`CompositeEncoder` discarded the primary encoder's error, so under `openclaw::make_pipeline` (Ollama all-minilm over the hash encoder, inside a cache; the pipeline behind `KannakaMemorySystem::init`, which `kannaka-acp` and setup seeding use) a failed or timed-out embed returned a hash pseudo-embedding with no message, the cache pinned it to that text for the life of the process, and a write stored it among semantic vectors, where it is noise at recall. Now each fallback prints an `[encoder] WARNING` naming the primary's error (at fallbacks 1, 2, 4, 8, …; not gated on `KANNAKA_QUIET`), increments `encoding::fallback_count()`, and is not cached, so the next call for that text asks the embedder again. `KANNAKA_ENCODER_FALLBACK=off` (default `warn`) returns the error instead of falling back. The main `kannaka` CLI is unchanged: its pipeline (`build_encoding_pipeline`) never had a fallback. Not done here: marking which encoder wrote each wavefront, and scanning existing stores for hash vectors written by earlier fallbacks. Reported by steellens on The Colony.
+
 ### `kannaka digest` reports forget events as on (follow-up to #1161)
 
 `digest::FORGET_EVENTS_EMITTED` is now `true`, so `kannaka digest` no longer prints "forget events not emitted by this build" and `log.expected_to_balance` is `true` when both lanes are on. `log.forget_events` now also honours `[events] forget` (env `KANNAKA_EVENTS_FORGET`) and the agent id, and the JSON gains `log.forget_level`. The digest itself (`count`, the roots, `set_hash`) is unchanged. Test: `report_has_no_paths_and_says_whether_the_log_can_balance`.

@@ -92,6 +92,12 @@ pub struct EventsConfig {
 /// Env overrides (highest precedence, for eval arms and one-off runs):
 /// `KANNAKA_ENCODER` (hash|ollama), `KANNAKA_ENCODER_URL`,
 /// `KANNAKA_ENCODER_MODEL`, `KANNAKA_ENCODER_DIM`.
+///
+/// `KANNAKA_ENCODER_FALLBACK` (off|warn, default warn) is separate: it governs
+/// only `openclaw::make_pipeline` (Ollama with a hash fallback, used by
+/// `KannakaMemorySystem::init`), not the pipeline this config selects, which
+/// has no fallback. `warn` keeps the fallback, warns on stderr and counts it
+/// (`encoding::fallback_count`); `off` returns the embed error instead (#1166).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderConfig {
     #[serde(default = "default_encoder_kind")]
