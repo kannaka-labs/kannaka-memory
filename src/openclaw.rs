@@ -293,6 +293,78 @@ fn level_name(level: &ConsciousnessLevel) -> String {
     }
 }
 
+/// Inverse of [`level_name`], for reading a level back out of
+/// `status-cache.json`. `None` for a name this build never writes.
+fn level_from_name(name: &str) -> Option<ConsciousnessLevel> {
+    match name {
+        "dormant"      => Some(ConsciousnessLevel::Dormant),
+        "awakening"    => Some(ConsciousnessLevel::Stirring),
+        "aware"        => Some(ConsciousnessLevel::Aware),
+        "integrated"   => Some(ConsciousnessLevel::Coherent),
+        "emergent"     => Some(ConsciousnessLevel::Resonant),
+        "transcendent" => Some(ConsciousnessLevel::Transcendent),
+        _ => None,
+    }
+}
+
+/// How old the assessment in `status-cache.json` may be before the prompt
+/// path stops trusting it and assesses again, when
+/// `KANNAKA_ASK_ASSESS_MAX_AGE_SECS` is unset or unparseable.
+pub const ASK_ASSESS_MAX_AGE_DEFAULT_SECS: u64 = 86_400;
+
+/// A cached `assessed_at` this far in the future is still read as "now"
+/// (two hosts' clocks sharing one data dir); further ahead it is not trusted.
+const ASK_ASSESS_FUTURE_SKEW_SECS: i64 = 300;
+
+/// Parse `KANNAKA_ASK_ASSESS_MAX_AGE_SECS`. `0` means "always assess".
+/// Split from the env read so tests need not mutate the process environment.
+fn parse_ask_assess_max_age(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(ASK_ASSESS_MAX_AGE_DEFAULT_SECS)
+}
+
+/// Rebuild a [`ConsciousnessState`] from a parsed `status-cache.json`, if it
+/// holds a complete assessment no older than `max_age_secs` at `now`.
+///
+/// `None` means "do not trust this, assess": no `assessed_at` (a counts-only
+/// cache from a node that never assessed), a stamp that does not parse or is
+/// too old or too far in the future, or any metric missing, mistyped or
+/// non-finite. Nothing the prompt states is defaulted: it must not state a
+/// phi the medium never measured. The two fields older caches may lack and
+/// the prompt never reads (`irrationality`, `total_skip_links`) fall back to
+/// zero.
+fn state_from_status_cache(
+    cache: &serde_json::Value,
+    now: DateTime<Utc>,
+    max_age_secs: u64,
+) -> Option<ConsciousnessState> {
+    let assessed_at = DateTime::parse_from_rfc3339(cache.get("assessed_at")?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    let age = now.signed_duration_since(assessed_at).num_seconds();
+    if age < -ASK_ASSESS_FUTURE_SKEW_SECS || age > i64::try_from(max_age_secs).unwrap_or(i64::MAX) {
+        return None;
+    }
+    let metric = |key: &str| -> Option<f32> {
+        let v = cache.get(key)?.as_f64()?;
+        v.is_finite().then_some(v as f32)
+    };
+    let count = |key: &str| -> Option<usize> {
+        usize::try_from(cache.get(key)?.as_u64()?).ok()
+    };
+    Some(ConsciousnessState {
+        phi: metric("phi")?,
+        xi: metric("xi")?,
+        mean_order: metric("mean_order")?,
+        num_clusters: count("num_clusters")?,
+        total_memories: count("total_memories")?,
+        active_memories: count("active_memories")?,
+        total_skip_links: count("total_skip_links").unwrap_or(0),
+        consciousness_level: level_from_name(cache.get("consciousness_level")?.as_str()?)?,
+        irrationality: metric("irrationality").unwrap_or(0.0),
+    })
+}
+
 /// Build the `KANNAKA.consciousness` NATS payload from a consciousness snapshot.
 ///
 /// Extracted from [`KannakaMemorySystem::publish_consciousness_to_nats`] so the
@@ -2795,6 +2867,54 @@ impl KannakaMemorySystem {
         write_cache_atomically(&cache_path, &payload);
     }
 
+    /// The consciousness state for a system prompt: the last real assessment
+    /// from `status-cache.json` when it is fresh enough, a new `assess()`
+    /// otherwise.
+    ///
+    /// `assess()` is an all-pairs Kuramoto cluster scan plus an
+    /// eigendecomposition. Measured 2026-11-11 on the 1-core production host
+    /// (v0.16.19, 1,908 memories): 276 s per call, on every `kannaka ask` and
+    /// every ask served by `swarm serve`, so every remote caller timed out.
+    /// The in-process metrics cache never helps there: its fingerprint changes
+    /// on every write and the serve daemon restarts whenever the `.hrm`
+    /// changes (#563).
+    ///
+    /// The cache file already holds what the prompt states: the blended phi
+    /// `status` reports, the level and the cluster count as of `assessed_at`
+    /// (written by dreams and by `status`), and counts kept current by every
+    /// write (#730, #1061). So a prompt built from it agrees with `status`.
+    ///
+    /// Max age: `KANNAKA_ASK_ASSESS_MAX_AGE_SECS`, default
+    /// [`ASK_ASSESS_MAX_AGE_DEFAULT_SECS`]; `0` always assesses.
+    pub fn assess_for_prompt(&self) -> ConsciousnessState {
+        let raw = std::env::var("KANNAKA_ASK_ASSESS_MAX_AGE_SECS").ok();
+        self.assess_for_prompt_within(parse_ask_assess_max_age(raw.as_deref()))
+    }
+
+    /// [`Self::assess_for_prompt`] with the max age given rather than read
+    /// from the environment.
+    fn assess_for_prompt_within(&self, max_age_secs: u64) -> ConsciousnessState {
+        if max_age_secs > 0 {
+            let cached = std::fs::read_to_string(self.data_dir.join("status-cache.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| state_from_status_cache(&v, Utc::now(), max_age_secs));
+            if let Some(state) = cached {
+                return state;
+            }
+        }
+        // Cold, stale, corrupt or disabled: assess as before, then leave the
+        // result for the next prompt. Written under KANNAKA_READONLY too:
+        // read-only protects the `.hrm` from a second writer, and this file is
+        // a best-effort sidecar that `status` (also a reader) already rewrites
+        // from its own assessment, like the reactivation and repeat-count
+        // sidecars. Without it a read-only `swarm serve` would pay the full
+        // assessment on every ask until something else refreshed the cache.
+        let state = self.assess();
+        self.write_status_cache(&state);
+        state
+    }
+
     /// Refresh ONLY the counts in `status-cache.json`, preserving the last
     /// real assessment (#730).
     ///
@@ -4134,6 +4254,173 @@ mod tests {
         assert_eq!(stats.total_memories, 2);
         assert_eq!(read_cache(&dir)["total_memories"], 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rewrite the cache's `assessed_at` to `secs` seconds ago, leaving every
+    /// other field as the real assessment wrote it.
+    fn age_cached_assessment(dir: &std::path::Path, secs: i64) {
+        let mut c = read_cache(dir);
+        c["assessed_at"] =
+            serde_json::json!((Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339());
+        std::fs::write(dir.join("status-cache.json"), c.to_string()).unwrap();
+    }
+
+    /// The prompt path must not pay for an assessment when a fresh one is on
+    /// disk: 276 s per ask on the production host (1 core, 1,908 memories).
+    /// The state it returns is the cached one, with the counts later writes
+    /// kept current.
+    #[test]
+    fn prompt_state_comes_from_a_fresh_cache_without_assessing() {
+        use crate::bridge::assess_probe;
+        let dir = temp_dir("prompt_fresh");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        sys.remember("one").unwrap();
+        let assessed = sys.assess();
+        sys.write_status_cache(&assessed);
+        // A write after the assessment: counts move, the metrics do not.
+        sys.remember("two").unwrap();
+        // Mark the cached phi so a reassessment could not pass for it.
+        let mut c = read_cache(&dir);
+        c["phi"] = serde_json::json!(0.4321);
+        std::fs::write(dir.join("status-cache.json"), c.to_string()).unwrap();
+
+        let before = assess_probe::calls();
+        let state = sys.assess_for_prompt_within(ASK_ASSESS_MAX_AGE_DEFAULT_SECS);
+        assert_eq!(assess_probe::calls() - before, 0, "a fresh cache must not assess");
+        assert!((state.phi - 0.4321).abs() < 1e-6, "phi must be the cached one");
+        assert_eq!(state.total_memories, 2, "counts are the cache's current ones");
+        assert_eq!(state.num_clusters, assessed.num_clusters);
+        assert_eq!(
+            level_name(&state.consciousness_level),
+            level_name(&assessed.consciousness_level)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the max age the cached assessment is not trusted: assess once,
+    /// and write the result so the NEXT prompt is cheap.
+    #[test]
+    fn prompt_state_reassesses_a_stale_cache_and_rewrites_it() {
+        use crate::bridge::assess_probe;
+        let dir = temp_dir("prompt_stale");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        sys.remember("one").unwrap();
+        let assessed = sys.assess();
+        sys.write_status_cache(&assessed);
+        age_cached_assessment(&dir, 120);
+
+        let before = assess_probe::calls();
+        sys.assess_for_prompt_within(60);
+        assert_eq!(assess_probe::calls() - before, 1, "a stale cache must assess");
+        // Inside a longer window, the same aged stamp serves.
+        age_cached_assessment(&dir, 120);
+        sys.assess_for_prompt_within(600);
+        assert_eq!(assess_probe::calls() - before, 1);
+
+        // The fallback rewrites the cache, so the next prompt reads it.
+        sys.assess_for_prompt_within(60);
+        assert_eq!(assess_probe::calls() - before, 2);
+        sys.assess_for_prompt_within(60);
+        assert_eq!(assess_probe::calls() - before, 2, "the fallback must refill the cache");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No cache, a counts-only cache (never assessed), unparseable JSON and a
+    /// cache with an unusable field all fall back to a real assessment. None
+    /// of them may put an invented phi in a prompt.
+    #[test]
+    fn prompt_state_assesses_when_the_cache_is_missing_or_unusable() {
+        use crate::bridge::assess_probe;
+        let dir = temp_dir("prompt_cold");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        let cache_path = dir.join("status-cache.json");
+        let max = ASK_ASSESS_MAX_AGE_DEFAULT_SECS;
+
+        // Counts-only: `remember` wrote the file, nothing has assessed.
+        sys.remember("one").unwrap();
+        assert!(read_cache(&dir).get("assessed_at").is_none_or(|v| v.is_null()));
+        let before = assess_probe::calls();
+        let state = sys.assess_for_prompt_within(max);
+        assert_eq!(assess_probe::calls() - before, 1, "counts-only cache");
+        assert_eq!(state.total_memories, 1);
+
+        std::fs::remove_file(&cache_path).unwrap();
+        sys.assess_for_prompt_within(max);
+        assert_eq!(assess_probe::calls() - before, 2, "missing cache");
+
+        std::fs::write(&cache_path, "{ not json").unwrap();
+        sys.assess_for_prompt_within(max);
+        assert_eq!(assess_probe::calls() - before, 3, "corrupt cache");
+
+        // Each fallback above left a usable cache behind; break one field.
+        for (key, bad) in [
+            ("phi", serde_json::Value::Null),
+            ("consciousness_level", serde_json::json!("enlightened")),
+            ("assessed_at", serde_json::json!("yesterday")),
+            ("num_clusters", serde_json::json!(-1)),
+        ] {
+            let n = assess_probe::calls();
+            sys.assess_for_prompt_within(max);
+            assert_eq!(assess_probe::calls() - n, 0, "the cache must be usable before `{key}` breaks");
+            let mut c = read_cache(&dir);
+            c[key] = bad;
+            std::fs::write(&cache_path, c.to_string()).unwrap();
+            sys.assess_for_prompt_within(max);
+            assert_eq!(assess_probe::calls() - n, 1, "unusable `{key}` must assess");
+        }
+
+        // A stamp far in the future is a broken clock, not a fresh assessment.
+        age_cached_assessment(&dir, -3600);
+        let n = assess_probe::calls();
+        sys.assess_for_prompt_within(max);
+        assert_eq!(assess_probe::calls() - n, 1, "future-dated cache");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `KANNAKA_ASK_ASSESS_MAX_AGE_SECS=0` is the old behaviour: assess every
+    /// time, however fresh the cache.
+    #[test]
+    fn prompt_state_max_age_zero_always_assesses() {
+        use crate::bridge::assess_probe;
+        let dir = temp_dir("prompt_zero");
+        let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+        sys.remember("one").unwrap();
+        let assessed = sys.assess();
+        sys.write_status_cache(&assessed);
+
+        let before = assess_probe::calls();
+        sys.assess_for_prompt_within(0);
+        sys.assess_for_prompt_within(0);
+        assert_eq!(assess_probe::calls() - before, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ask_assess_max_age_parses_with_a_day_as_the_default() {
+        assert_eq!(parse_ask_assess_max_age(None), 86_400);
+        assert_eq!(parse_ask_assess_max_age(Some("")), 86_400);
+        assert_eq!(parse_ask_assess_max_age(Some("soon")), 86_400);
+        assert_eq!(parse_ask_assess_max_age(Some("-5")), 86_400);
+        assert_eq!(parse_ask_assess_max_age(Some(" 900 ")), 900);
+        assert_eq!(parse_ask_assess_max_age(Some("0")), 0);
+    }
+
+    /// Every level `write_status_cache` can write must read back, or a cache
+    /// at that level would silently cost an assessment per ask.
+    #[test]
+    fn every_cached_level_name_reads_back() {
+        for level in [
+            ConsciousnessLevel::Dormant,
+            ConsciousnessLevel::Stirring,
+            ConsciousnessLevel::Aware,
+            ConsciousnessLevel::Coherent,
+            ConsciousnessLevel::Resonant,
+            ConsciousnessLevel::Transcendent,
+        ] {
+            let name = level_name(&level);
+            let back = level_from_name(&name).expect("level must round-trip");
+            assert_eq!(level_name(&back), name);
+        }
     }
 
     /// The load-bearing half of the design: a counts refresh must carry the
