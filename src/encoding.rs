@@ -28,6 +28,15 @@ pub enum EncodingError {
 pub trait TextEncoder: Send + Sync {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EncodingError>;
     fn embedding_dim(&self) -> usize;
+
+    /// `embed`, plus whether the vector is this encoder's real answer for
+    /// `text` and so may be cached. Every encoder says `true` except
+    /// [`CompositeEncoder`] when it had to fall back: that vector stands in for
+    /// a failed call, and [`CachedEncoder`] must not pin it to the text for the
+    /// life of the process (#1166).
+    fn embed_cacheable(&self, text: &str) -> Result<(Vec<f32>, bool), EncodingError> {
+        self.embed(text).map(|v| (v, true))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,44 +292,130 @@ impl<E: TextEncoder> CachedEncoder<E> {
 
 impl<E: TextEncoder> TextEncoder for CachedEncoder<E> {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EncodingError> {
-        let key = text.to_string();
-        let read_guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = read_guard.get(&key) {
-            return Ok(cached.clone());
-        }
-        drop(read_guard);
-        let result = self.inner.embed(text)?;
-        self.cache.write().unwrap_or_else(|e| e.into_inner()).insert(key, result.clone());
-        Ok(result)
+        self.embed_cacheable(text).map(|(v, _)| v)
     }
 
     fn embedding_dim(&self) -> usize {
         self.inner.embedding_dim()
     }
+
+    /// A vector the inner encoder marks as not cacheable (a fallback) is
+    /// returned but not stored, so the next call for the same text asks the
+    /// inner encoder again (#1166).
+    fn embed_cacheable(&self, text: &str) -> Result<(Vec<f32>, bool), EncodingError> {
+        let key = text.to_string();
+        let read_guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = read_guard.get(&key) {
+            return Ok((cached.clone(), true));
+        }
+        drop(read_guard);
+        let (result, cacheable) = self.inner.embed_cacheable(text)?;
+        if cacheable {
+            self.cache.write().unwrap_or_else(|e| e.into_inner()).insert(key, result.clone());
+        }
+        Ok((result, cacheable))
+    }
+}
+
+/// What [`CompositeEncoder`] does when its primary encoder fails.
+/// Env: `KANNAKA_ENCODER_FALLBACK=off|warn` (default `warn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPolicy {
+    /// Return the fallback encoder's vector, warn on stderr and count it.
+    Warn,
+    /// Do not fall back: return the primary's error, so the absorb or recall
+    /// fails instead of storing or querying with a vector from another space.
+    Off,
+}
+
+impl FallbackPolicy {
+    /// `None`, empty and `warn` are `Warn`; `off` is `Off` (case-insensitive).
+    /// Anything else is `Warn` with a note on stderr.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("warn") => FallbackPolicy::Warn,
+            Some("off") => FallbackPolicy::Off,
+            Some(other) => {
+                eprintln!("[encoder] KANNAKA_ENCODER_FALLBACK='{other}' is not off|warn; using warn.");
+                FallbackPolicy::Warn
+            }
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var("KANNAKA_ENCODER_FALLBACK").ok().as_deref())
+    }
+}
+
+/// Fallback vectors returned by every [`CompositeEncoder`] in this process.
+static FALLBACK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times this process returned a fallback vector because a primary
+/// encoder failed. Zero means none in THIS process; it says nothing about
+/// vectors already in a store.
+pub fn fallback_count() -> u64 {
+    FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one fallback and warn. The warning is an error-class line, so like the
+/// other `[encoder]` warnings it is NOT gated on `KANNAKA_QUIET` (which only
+/// silences banners). It prints at fallback 1, 2, 4, 8, … so an outage during a
+/// long run stays visible without one line per embed.
+fn note_fallback(primary_err: &EncodingError) {
+    let n = FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        eprintln!("[encoder] WARNING: primary encoder failed ({primary_err}); using the fallback encoder's vector (fallback #{n} in this process).");
+        eprintln!("[encoder] in a store of semantic embeddings that vector is noise at recall, and nothing in the store marks it.");
+        eprintln!("[encoder] set KANNAKA_ENCODER_FALLBACK=off to fail instead. (This warning repeats at 1, 2, 4, 8, … fallbacks.)");
+    }
 }
 
 /// Fallback chain: tries primary encoder, falls back on error.
+///
+/// The fallback is never silent (#1166): each one is counted
+/// ([`fallback_count`]), warned about on stderr, and marked not cacheable.
+/// With [`FallbackPolicy::Off`] there is no fallback and the primary's error is
+/// returned. `EmptyInput` is returned as is under either policy: the input is
+/// at fault, not the encoder.
 pub struct CompositeEncoder {
     primary: Box<dyn TextEncoder>,
     fallback: Box<dyn TextEncoder>,
+    policy: FallbackPolicy,
 }
 
 impl CompositeEncoder {
+    /// Policy comes from `KANNAKA_ENCODER_FALLBACK`, read once here.
     pub fn new(primary: Box<dyn TextEncoder>, fallback: Box<dyn TextEncoder>) -> Self {
-        Self { primary, fallback }
+        Self { primary, fallback, policy: FallbackPolicy::from_env() }
+    }
+
+    /// Set the policy explicitly, ignoring the environment.
+    pub fn with_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
 impl TextEncoder for CompositeEncoder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EncodingError> {
-        match self.primary.embed(text) {
-            Ok(v) => Ok(v),
-            Err(_) => self.fallback.embed(text),
-        }
+        self.embed_cacheable(text).map(|(v, _)| v)
     }
 
     fn embedding_dim(&self) -> usize {
         self.primary.embedding_dim()
+    }
+
+    fn embed_cacheable(&self, text: &str) -> Result<(Vec<f32>, bool), EncodingError> {
+        let primary_err = match self.primary.embed_cacheable(text) {
+            Ok(result) => return Ok(result),
+            Err(e) => e,
+        };
+        if matches!(primary_err, EncodingError::EmptyInput) || self.policy == FallbackPolicy::Off {
+            return Err(primary_err);
+        }
+        let v = self.fallback.embed(text)?;
+        note_fallback(&primary_err);
+        Ok((v, false))
     }
 }
 
@@ -557,9 +652,97 @@ mod tests {
     fn composite_falls_back_on_primary_error() {
         let primary = FailingEncoder { dim: 64 };
         let fallback = SimpleHashEncoder::new(64, 42);
-        let composite = CompositeEncoder::new(Box::new(primary), Box::new(fallback));
+        let composite = CompositeEncoder::new(Box::new(primary), Box::new(fallback))
+            .with_policy(FallbackPolicy::Warn);
+        let before = fallback_count();
         let v = composite.embed("test").unwrap();
         assert_eq!(v.len(), 64);
+        // The counter is process-wide and tests run in parallel, so `>=`.
+        assert!(fallback_count() >= before + 1, "a fallback must be counted");
+        let (_, cacheable) = composite.embed_cacheable("test").unwrap();
+        assert!(!cacheable, "a fallback vector must be marked not cacheable");
+    }
+
+    /// Fails its first `fail_first` calls, then returns all-ones.
+    struct FlakyEncoder {
+        dim: usize,
+        fail_first: usize,
+        call_count: Arc<AtomicUsize>,
+    }
+    impl TextEncoder for FlakyEncoder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EncodingError> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first {
+                return Err(EncodingError::Other("embedder timed out".to_string()));
+            }
+            Ok(vec![1.0; self.dim])
+        }
+        fn embedding_dim(&self) -> usize { self.dim }
+    }
+
+    /// #1166: the production shape, `CachedEncoder` over `CompositeEncoder`.
+    /// One failed embed must not pin the hash vector to that text.
+    #[test]
+    fn fallback_vector_is_not_cached() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let primary = FlakyEncoder { dim: 64, fail_first: 1, call_count: calls.clone() };
+        let hash = SimpleHashEncoder::new(64, 42).embed("hello").unwrap();
+        let composite = CompositeEncoder::new(Box::new(primary), Box::new(SimpleHashEncoder::new(64, 42)))
+            .with_policy(FallbackPolicy::Warn);
+        let cached = CachedEncoder::new(composite);
+
+        let before = fallback_count();
+        assert_eq!(cached.embed("hello").unwrap(), hash, "first call falls back");
+        assert!(fallback_count() >= before + 1);
+        assert_eq!(cached.embed("hello").unwrap(), vec![1.0; 64], "second call must reach the recovered primary");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cached.embed("hello").unwrap(), vec![1.0; 64]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the primary's vector is cached as before");
+    }
+
+    #[test]
+    fn fallback_off_propagates_primary_error() {
+        let (fallback, fallback_calls) = CountingEncoder::new(64);
+        let composite = CompositeEncoder::new(Box::new(FailingEncoder { dim: 64 }), Box::new(fallback))
+            .with_policy(FallbackPolicy::Off);
+        let cached = CachedEncoder::new(composite);
+        let err = cached.embed("test").unwrap_err();
+        assert!(err.to_string().contains("always fails"), "got: {err}");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0, "off must not call the fallback");
+    }
+
+    #[test]
+    fn composite_primary_success_never_touches_fallback() {
+        for policy in [FallbackPolicy::Warn, FallbackPolicy::Off] {
+            let (primary, primary_calls) = CountingEncoder::new(64);
+            let (fallback, fallback_calls) = CountingEncoder::new(64);
+            let composite = CompositeEncoder::new(Box::new(primary), Box::new(fallback))
+                .with_policy(policy);
+            let (v, cacheable) = composite.embed_cacheable("test").unwrap();
+            assert_eq!(v, vec![1.0; 64]);
+            assert!(cacheable, "a primary vector stays cacheable");
+            assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn composite_empty_input_is_not_a_fallback() {
+        let (fallback, fallback_calls) = CountingEncoder::new(64);
+        let composite = CompositeEncoder::new(Box::new(SimpleHashEncoder::new(64, 1)), Box::new(fallback))
+            .with_policy(FallbackPolicy::Warn);
+        assert!(matches!(composite.embed("   "), Err(EncodingError::EmptyInput)));
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fallback_policy_parse() {
+        assert_eq!(FallbackPolicy::parse(None), FallbackPolicy::Warn);
+        assert_eq!(FallbackPolicy::parse(Some("")), FallbackPolicy::Warn);
+        assert_eq!(FallbackPolicy::parse(Some("warn")), FallbackPolicy::Warn);
+        assert_eq!(FallbackPolicy::parse(Some("off")), FallbackPolicy::Off);
+        assert_eq!(FallbackPolicy::parse(Some(" OFF ")), FallbackPolicy::Off);
+        assert_eq!(FallbackPolicy::parse(Some("strict")), FallbackPolicy::Warn);
     }
 
     #[test]
