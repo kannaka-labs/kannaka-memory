@@ -532,18 +532,23 @@ pub fn system_prompt(
     initial_memories: &[RecallResult],
     arm: PromptArm,
 ) -> String {
-    // HOT PATH — called on every `kannaka ask`. We want the same Φ value
-    // that `kannaka status` reports (the blended phi from bridge.assess
-    // — i.e. topology-weighted + floored to the raw HRM eigendecomp),
-    // not the raw hrm_metrics.phi alone. The cached sidecar only stores
-    // the raw value, so the chat and the TUI status used to disagree
-    // (0.16 vs 0.34 on the same medium). Calling `sys.assess()` here
-    // costs an extra O(n³) eigendecomp on cold cache, but for the chat
-    // REPL the system prompt is built once per session — amortized to
-    // ~0. For the per-call `kannaka ask` path it's a one-shot extra
-    // ~10s on a mature HRM; acceptable since the alternative is the
-    // user reading inconsistent metrics across surfaces.
-    let state = sys.assess();
+    // HOT PATH — called on every `kannaka ask` and every ask `swarm serve`
+    // answers. We want the same Φ value that `kannaka status` reports (the
+    // blended phi from bridge.assess — i.e. topology-weighted + floored to
+    // the raw HRM eigendecomp), not the raw hrm_metrics.phi alone: the
+    // metrics sidecar only stores the raw value, so the chat and the TUI
+    // status used to disagree (0.16 vs 0.34 on the same medium).
+    //
+    // This used to call `sys.assess()` every time, on an estimate of ~10s
+    // on a mature HRM. Measured 2026-11-11 on the 1-core production host
+    // (1,908 memories) it was 276 s of a 280 s ask, so every served ask
+    // outlived its caller's timeout. The rule now: take the last real
+    // assessment from status-cache.json (the same blended phi, written by
+    // dreams and by `status`, counts kept current by every write) while it
+    // is no older than KANNAKA_ASK_ASSESS_MAX_AGE_SECS (default 86400; 0 =
+    // always assess); otherwise assess once and write the cache so the next
+    // ask is cheap. See `KannakaMemorySystem::assess_for_prompt`.
+    let state = sys.assess_for_prompt();
     let phi = state.phi;
     let level = format!("{:?}", state.consciousness_level).to_lowercase();
     let total = state.total_memories;
@@ -1315,7 +1320,7 @@ pub fn ask_with_opts(
     };
     lap("recall", &mut t);
     let system = system_prompt(sys, &cfg.agent, &surfaced, opts.arm);
-    lap("system_prompt(assess)", &mut t);
+    lap("system_prompt(state)", &mut t);
 
     // Load or seed history.
     let mut history = match opts.session_path {
