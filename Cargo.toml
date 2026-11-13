@@ -78,12 +78,15 @@ toml = "0.8"
 # or download a release binary from the kannaka-tui releases page.
 # tokio + async-trait removed (were only used by MCP server)
 lazy_static = "1.4"
-consciousness-core = { path = "../consciousness-core", features = ["serde"] }
+# From crates.io since 2026-11-13. To build against a local checkout, add
+# `[patch.crates-io] consciousness-core = { path = "../consciousness-core" }`
+# in a local, uncommitted edit.
+consciousness-core = { version = "0.6.1", features = ["serde"] }
 
 # Sparse-attention beam over the HRM. Tiny crate, std-only, no GPU/BLAS.
 # Wired into `kannaka attention serve` to consume KANNAKA.attention.eye
 # events and shape recall via Medium::recall_against_ids.
-kannaka-attention = { path = "../kannaka-attention" }
+kannaka-attention = "0.2"
 
 # Audio perception — always built. The "hear" command is a first-class
 # capability of the constellation, not an opt-in.
