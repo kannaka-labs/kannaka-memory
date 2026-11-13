@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### `KANNAKA_ASK_LOG_NOTICE`: a served ask that is logged tells the asker so
+
+`KANNAKA_ASK_LOG` keeps the question, the memories shown to the model and the answer, and until now nothing told the asker. Set `KANNAKA_ASK_LOG_NOTICE=<text>` beside it and `kannaka swarm serve` ends every logged reply with that text on its own paragraph and repeats it in the reply's `notice` field. The log row gains a `notice` field; `answer_text` and `answer_sha256` remain the model's own words. Without `KANNAKA_ASK_LOG` the variable does nothing, a failed ask carries no notice, and `kannaka ask` (the CLI path) is unchanged apart from `notice: null` in its rows. When the log is on with no notice, `swarm serve` says so at startup. With both variables unset the ask path is as before.
+
 ## [0.16.20] — 2026-11-11
 
 Three fixes. A served ask no longer runs a full assess, which took 276 s per ask on the production host and made every `ask` through `swarm serve` time out (#1169). The encoder's hash fallback is no longer silent or cached (#1167). `kannaka digest` reports the forget lane as on (#1165). Nothing here changes recall ranking, dream scoring or the store format. What does change for a reader: the phi, level and cluster count in an ask's prompt can be up to a day old.

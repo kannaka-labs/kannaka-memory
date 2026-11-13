@@ -35,6 +35,16 @@
 //! again, and it never fails the ask. The parent directory is created on the
 //! first append.
 //!
+//! **Telling the asker.** Set [`NOTICE_ENV`] (`KANNAKA_ASK_LOG_NOTICE=<text>`)
+//! beside [`ENV`] and `swarm serve` ends every reply it logs with that text,
+//! on its own paragraph, and repeats it in the reply's `notice` field. The log
+//! keeps other people's questions, so the operator says in one line what is
+//! kept, for how long and who may read it. The notice is not part of the
+//! answer: `answer_text` and `answer_sha256` stay the model's own words and the
+//! row records the notice in `notice`. Without [`ENV`] the notice variable does
+//! nothing, and a failed ask carries no notice. `swarm serve` warns at startup
+//! when the log is on and no notice is set.
+//!
 //! Two asymmetries a reader of the file should know: a row whose `error` is set
 //! by an LLM failure carries `context: []`, because the serve loop gives up
 //! before the recall runs; and `kannaka ask` (the CLI path) logs only asks that
@@ -54,17 +64,50 @@ use crate::remember_events::content_sha256;
 /// Environment variable naming the log file. Unset or empty disables the log.
 pub const ENV: &str = "KANNAKA_ASK_LOG";
 
+/// Environment variable holding the line `swarm serve` appends to every logged
+/// reply so the asker knows the exchange is kept. Unset or blank: no notice.
+pub const NOTICE_ENV: &str = "KANNAKA_ASK_LOG_NOTICE";
+
+/// Read [`NOTICE_ENV`]. `None` when it is unset or blank.
+pub fn notice_from_env() -> Option<String> {
+    notice_from_value(std::env::var(NOTICE_ENV).ok())
+}
+
+/// The rule behind [`notice_from_env`], on an already-read value. The text is
+/// trimmed; a blank value is no notice.
+pub fn notice_from_value(raw: Option<String>) -> Option<String> {
+    let trimmed = raw?.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// The reply text the asker receives: the answer, then the notice on its own
+/// paragraph. With no notice the answer is returned unchanged.
+pub fn with_notice(answer: &str, notice: Option<&str>) -> String {
+    match notice {
+        Some(n) => format!("{}
+
+{}", answer.trim_end(), n),
+        None => answer.to_string(),
+    }
+}
+
 /// Append-only JSONL sink for [`AskLogEntry`] rows.
 pub struct AskLog {
     path: PathBuf,
     warned: AtomicBool,
+    /// The asker notice read with the path ([`NOTICE_ENV`]), if any.
+    notice: Option<String>,
 }
 
 impl AskLog {
     /// Read [`ENV`]. `None` when it is unset or blank, so the caller can hold
     /// an `Option<AskLog>` and pay nothing when the log is off.
     pub fn from_env() -> Option<Self> {
-        Self::from_value(std::env::var(ENV).ok())
+        Self::from_value(std::env::var(ENV).ok()).map(|log| log.notifying(notice_from_env()))
     }
 
     /// The rule behind [`Self::from_env`], on an already-read value.
@@ -81,7 +124,19 @@ impl AskLog {
         Self {
             path,
             warned: AtomicBool::new(false),
+            notice: None,
         }
+    }
+
+    /// The same log, telling askers `notice` on every reply it records.
+    pub fn notifying(mut self, notice: Option<String>) -> Self {
+        self.notice = notice;
+        self
+    }
+
+    /// The line appended to each logged reply, when one is configured.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     /// Where rows go.
@@ -188,6 +243,9 @@ pub struct AskLogEntry {
     pub latency_ms: u64,
     /// Whether the answer reached the caller (`true` for a printed CLI answer).
     pub reply_ok: bool,
+    /// The notice appended to the reply ([`NOTICE_ENV`]). `None` when no notice
+    /// was sent: the variable was unset, the ask failed, or this is the CLI path.
+    pub notice: Option<String>,
 }
 
 /// Map surfaced memories to log rows, in the order the prompt saw them.
@@ -240,6 +298,7 @@ mod tests {
             },
             latency_ms: 42,
             reply_ok: answer.is_some(),
+            notice: None,
         }
     }
 
@@ -254,6 +313,51 @@ mod tests {
             layer: 0,
             times_seen: 1,
         }
+    }
+
+    #[test]
+    fn a_log_carries_its_notice_and_has_none_by_default() {
+        let log = AskLog::at(PathBuf::from("asks.jsonl"));
+        assert!(log.notice().is_none());
+        let log = log.notifying(Some("kept 90 days".to_string()));
+        assert_eq!(log.notice(), Some("kept 90 days"));
+    }
+
+    #[test]
+    fn notice_is_trimmed_and_blank_means_none() {
+        assert!(notice_from_value(None).is_none());
+        assert!(notice_from_value(Some(String::new())).is_none());
+        assert!(notice_from_value(Some("  
+ ".to_string())).is_none());
+        assert_eq!(
+            notice_from_value(Some("  kept 90 days 
+".to_string())).as_deref(),
+            Some("kept 90 days")
+        );
+    }
+
+    #[test]
+    fn with_notice_appends_one_paragraph_and_leaves_a_bare_answer_alone() {
+        assert_eq!(with_notice("an answer
+", None), "an answer
+");
+        assert_eq!(
+            with_notice("an answer
+", Some("kept 90 days")),
+            "an answer
+
+kept 90 days"
+        );
+    }
+
+    #[test]
+    fn notice_is_recorded_beside_the_answer_not_inside_it() {
+        let mut e = entry("ask.kannaka-test", Some("an answer"));
+        e.notice = Some("kept 90 days".to_string());
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["notice"], "kept 90 days");
+        assert_eq!(v["answer_text"], "an answer");
+        assert_eq!(v["answer_sha256"], content_sha256("an answer"));
     }
 
     #[test]
