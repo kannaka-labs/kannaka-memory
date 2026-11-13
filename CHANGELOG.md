@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.16.21] — 2026-11-13
+
+One addition: a served ask that is being logged can tell the asker so (#1171).
+
 ### `KANNAKA_ASK_LOG_NOTICE`: a served ask that is logged tells the asker so
 
 `KANNAKA_ASK_LOG` keeps the question, the memories shown to the model and the answer, and until now nothing told the asker. Set `KANNAKA_ASK_LOG_NOTICE=<text>` beside it and `kannaka swarm serve` ends every logged reply with that text on its own paragraph and repeats it in the reply's `notice` field. The log row gains a `notice` field; `answer_text` and `answer_sha256` remain the model's own words. Without `KANNAKA_ASK_LOG` the variable does nothing, a failed ask carries no notice, and `kannaka ask` (the CLI path) is unchanged apart from `notice: null` in its rows. When the log is on with no notice, `swarm serve` says so at startup. With both variables unset the ask path is as before.
