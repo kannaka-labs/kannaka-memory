@@ -281,6 +281,13 @@ pub(crate) fn handle_swarm_serve(
             log.path().display(),
             kannaka_memory::ask_log::ENV
         );
+        match log.notice() {
+            Some(n) => eprintln!("[swarm serve] ask log notice, appended to every logged reply: {n}"),
+            None => eprintln!(
+                "[swarm serve] ask log: NO asker notice ({} unset); askers are not told their questions are kept",
+                kannaka_memory::ask_log::NOTICE_ENV
+            ),
+        }
     }
     if llm_ok {
         eprintln!(
@@ -1068,12 +1075,23 @@ fn _handle_serve_msg(
     // --agent-id override when given), not unconditionally cfg.agent.id.
     // `mode_used` is additive: an old client ignores it, a new one uses its
     // presence to tell a mode-aware peer from a pre-#746 one.
+    // KANNAKA_ASK_LOG_NOTICE: when this ask is being logged and the operator
+    // set a notice, the asker is told in the reply itself. An old client reads
+    // only `text`, so the line goes there; `notice` repeats it for a client
+    // that wants to show it apart. A failed ask carries none.
+    let notice = ask_log.and_then(|log| log.notice());
     let reply = match &result {
-        Ok(r) => serde_json::json!({
-            "from": serve_agent_id,
-            "text": r.text,
-            "mode_used": mode.mode_used_name(),
-        }),
+        Ok(r) => {
+            let mut reply = serde_json::json!({
+                "from": serve_agent_id,
+                "text": kannaka_memory::ask_log::with_notice(&r.text, notice),
+                "mode_used": mode.mode_used_name(),
+            });
+            if let Some(n) = notice {
+                reply["notice"] = serde_json::Value::String(n.to_string());
+            }
+            reply
+        }
         Err(e) => serde_json::json!({
             "from": serve_agent_id,
             "error": format!("{e}"),
@@ -1166,6 +1184,11 @@ fn _handle_serve_msg(
             error,
             latency_ms,
             reply_ok,
+            notice: if result.is_ok() {
+                notice.map(str::to_string)
+            } else {
+                None
+            },
         });
     }
 }

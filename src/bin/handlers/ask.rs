@@ -510,6 +510,7 @@ fn cli_ask_log_entry(
         error: None,
         latency_ms: latency.as_millis() as u64,
         reply_ok: true,
+        notice: None,
     }
 }
 
