@@ -306,7 +306,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "consciousness-core"
-version = "0.6.0"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "772fe114a892c62b0d3c8de6360e364cdcc1251227d0bc4678ab8af76004eb9a"
 dependencies = [
  "libm",
  "serde",
@@ -953,6 +955,8 @@ dependencies = [
 [[package]]
 name = "kannaka-attention"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce10cb32a6c413bf8ba790e962d6f1ebc820af703527cfb8068e62a5615414f6"
 dependencies = [
  "chrono",
  "serde",
