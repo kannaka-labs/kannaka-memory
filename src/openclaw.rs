@@ -423,12 +423,28 @@ pub fn build_consciousness_payload(
 /// on stderr and never cached. `KANNAKA_ENCODER_FALLBACK=off` removes it, so a
 /// failed embed is an error instead of a hash vector among semantic ones.
 pub fn make_pipeline() -> EncodingPipeline {
-    let ollama = OllamaEncoder::default_local(); // all-minilm, 384-dim
+    // #1178: this pipeline used to be pinned to localhost, so a process whose
+    // store pipeline honoured KANNAKA_ENCODER_URL still embedded through
+    // localhost here (`observe`), failed, and fell back to the hash encoder.
+    let ollama = OllamaEncoder::new(
+        pipeline_encoder_url(std::env::var("KANNAKA_ENCODER_URL").ok()),
+        "all-minilm".to_string(),
+        CODEBOOK_INPUT_DIM,
+    );
     let hash_fallback = SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, CODEBOOK_SEED);
     let composite = CompositeEncoder::new(Box::new(ollama), Box::new(hash_fallback));
     let cached = CachedEncoder::new(composite);
     let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
     EncodingPipeline::new(Box::new(cached), codebook)
+}
+
+/// Where [`make_pipeline`]'s embedder lives: `KANNAKA_ENCODER_URL` when it is
+/// set and not blank, else the local Ollama default (#1178).
+pub(crate) fn pipeline_encoder_url(env: Option<String>) -> String {
+    match env {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => "http://localhost:11434".to_string(),
+    }
 }
 
 /// A pipeline with **no hash fallback**, for bulk re-encoding.
@@ -3683,6 +3699,14 @@ impl KannakaMemorySystem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pipeline_encoder_url_honours_env_and_defaults_to_localhost() {
+        // #1178
+        assert_eq!(pipeline_encoder_url(None), "http://localhost:11434");
+        assert_eq!(pipeline_encoder_url(Some("  ".into())), "http://localhost:11434");
+        assert_eq!(pipeline_encoder_url(Some(" http://10.0.0.5:11434 ".into())), "http://10.0.0.5:11434");
+    }
+
     use super::*;
     use std::env;
 
