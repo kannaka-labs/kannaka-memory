@@ -676,6 +676,13 @@ fn build_encoding_pipeline(data_dir: &std::path::Path, quiet: bool, cfg: &Kannak
             dim,
         ),
         "ollama" => {
+            // #1178: the system's second pipeline (`openclaw::make_pipeline`)
+            // reads the address from the environment, so a `base_url` that came
+            // from config.toml has to be exported for it to see. Same pattern
+            // and same single-threaded point as `apply_*_env_from_config`.
+            if std::env::var("KANNAKA_ENCODER_URL").map(|v| v.trim().is_empty()).unwrap_or(true) {
+                std::env::set_var("KANNAKA_ENCODER_URL", &url);
+            }
             if stamped.is_none() && !embedder_reachable(&url) {
                 eprintln!("[encoder] no embedder answering at {url} — refusing to create a new store.");
                 eprintln!("[encoder] a hash-encoded store has no semantics: recall returns near-noise");
