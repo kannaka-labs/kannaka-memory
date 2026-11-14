@@ -106,11 +106,17 @@ ctrlc = { version = "3", features = ["termination"] }
 # <data_dir>/snapshots/. Pure-rust, no system deps.
 flate2 = "1"
 
+# Native text embedder (`native-embed`): WordPiece tokenizer for the built-in
+# all-MiniLM-L6-v2 forward pass (src/native_embed.rs, on ndarray). The
+# pure-Rust regex backend keeps the musl release targets free of a C compiler
+# (no onig, no esaxx C++).
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"], optional = true }
+
 [features]
 # glyph is now default: the SGA glyph path (fano_line_of, classify, glyph-
 # gravity recall) is load-bearing for attention-as-gravity. Keeping it in
 # default means every build — including the autoresearch cron — ships it.
-default = ["hrm", "nats", "glyph", "video", "nostr", "mail"]
+default = ["hrm", "nats", "glyph", "video", "nostr", "mail", "native-embed"]
 nats = []
 # ADR-0064 P0: `kannaka mail` (accounts/sync/status/thread/close), read-only.
 # In default so the CI build covers it; adds no crates (see rustls above).
@@ -131,6 +137,11 @@ audio = []
 video = []
 glyph = []
 collective = []  # rayon is now unconditional
+# The built-in text embedder: all-MiniLM-L6-v2 run in-process, so a fresh
+# install needs no Ollama. Weights (45 MB) are fetched once on first use and
+# sha256-checked; the vocabulary is compiled in. Without this feature the
+# `native` encoder kind reports itself as compiled out.
+native-embed = ["tokenizers", "ndarray"]
 hrm = ["ndarray"]  # blake3 promoted to an unconditional dependency (inc-1a)
 # tui feature removed in v0.5.13 — see kannaka-labs/kannaka-tui
 # sqlite-migrate feature removed

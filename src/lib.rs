@@ -30,6 +30,11 @@ pub mod consolidation;
 pub mod kannaktopus;
 pub mod rhythm;
 pub mod encoding;
+/// Which text encoder a store uses: ids, stamp equivalence, selection order.
+pub mod encoder_select;
+/// The built-in all-MiniLM-L6-v2 embedder (no Ollama needed).
+#[cfg(feature = "native-embed")]
+pub mod native_embed;
 pub mod kuramoto;
 pub mod memory;
 pub mod store;

@@ -16,7 +16,7 @@ def embed(texts):
     B = 64
     for i in range(0, len(texts), B):
         req = urllib.request.Request(
-            "http://localhost:11434/api/embed",
+            "http://127.0.0.1:11434/api/embed",
             data=json.dumps({"model": MODEL, "input": texts[i:i+B]}).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=600) as r:

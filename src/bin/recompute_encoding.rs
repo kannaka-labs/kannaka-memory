@@ -3,7 +3,7 @@
 //! encoder (#107). Chiral (v2) HRMs only.
 //!
 //! Usage: kannaka-recompute-encoding [data-dir] [--dry-run]
-//!   KANNAKA_ENCODER_URL   (default http://localhost:11434)
+//!   KANNAKA_ENCODER_URL   (default http://127.0.0.1:11434)
 //!   KANNAKA_ENCODER_MODEL (default all-minilm)
 //!   KANNAKA_ENCODER_DIM   (default 384 — must match the codebook input dim)
 //!
@@ -39,7 +39,7 @@ use std::time::Duration;
 /// Where the embedder lives. Defaults match `OllamaEncoder::default_local`, and
 /// are overridable because the box that holds a store is not always the box that
 /// can run a model — O1 serves the swarm on one core and has no Ollama at all.
-const DEFAULT_URL: &str = "http://localhost:11434";
+const DEFAULT_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MODEL: &str = "all-minilm";
 const DEFAULT_DIM: usize = 384;
 

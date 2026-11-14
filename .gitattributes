@@ -3,3 +3,6 @@
 # trust before registering it. This stores the file as UTF-8 and materialises
 # UTF-16 in the working tree, so diffs stay readable and the file stays valid.
 ops/windows/KannakaSwarmServe.xml working-tree-encoding=UTF-16LE-BOM text eol=crlf
+
+# Compiled into the binary and sha256-pinned (src/native_embed.rs): no line-ending conversion.
+src/native_embed/vocab.txt -text

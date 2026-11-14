@@ -44,7 +44,7 @@
   "securityNotes": [
     "DOLT_PASSWORD is passed via MYSQL_PWD environment variable, not -p flag, to prevent process-list exposure",
     "DoltHub push only occurs on explicit `dolt push` commands — memories are local by default",
-    "Ollama embeddings are sent to OLLAMA_URL; defaults to localhost:11434",
+    "Ollama embeddings are sent to OLLAMA_URL; defaults to 127.0.0.1:11434",
     "Flux event publishing is disabled by default; only enabled when FLUX_URL is explicitly set",
     "Flux events carry only metadata (id, category, amplitude, summary) — never full vectors or memory content"
   ]

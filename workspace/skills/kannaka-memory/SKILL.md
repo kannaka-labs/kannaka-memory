@@ -176,7 +176,7 @@ Without Ollama, hash-based fallback encoding is used automatically.
 | `KANNAKA_DATA_DIR` | `.kannaka` | Data directory for binary snapshots |
 | `KANNAKA_DB_PATH` | `./kannaka_data` | MCP server data directory |
 | `KANNAKA_BIN` | `kannaka` | Path to CLI binary |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama API endpoint |
 | `OLLAMA_MODEL` | `all-minilm` | Embedding model |
 | `FLUX_URL` | *(disabled)* | Flux base URL — set to enable built-in event publishing |
 | `FLUX_AGENT_ID` | `kannaka-local` | This agent's entity ID in Flux |
