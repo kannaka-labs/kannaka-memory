@@ -1,8 +1,13 @@
 # Changelog
 
-## [Unreleased]
+## [0.17.0] — 2026-11-14
 
-Planned as 0.17.0. One change: the text embedder is built into the binary, so a fresh install needs no Ollama (spike #1180). The store format, recall ranking and dream scoring are unchanged, and a store written through Ollama `all-minilm` opens as before.
+The text embedder is built into the binary, so a fresh install needs no Ollama (#1184, spike #1180). Two fixes found in first-install testing ride along (#1179, #1182). The store format and dream scoring are unchanged, and a store written through Ollama `all-minilm` opens as before. Recall ranking is unchanged except that a dream's bookkeeping rows no longer appear in results (second fix below).
+
+### Fixes
+
+- **`observe` ignored `KANNAKA_ENCODER_URL` (#1178, #1179).** The system's second encoding pipeline was pinned to `localhost:11434`, so on a host with the embedder elsewhere `observe` failed its embed and fell back to the hash encoder with a warning. Checked on a Linux build: 0 embed calls to the configured address and 1 fallback warning before, 1 call and 0 warnings after.
+- **Recall returned a dream's bookkeeping row (#1181, #1182).** After `kannaka dream`, a `__consolidation_summary_layer_N` row could be the top recall result on a small store. `recall` and the serve daemon's beam recall now skip `__consolidation*` rows; plain recall over-fetches when such rows exist so the answer keeps its length. On a store that has dreamt, top-k lists can differ from before wherever such a row held a slot. Checked on a Linux build: 1 bookkeeping row in 12 results before, 0 in 12 after.
 
 ### The text embedder is built in: a fresh install needs no Ollama
 
@@ -17,7 +22,7 @@ Until now `kannaka` turned text into vectors by calling an Ollama server, and re
 - **Default Ollama address** is `http://127.0.0.1:11434` everywhere it was `http://localhost:11434` (encoder config, `OllamaEncoder::default_local`, the second pipeline, `kannaka-recompute-encoding`, the Ollama LLM defaults in `init` and `agent`). On Windows every request to `localhost` took about 2 s longer than the same request to `127.0.0.1` (measured in #1180). A config.toml that already says `localhost` is not changed.
 - **Cargo feature** `native-embed`, in the default set. Without it the `native` kind reports itself as compiled out and `auto` means Ollama.
 
-Costs: the release binary grows (the spike measured about +3.8 MB for the tokenizer and forward pass in a standalone probe; the delta in `kannaka` itself is not yet measured); a process that embeds natively holds the model in memory (about 91 MB as f32); the first embed of a process takes about 0.3 s to load it, later embeds 20 to 60 ms each on a laptop CPU.
+Costs: the release binary grows by 5.2 MB on Linux x86_64 (16,974,808 to 22,229,960 bytes; other targets not measured); a process that embeds natively holds the model in memory (about 91 MB as f32); the first embed of a process takes about 0.3 s to load it, later embeds 20 to 60 ms each on a laptop CPU.
 
 Known gap, not fixed here: Ollama tokenizes with llama.cpp's own WordPiece, which keeps Hangul syllables whole and keeps Devanagari vowel signs; this tokenizer does neither. For Korean and Devanagari text the built-in embedder's vectors therefore differ from Ollama's (cosine 0.659 and 0.964 on one sentence each), and the two stamps are still treated as equivalent. A store holding such text should stay with the embedder that wrote it (#1183). `kannaka-recompute-encoding` still re-encodes through Ollama only.
 
