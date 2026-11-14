@@ -78,9 +78,18 @@ pub struct EventsConfig {
 /// Text-encoder selection for the HRM pipeline.
 ///
 /// Measured 2026-08-02 (evals/semantic-encoder): a semantic encoder through the
-/// production chiral path scores 2.6x-4.4x the hash encoder's recall@10. Default
-/// stays `hash` — byte-identical to the pre-config behavior — per the ship-dark
-/// discipline; enable `ollama` on measured evidence per deployment.
+/// production chiral path scores 2.6x-4.4x the hash encoder's recall@10, so the
+/// default is semantic (#976).
+///
+/// `kind` is `auto|native|ollama|hash|hash2`. `auto` (the default since #1180)
+/// means: a new store uses the built-in embedder (`native`: all-MiniLM-L6-v2
+/// in-process, weights fetched once to `<data_dir>/models/`); a store stamped
+/// `ollama:all-minilm:384` keeps using Ollama while it answers and uses the
+/// built-in embedder, which returns the same vectors, when it does not. Any
+/// other value is an explicit choice. A config.toml written by `kannaka init`
+/// before #1180 says `kind = "ollama"`, which reads as that explicit choice;
+/// set it to `auto` (or delete the line) to get the behaviour above. The full
+/// order is `encoder_select::select`.
 ///
 /// A store's vectors are ENCODER-SPECIFIC: recalling a hash-encoded store with a
 /// semantic query vector (or vice versa) degrades to noise with no error. The
@@ -90,14 +99,18 @@ pub struct EventsConfig {
 /// recipe: evals/semantic-encoder/semantic-eval.rs).
 ///
 /// Env overrides (highest precedence, for eval arms and one-off runs):
-/// `KANNAKA_ENCODER` (hash|ollama), `KANNAKA_ENCODER_URL`,
-/// `KANNAKA_ENCODER_MODEL`, `KANNAKA_ENCODER_DIM`.
+/// `KANNAKA_ENCODER` (auto|native|ollama|hash|hash2), `KANNAKA_ENCODER_URL`,
+/// `KANNAKA_ENCODER_MODEL`, `KANNAKA_ENCODER_DIM`. For the built-in embedder:
+/// `KANNAKA_ENCODER_MODEL_PATH` (a local weights file; nothing is downloaded)
+/// and `KANNAKA_ENCODER_MODEL_URL` (a mirror; the sha256 is pinned either way).
 ///
 /// `KANNAKA_ENCODER_FALLBACK` (off|warn, default warn) is separate: it governs
-/// only `openclaw::make_pipeline` (Ollama with a hash fallback, used by
-/// `KannakaMemorySystem::init`), not the pipeline this config selects, which
-/// has no fallback. `warn` keeps the fallback, warns on stderr and counts it
-/// (`encoding::fallback_count`); `off` returns the embed error instead (#1166).
+/// only the Ollama-over-hash arm of `openclaw::make_pipeline` (the system's
+/// second pipeline, and both pipelines under `KannakaMemorySystem::init`), not
+/// the pipeline this config selects, which has no fallback. `warn` keeps the
+/// fallback, warns on stderr and counts it (`encoding::fallback_count`); `off`
+/// returns the embed error instead (#1166). The built-in embedder never has a
+/// hash fallback, in either pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderConfig {
     #[serde(default = "default_encoder_kind")]
@@ -110,8 +123,8 @@ pub struct EncoderConfig {
     pub dim: u32,
 }
 
-fn default_encoder_kind() -> String { "ollama".to_string() }
-fn default_encoder_url() -> String { "http://localhost:11434".to_string() }
+fn default_encoder_kind() -> String { "auto".to_string() }
+fn default_encoder_url() -> String { "http://127.0.0.1:11434".to_string() }
 fn default_encoder_model() -> String { "all-minilm".to_string() }
 fn default_encoder_dim() -> u32 { 384 }
 
@@ -2819,14 +2832,14 @@ pub fn run_init_wizard(overrides: InitOverrides) -> Result<KannakaConfig, String
                 if v.is_empty() { "llama3".into() } else { v }
             });
             config.llm.base_url = if non_interactive {
-                "http://localhost:11434".into()
+                "http://127.0.0.1:11434".into()
             } else {
-                eprint!("  Ollama base URL [default: http://localhost:11434] > ");
+                eprint!("  Ollama base URL [default: http://127.0.0.1:11434] > ");
                 stdout.flush().ok();
                 let mut line = String::new();
                 stdin.lock().read_line(&mut line).ok();
                 let v = line.trim().to_string();
-                if v.is_empty() { "http://localhost:11434".into() } else { v }
+                if v.is_empty() { "http://127.0.0.1:11434".into() } else { v }
             };
             // Pre-flight: verify the Ollama server is reachable AND has the
             // chosen model installed. Surfacing this at onboarding time means
@@ -3887,7 +3900,7 @@ fn run_init_wizard_with_installer_ui(overrides: InitOverrides, a: &Ansi, total_s
             config.llm.provider = "ollama".into();
             eprintln!();
             config.llm.model = prompt_line(a, "Ollama model", "llama3");
-            config.llm.base_url = prompt_line(a, "Ollama base URL", "http://localhost:11434");
+            config.llm.base_url = prompt_line(a, "Ollama base URL", "http://127.0.0.1:11434");
         }
         4 => {
             config.llm.provider = "custom".into();
@@ -4592,7 +4605,7 @@ pub fn run_upgrade_installer() {
             config.llm.provider = "ollama".into();
             eprintln!();
             config.llm.model = prompt_line(&a, "Ollama model", "llama3");
-            config.llm.base_url = prompt_line(&a, "Ollama base URL", "http://localhost:11434");
+            config.llm.base_url = prompt_line(&a, "Ollama base URL", "http://127.0.0.1:11434");
         }
         4 => {
             config.llm.provider = "custom".into();
@@ -6307,19 +6320,35 @@ id = \"from-config\"
     }
 
     #[test]
-    fn encoder_section_defaults_to_ollama() {
-        // #976: a config with no [encoder] section selects the SEMANTIC encoder.
+    fn encoder_section_defaults_to_auto() {
+        // #976: a config with no [encoder] section selects a SEMANTIC encoder.
         // The hash encoder is a non-semantic fallback: on LongMemEval-S it cost
         // hit@k 0.53 against 0.93 for the same medium with all-minilm, and it
         // was the shipped default, so every new store started useless for
         // recall. Existing hash stores keep working through the `.encoder`
         // stamp, which is adopted rather than refused (see
         // build_encoding_pipeline in the kannaka binary).
+        // #1180: the default is `auto`, which `encoder_select::select` resolves
+        // to the built-in embedder or Ollama and never to a hash encoder.
         let cfg: KannakaConfig = toml::from_str("").expect("empty config parses");
-        assert_eq!(cfg.encoder.kind, "ollama");
+        assert_eq!(cfg.encoder.kind, "auto");
+        let sel = crate::encoder_select::select(
+            &crate::encoder_select::SelectInput {
+                env_kind: None,
+                cfg_kind: &cfg.encoder.kind,
+                model: &cfg.encoder.model,
+                dim: cfg.encoder.dim as usize,
+                stamp: None,
+                native_built: true,
+            },
+            &mut || false,
+        )
+        .expect("the default config selects an encoder");
+        assert_eq!(sel.stamp(), crate::encoder_select::NATIVE_ENCODER_ID);
+
         assert_eq!(cfg.encoder.dim, 384);
         assert_eq!(cfg.encoder.model, "all-minilm");
-        assert_eq!(cfg.encoder.base_url, "http://localhost:11434");
+        assert_eq!(cfg.encoder.base_url, "http://127.0.0.1:11434");
     }
 
     #[test]
@@ -6335,7 +6364,7 @@ id = \"from-config\"
         assert_eq!(cfg.encoder.model, "mxbai-embed-large");
         assert_eq!(cfg.encoder.dim, 1024);
         // unspecified field falls back to its default
-        assert_eq!(cfg.encoder.base_url, "http://localhost:11434");
+        assert_eq!(cfg.encoder.base_url, "http://127.0.0.1:11434");
     }
 
     // ── #1067 an explicit KANNAKA_DATA_DIR outranks an escaping hrm.path ──

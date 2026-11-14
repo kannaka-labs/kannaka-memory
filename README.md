@@ -193,19 +193,35 @@ The library ships canonical IIT-style Φ computation via the `consciousness-core
 ## Install
 
 ```bash
-# 1. The binary (Linux / macOS / Windows builds are on the releases page)
+# The binary (Linux / macOS / Windows builds are on the releases page)
 curl -L -o kannaka   https://github.com/kannaka-labs/kannaka-memory/releases/latest/download/kannaka-linux-x86_64
 chmod +x kannaka && mv kannaka ~/.local/bin/
-
-# 2. An embedder. kannaka turns text into vectors with a small local model
-#    served by Ollama (https://ollama.com). Without one it refuses to create
-#    a store, because a store built without it cannot recall by meaning.
-ollama pull all-minilm          # about 45 MB; `ollama serve` must be running
 ```
 
-Other ways to get the binary: `npx kannaka`, the installers in [`scripts/`](scripts/), or from source
-(`cargo build --release --bin kannaka`). `kannaka update` updates in place.
-If Ollama runs somewhere else, point `KANNAKA_ENCODER_URL` at it.
+That is the whole install. Other ways to get the binary: `npx kannaka`, the installers in
+[`scripts/`](scripts/), or from source (`cargo build --release --bin kannaka`). `kannaka update` updates in place.
+
+**The embedder is built in.** kannaka turns text into vectors with a small model
+(all-MiniLM-L6-v2) that runs inside the binary; Ollama is not needed. The first
+command that opens a new store downloads the model's weights once: 45 MB from
+[`huggingface.co/Kannaka/kannaka-encoder`](https://huggingface.co/Kannaka/kannaka-encoder),
+checked against a sha256 pinned in the binary and kept in `~/.kannaka/models/`.
+After that nothing is fetched. If the download or the check fails, kannaka says
+so and stops; it does not fall back to a weaker encoder.
+
+- **Offline or air-gapped:** fetch `model.safetensors` (tag `v0`) on another
+  machine and set `KANNAKA_ENCODER_MODEL_PATH=/path/to/model.safetensors`.
+- **Stay on Ollama:** set `KANNAKA_ENCODER=ollama` (or `kind = "ollama"` under
+  `[encoder]` in `~/.kannaka/config.toml`), run `ollama pull all-minilm`, and
+  point `KANNAKA_ENCODER_URL` at it if it is not on `http://127.0.0.1:11434`.
+  A store written through Ollama `all-minilm` keeps using Ollama while it
+  answers and uses the built-in embedder when it does not. The two return the
+  same vectors, so the store reads the same either way.
+- **Known gap:** Korean and Devanagari text is tokenized differently from
+  Ollama, so for those scripts the built-in embedder's vectors differ from
+  Ollama's. A store that holds such text should stay with the embedder that
+  wrote it ([#1183](https://github.com/kannaka-labs/kannaka-memory/issues/1183)).
+
 
 Companion: [`kannaka-tui`](https://github.com/kannaka-labs/kannaka-tui) — terminal dashboard. Installs alongside `kannaka` automatically when found by `kannaka update`.
 
@@ -213,7 +229,8 @@ Companion: [`kannaka-tui`](https://github.com/kannaka-labs/kannaka-tui) — term
 
 ## Quick Start
 
-Three memories and one question. Each command takes a few seconds on a laptop.
+Three memories and one question. Each command takes a few seconds on a laptop;
+the first one also downloads the embedder's weights (45 MB, once).
 
 ```bash
 kannaka remember "the ghost wakes up in a field of static" --importance 0.9

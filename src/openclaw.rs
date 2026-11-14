@@ -414,28 +414,118 @@ pub fn build_consciousness_payload(
     })
 }
 
-/// Construct the production encoding pipeline (Ollama all-minilm with a
-/// deterministic hash fallback). Public so one-shot data tools — e.g. the #107
-/// re-encode migration binary — refresh wavefronts with the SAME pipeline the
-/// running system uses, not a test stand-in.
+/// Construct the system's encoding pipeline: the engine-side ("second")
+/// pipeline of every `KannakaMemorySystem`, and the store pipeline too for
+/// callers that go through `KannakaMemorySystem::init`. Public so one-shot data
+/// tools — e.g. the #107 re-encode migration binary — refresh wavefronts with
+/// the SAME pipeline the running system uses, not a test stand-in.
 ///
-/// #1166: the fallback is counted (`encoding::fallback_count`), warned about
+/// It mirrors what the store pipeline selected. The `kannaka` binary selects an
+/// encoder per store (`encoder_select::select`) and exports its stamp as
+/// `KANNAKA_ENCODER_SELECTED`; this function builds the encoder that stamp
+/// names. Two pipelines that disagree are the bug class behind #1178: one
+/// embeds the memory, the other the query or the health check, and nothing
+/// reports that they live in different vector spaces.
+///
+/// - a hash stamp: that hash encoder, directly;
+/// - the native stamp: the native embedder, with **no** hash fallback (its
+///   failure is an error, never a pseudo-embedding);
+/// - an Ollama stamp at the codebook's width, or nothing exported (library
+///   callers, tests): Ollama (`KANNAKA_ENCODER_URL`, the stamp's model or
+///   all-minilm) over the hash fallback, as before.
+///
+/// #1166: that fallback is counted (`encoding::fallback_count`), warned about
 /// on stderr and never cached. `KANNAKA_ENCODER_FALLBACK=off` removes it, so a
 /// failed embed is an error instead of a hash vector among semantic ones.
 pub fn make_pipeline() -> EncodingPipeline {
+    make_pipeline_for_stamp(
+        std::env::var(crate::encoder_select::SELECTED_ENV).ok().filter(|v| !v.trim().is_empty()).as_deref(),
+    )
+}
+
+/// [`make_pipeline`] for an explicit stamp (`None`: nothing was selected).
+pub(crate) fn make_pipeline_for_stamp(selected: Option<&str>) -> EncodingPipeline {
+    use crate::encoder_select::{addressless_encoder, parse_encoder_stamp};
+    let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
+    if let Some(stamp) = selected {
+        match addressless_encoder(stamp, CODEBOOK_INPUT_DIM) {
+            Some(Ok(encoder)) => {
+                return EncodingPipeline::new(Box::new(CachedEncoder::new(BoxedEncoder(encoder))), codebook)
+                    .with_metadata(stamp.trim().to_string(), false);
+            }
+            // The store selected the native embedder and this build has none.
+            // Say so on every embed instead of answering from another space.
+            Some(Err(why)) => {
+                return EncodingPipeline::new(Box::new(UnavailableEncoder(why)), codebook)
+                    .with_metadata(stamp.trim().to_string(), false);
+            }
+            None => {}
+        }
+    }
     // #1178: this pipeline used to be pinned to localhost, so a process whose
     // store pipeline honoured KANNAKA_ENCODER_URL still embedded through
     // localhost here (`observe`), failed, and fell back to the hash encoder.
+    let (model, stamp) = match selected.and_then(parse_encoder_stamp) {
+        Some((kind, model, dim)) if kind == "ollama" && dim == CODEBOOK_INPUT_DIM => {
+            (model, selected.map(|s| s.trim().to_string()))
+        }
+        _ => ("all-minilm".to_string(), None),
+    };
     let ollama = OllamaEncoder::new(
         pipeline_encoder_url(std::env::var("KANNAKA_ENCODER_URL").ok()),
-        "all-minilm".to_string(),
+        model,
         CODEBOOK_INPUT_DIM,
     );
     let hash_fallback = SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, CODEBOOK_SEED);
     let composite = CompositeEncoder::new(Box::new(ollama), Box::new(hash_fallback));
     let cached = CachedEncoder::new(composite);
-    let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
-    EncodingPipeline::new(Box::new(cached), codebook)
+    let pipeline = EncodingPipeline::new(Box::new(cached), codebook);
+    match stamp {
+        Some(stamp) => pipeline.with_metadata(stamp, false),
+        None => pipeline,
+    }
+}
+
+/// [`make_pipeline`] for a system opened on `data_dir` without the `kannaka`
+/// binary's selection (`KannakaMemorySystem::init`: `kannaka-acp`, setup
+/// seeding, tools). When nothing was exported and the store's `.encoder` stamp
+/// is the native id, the store was written by the native embedder and is opened
+/// with it, not with Ollama over a hash fallback.
+pub(crate) fn make_pipeline_for_data_dir(data_dir: &std::path::Path) -> EncodingPipeline {
+    if std::env::var(crate::encoder_select::SELECTED_ENV).map(|v| v.trim().is_empty()).unwrap_or(true) {
+        let stamp = std::fs::read_to_string(data_dir.join(".encoder")).unwrap_or_default();
+        if stamp.trim() == crate::encoder_select::NATIVE_ENCODER_ID {
+            return make_pipeline_for_stamp(Some(stamp.trim()));
+        }
+    }
+    make_pipeline()
+}
+
+/// A boxed encoder as an encoder, so it can sit inside [`CachedEncoder`].
+struct BoxedEncoder(Box<dyn crate::encoding::TextEncoder>);
+
+impl crate::encoding::TextEncoder for BoxedEncoder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, crate::encoding::EncodingError> {
+        self.0.embed(text)
+    }
+    fn embedding_dim(&self) -> usize {
+        self.0.embedding_dim()
+    }
+    fn embed_cacheable(&self, text: &str) -> Result<(Vec<f32>, bool), crate::encoding::EncodingError> {
+        self.0.embed_cacheable(text)
+    }
+}
+
+/// Stands in for an encoder this build cannot provide: every embed is an error.
+struct UnavailableEncoder(String);
+
+impl crate::encoding::TextEncoder for UnavailableEncoder {
+    fn embed(&self, _text: &str) -> Result<Vec<f32>, crate::encoding::EncodingError> {
+        Err(crate::encoding::EncodingError::Other(self.0.clone()))
+    }
+    fn embedding_dim(&self) -> usize {
+        CODEBOOK_INPUT_DIM
+    }
 }
 
 /// Where [`make_pipeline`]'s embedder lives: `KANNAKA_ENCODER_URL` when it is
@@ -443,7 +533,7 @@ pub fn make_pipeline() -> EncodingPipeline {
 pub(crate) fn pipeline_encoder_url(env: Option<String>) -> String {
     match env {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => "http://localhost:11434".to_string(),
+        _ => crate::encoder_select::DEFAULT_OLLAMA_URL.to_string(),
     }
 }
 
@@ -614,7 +704,8 @@ impl KannakaMemorySystem {
     pub fn init(data_dir: PathBuf) -> Result<Self, SystemError> {
         std::fs::create_dir_all(&data_dir)?;
 
-        let pipeline = make_pipeline();
+        // One selection for the store pipeline and the engine pipeline.
+        let pipeline = make_pipeline_for_data_dir(&data_dir);
         let hrm_path = data_dir.join("kannaka.hrm");
 
         let store: Box<dyn crate::store::MediumBackend> = if hrm_path.exists() {
@@ -633,7 +724,7 @@ impl KannakaMemorySystem {
                          (existing file preserved, NOT overwritten). Move it aside and \
                          restart to begin a clean store."
                     );
-                    let pipeline = make_pipeline();
+                    let pipeline = make_pipeline_for_data_dir(&data_dir);
                     let mut fresh = crate::hrm_store::HrmStore::new(pipeline, data_dir.join("kannaka.hrm"));
                     fresh.set_readonly(true);
                     Box::new(fresh)
@@ -643,7 +734,7 @@ impl KannakaMemorySystem {
             Box::new(crate::hrm_store::HrmStore::new(pipeline, hrm_path))
         };
 
-        let engine = ResonanceEngine::new(store, make_pipeline());
+        let engine = ResonanceEngine::new(store, make_pipeline_for_data_dir(&data_dir));
         Self::init_with_engine(data_dir, engine)
     }
 
@@ -1143,7 +1234,20 @@ impl KannakaMemorySystem {
     pub fn init_with_store(data_dir: PathBuf, store: Box<dyn crate::store::MediumBackend>) -> Result<Self, SystemError> {
         std::fs::create_dir_all(&data_dir)?;
 
-        let pipeline = make_pipeline();
+        let pipeline = make_pipeline_for_data_dir(&data_dir);
+        Self::init_with_store_and_pipeline(data_dir, store, pipeline)
+    }
+
+    /// [`Self::init_with_store`] with the engine-side pipeline supplied by the
+    /// caller, who built `store` around its own pipeline and knows which
+    /// encoder that was. The two must embed into the same space.
+    pub fn init_with_store_and_pipeline(
+        data_dir: PathBuf,
+        store: Box<dyn crate::store::MediumBackend>,
+        pipeline: EncodingPipeline,
+    ) -> Result<Self, SystemError> {
+        std::fs::create_dir_all(&data_dir)?;
+
         let engine = ResonanceEngine::new(store, pipeline);
 
         Self::init_with_engine(data_dir, engine)
@@ -3702,10 +3806,77 @@ mod tests {
     #[test]
     fn pipeline_encoder_url_honours_env_and_defaults_to_localhost() {
         // #1178
-        assert_eq!(pipeline_encoder_url(None), "http://localhost:11434");
-        assert_eq!(pipeline_encoder_url(Some("  ".into())), "http://localhost:11434");
+        assert_eq!(pipeline_encoder_url(None), "http://127.0.0.1:11434");
+        assert_eq!(pipeline_encoder_url(Some("  ".into())), "http://127.0.0.1:11434");
+
         assert_eq!(pipeline_encoder_url(Some(" http://10.0.0.5:11434 ".into())), "http://10.0.0.5:11434");
     }
+
+    /// #1180: the second pipeline builds the encoder the store pipeline
+    /// selected. A hash store is embedded with that hash encoder directly (it
+    /// used to go to Ollama first and only reach the hash encoder by failing).
+    #[test]
+    fn second_pipeline_mirrors_a_selected_hash_encoder() {
+        use crate::encoding::TextEncoder;
+        let text = "the spare key is under the blue flowerpot";
+        let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
+        for (stamp, direct) in [
+            ("hash:384:42", SimpleHashEncoder::new(384, 42)),
+            ("hash:384:7", SimpleHashEncoder::new(384, 7)),
+            ("hash2:384:42", SimpleHashEncoder::new_cleaned(384, 42)),
+        ] {
+            let before = crate::encoding::fallback_count();
+            let pipeline = make_pipeline_for_stamp(Some(stamp));
+            assert_eq!(pipeline.stamp, stamp);
+            assert_eq!(
+                pipeline.encode_text(text).unwrap(),
+                codebook.project(&direct.embed(text).unwrap()),
+                "{stamp}"
+            );
+            assert_eq!(crate::encoding::fallback_count(), before, "{stamp}: no fallback was involved");
+        }
+    }
+
+    /// #1180: a selected native embedder has no hash fallback in the second
+    /// pipeline either. Without the feature every embed is an error that says
+    /// why; with it, the pipeline carries the native stamp (embedding needs the
+    /// weights and is covered by the ignored tests in `native_embed`).
+    #[test]
+    fn second_pipeline_mirrors_a_selected_native_encoder() {
+        let id = crate::encoder_select::NATIVE_ENCODER_ID;
+        let pipeline = make_pipeline_for_stamp(Some(id));
+        assert_eq!(pipeline.stamp, id);
+        if !crate::encoder_select::native_built() {
+            let before = crate::encoding::fallback_count();
+            let err = pipeline.encode_text("anything").unwrap_err().to_string();
+            assert!(err.contains("native-embed"), "{err}");
+            assert_eq!(crate::encoding::fallback_count(), before);
+        }
+        // A store stamped native is opened natively by `init` with nothing exported.
+        let dir = std::env::temp_dir().join(format!("kannaka_native_stamp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".encoder"), format!("{id}\n")).unwrap();
+        if std::env::var(crate::encoder_select::SELECTED_ENV).is_err() {
+            assert_eq!(make_pipeline_for_data_dir(&dir).stamp, id);
+            std::fs::write(dir.join(".encoder"), "ollama:all-minilm:384").unwrap();
+            assert_eq!(make_pipeline_for_data_dir(&dir).stamp, "unknown", "anything else keeps the legacy pipeline");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An Ollama stamp at the codebook's width keeps Ollama over the hash
+    /// fallback and takes the stamp's model; other widths and no stamp are the
+    /// legacy all-minilm pipeline.
+    #[test]
+    fn second_pipeline_keeps_the_ollama_arm_for_ollama_stamps() {
+        assert_eq!(make_pipeline_for_stamp(Some("ollama:all-minilm:384")).stamp, "ollama:all-minilm:384");
+        assert_eq!(make_pipeline_for_stamp(Some("ollama:nomic-embed-text:384")).stamp, "ollama:nomic-embed-text:384");
+        assert_eq!(make_pipeline_for_stamp(Some("ollama:mxbai-embed-large:1024")).stamp, "unknown");
+        assert_eq!(make_pipeline_for_stamp(Some("hash:768:42")).stamp, "unknown");
+        assert_eq!(make_pipeline_for_stamp(None).stamp, "unknown");
+    }
+
 
     use super::*;
     use std::env;

@@ -221,10 +221,10 @@ impl OllamaEncoder {
         Self { base_url, model, embedding_dim }
     }
 
-    /// Default: all-minilm on localhost, 384 dims.
+    /// Default: all-minilm on the local machine, 384 dims.
     pub fn default_local() -> Self {
         Self::new(
-            "http://localhost:11434".to_string(),
+            crate::encoder_select::DEFAULT_OLLAMA_URL.to_string(),
             "all-minilm".to_string(),
             384,
         )

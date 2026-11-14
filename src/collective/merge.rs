@@ -157,7 +157,9 @@ pub fn merge_guard(
 ) -> Option<String> {
     // D4: Embedding model compatibility
     if let (Some(local_model), Some(remote_model)) = (local_embedding_model, remote_embedding_model) {
-        if local_model != remote_model {
+        // The native embedder and Ollama's all-minilm are one vector space
+        // under two names (`encoder_select`); every other pair must match.
+        if !crate::encoder_select::embedding_models_equivalent(local_model, remote_model) {
             return Some(format!(
                 "embedding model mismatch: local={local_model}, remote={remote_model}"
             ));
@@ -457,6 +459,21 @@ mod tests {
         let guard = merge_guard(&local, &remote, Some("all-minilm"), Some("text-embedding-3-small"));
         assert!(guard.is_some(), "should reject embedding model mismatch");
         assert!(guard.unwrap().contains("mismatch"));
+    }
+
+    #[test]
+    fn merge_guard_treats_native_and_ollama_minilm_as_one_model() {
+        let local = mem_agent(0.8, 0.0, "fact A", "kannaka");
+        let remote = mem_agent(0.7, 0.0, "fact A", "arc");
+        for (l, r) in [
+            ("all-minilm", "all-minilm-l6-v2"),
+            ("ollama:all-minilm:384", "kannaka:all-minilm-l6-v2:384"),
+            ("kannaka:all-minilm-l6-v2:384", "all-minilm"),
+        ] {
+            assert!(merge_guard(&local, &remote, Some(l), Some(r)).is_none(), "{l} vs {r}");
+        }
+        let guard = merge_guard(&local, &remote, Some("kannaka:all-minilm-l6-v2:384"), Some("hash:384:42"));
+        assert!(guard.unwrap().contains("embedding model mismatch"));
     }
 
     #[test]

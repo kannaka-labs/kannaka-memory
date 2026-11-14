@@ -430,7 +430,7 @@ case "$COMMAND" in
         echo "Environment:"
         echo "  KANNAKA_BIN=${KANNAKA_BIN}"
         echo "  KANNAKA_DATA_DIR=${KANNAKA_DATA_DIR:-.kannaka}"
-        echo "  OLLAMA_URL=${OLLAMA_URL:-http://localhost:11434}"
+        echo "  OLLAMA_URL=${OLLAMA_URL:-http://127.0.0.1:11434}"
         echo "  FLUX_URL=${FLUX_URL:-(disabled)}  FLUX_AGENT_ID=${FLUX_AGENT_ID:-kannaka-local}"
         echo "  DOLT_HOST=${DOLT_HOST:-127.0.0.1}  DOLT_PORT=${DOLT_PORT:-3307}"
         exit 1

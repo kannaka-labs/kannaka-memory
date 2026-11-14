@@ -122,7 +122,7 @@ Key environment variables:
 | `KANNAKA_ALLOW_EXTERNAL_HRM` | `1` keeps an absolute `hrm.path` outside `KANNAKA_DATA_DIR` (pre-#1067 behaviour) | unset |
 | `KANNAKA_NATS_URL` | NATS server | `nats://swarm.ninja-portal.com:4222` |
 | `KANNAKA_AGENT_ID` | Agent identifier | auto-generated |
-| `OLLAMA_URL` | Ollama endpoint | `http://localhost:11434` |
+| `OLLAMA_URL` | Ollama endpoint | `http://127.0.0.1:11434` |
 
 ## Get Help
 

@@ -1124,7 +1124,7 @@ pub fn client_from_config(cfg: &KannakaConfig) -> Result<LlmClient, AgentError> 
             // Ollama is the local-model path. base_url defaults to the
             // standard 11434 port; model defaults to llama3.
             let base_url = if cfg.llm.base_url.is_empty() {
-                "http://localhost:11434".to_string()
+                "http://127.0.0.1:11434".to_string()
             } else {
                 cfg.llm.base_url.clone()
             };
