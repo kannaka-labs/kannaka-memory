@@ -1,0 +1,157 @@
+The cat sat on the windowsill and watched the rain.
+How do I reset my password if I no longer have access to my email?
+Mitochondria are the powerhouse of the cell.
+The Federal Reserve raised interest rates by 25 basis points on Wednesday.
+fn main() { println!("hello, world"); }
+SELECT id, name FROM users WHERE created_at > '2024-01-01' ORDER BY id DESC LIMIT 10;
+She sells seashells by the seashore.
+What is the capital of Australia?
+Canberra is the capital city of Australia.
+Paris is the capital of France.
+I really enjoyed the film, although the ending felt rushed.
+The movie was great but the last act was hurried.
+Quantum entanglement links the states of two particles regardless of distance.
+Error: connection refused (os error 111) while dialing 127.0.0.1:4222
+Remember to buy milk, eggs, and bread on the way home.
+The patient presented with acute chest pain radiating to the left arm.
+In 1969, Apollo 11 landed the first humans on the Moon.
+Water boils at 100 degrees Celsius at sea level.
+git rebase --onto main feature~3 feature
+The stock closed at $182.47, up 3.2% on the day.
+Wave interference stores memories as phase patterns in a holographic medium.
+A dream cycle consolidates recent memories and prunes weak links.
+The radio station plays an eight-track album every evening at nine.
+Please call me back at +1 (555) 010-9999 before 5 PM.
+https://example.com/path/to/resource?query=1&lang=en#section-2
+ALL CAPS TEXT SHOULD BE LOWERCASED BY THE UNCASED TOKENIZER.
+MiXeD cAsE wOrDs ArE aLsO fInE.
+a
+OK
+Yes.
+No, thank you.
+42
+3.14159265358979
+1,000,000 people attended the festival in 2019.
+The quick brown fox jumps over the lazy dog.
+Pack my box with five dozen liquor jugs.
+To be, or not to be, that is the question.
+It was the best of times, it was the worst of times.
+Naïve café patrons ordered crème brûlée and a piña colada.
+Der schnelle braune Fuchs springt über den faulen Hund.
+El niño comió una manzana roja en el jardín.
+Les élèves étudient la géométrie à l'école.
+Привет, как дела? Сегодня хорошая погода.
+今日は天気がいいですね。
+我喜欢在周末读书和散步。
+한국어 문장도 테스트합니다.
+مرحبا بالعالم، كيف حالك اليوم؟
+Γειά σου Κόσμε, τι κάνεις;
+I love pizza 🍕 and rockets 🚀!
+Temperature: −40°C equals −40°F — a curious coincidence.
+“Smart quotes” and ‘apostrophes’ … plus an ellipsis.
+Tabs	and  multiple   spaces    should collapse.
+user@example.com sent 3 attachments (2.5 MB total).
+E = mc^2 and F = ma are famous equations.
+The derivative of x^2 is 2x; the integral is x^3/3 + C.
+import numpy as np; x = np.linspace(0, 1, 100)
+{"key": "value", "list": [1, 2, 3], "nested": {"ok": true}}
+<div class="container"><p>Hello</p></div>
+C:\Users\someone\Documents\report_final_v2.docx
+#hashtag @mention $TICKER 100% legit!!!
+supercalifragilisticexpialidocious
+pneumonoultramicroscopicsilicovolcanoconiosis is a long word
+Dr. Smith, Ph.D., arrived at 10:30 a.m. on Jan. 5th.
+The U.S.A. and the U.K. signed the agreement.
+don't can't won't shouldn't've y'all
+state-of-the-art, well-known, twenty-one, mother-in-law
+The server returned HTTP 503 Service Unavailable after 30s timeout.
+Kubernetes pods were evicted due to memory pressure on node-7.
+The gradient vanished after forty layers without residual connections.
+LoRA adapters add low-rank updates to frozen weight matrices.
+Cosine similarity measures the angle between two vectors.
+Top-k retrieval returns the k nearest neighbours of a query.
+The orchestra tuned to A440 before the symphony began.
+She played a melancholic nocturne in C-sharp minor.
+The recipe calls for two cups of flour and a pinch of salt.
+Simmer the sauce for twenty minutes, stirring occasionally.
+The marathon runner hit the wall at mile twenty.
+The goalkeeper saved a penalty in the ninetieth minute.
+Photosynthesis converts light energy into chemical energy.
+Tectonic plates drift a few centimetres each year.
+The treaty was ratified by a two-thirds majority.
+The defendant pleaded not guilty to all charges.
+Compound interest grows exponentially over long horizons.
+Diversification reduces unsystematic risk in a portfolio.
+The toddler laughed when the puppy licked her face.
+My grandmother knits scarves every winter.
+The train to Edinburgh departs from platform nine.
+Turn left at the lighthouse and follow the coastal road.
+The old bookstore smelled of dust and vanilla.
+A storm is expected to make landfall on Friday night.
+The antenna radiates best when cut to a half wavelength.
+CQ CQ CQ this is a test station calling on twenty metres.
+Schedule the cron job to run at 07:00 UTC daily.
+The disk is 91% full; clean up old build artefacts.
+An agent joined the swarm and synced its memories.
+The ledger is append-only and hash-chained.
+Is it going to rain tomorrow?
+Why is the sky blue?
+Who wrote Pride and Prejudice?
+When does the next lunar eclipse occur?
+Where can I find a good ramen place nearby?
+Translate 'good morning' into Japanese.
+Summarize the following article in three bullet points.
+I'm feeling anxious about my presentation tomorrow.
+Congratulations on your promotion, you deserve it!
+I'm so sorry for your loss.
+This product broke after two days. Terrible quality.
+Absolutely fantastic service, would recommend to anyone.
+The meeting is moved from Tuesday to Thursday at 3 PM.
+Invoice #20391 is overdue by 14 days.
+The function returns None when the key is missing.
+A mutex guards the shared counter against data races.
+Rust's borrow checker enforces aliasing XOR mutability.
+The kernel panicked with a null pointer dereference.
+TCP guarantees ordered delivery; UDP does not.
+Elliptic-curve signatures are shorter than RSA signatures.
+A black hole's event horizon marks the point of no return.
+The James Webb telescope observes in the infrared.
+Vaccines train the immune system to recognise pathogens.
+Insulin regulates the uptake of glucose into cells.
+The Renaissance began in Florence in the fourteenth century.
+The Berlin Wall fell in November 1989.
+Shakespeare was born in Stratford-upon-Avon.
+Honey never spoils if stored properly.
+Octopuses have three hearts and blue blood.
+Bananas are berries, but strawberries are not.
+The chess engine sacrificed its queen for a mating attack.
+Roll two six-sided dice and add the results.
+Empty the dishwasher and take out the recycling.
+The baby finally slept through the night.
+He whispered a secret that changed everything.
+The lighthouse keeper counted ships until dawn.
+Under the sea, bioluminescent creatures glow in the dark.
+Autumn leaves crunch underfoot in the quiet park.
+The desert blooms briefly after rare rains.
+   leading and trailing whitespace
+line one\nline two\nline three
+!!!???...
+--- *** ___
+ñ
+Ünïcödé dïäcrïtïcs everywhere
+ﬁnancial ligatures and ½ fractions and ² superscripts
+full-width ＡＢＣ１２３ characters
+zero​width​space inside words
+Café vs Café (composed vs decomposed)
+İstanbul'da hava çok güzel.
+Zażółć gęślą jaźń.
+Tiếng Việt có nhiều dấu thanh.
+हिन्दी में एक वाक्य।
+שלום עולם
+ภาษาไทยไม่มีช่องว่างระหว่างคำ
+日本語とEnglishが混ざった文章です。
+x
+the the the the the the the the
+[CLS] literal special tokens [SEP] in text [MASK] [UNK] [PAD]
+0x7fffffff 0b1010 1e-12 NaN Infinity
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

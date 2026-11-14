@@ -1,0 +1,38 @@
+[package]
+name = "native-embed-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike: native all-MiniLM-L6-v2 embedder vs Ollama all-minilm parity probe"
+
+# Standalone: not part of the kannaka-memory package.
+[workspace]
+
+[dependencies]
+serde_json = "1"
+# Pure-Rust regex backend (no onig C library) so the musl targets stay C-free.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"], optional = true }
+
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+
+tract-onnx = { version = "0.23", optional = true }
+
+# "scratch" backend: a hand-written BERT forward pass on the ndarray kannaka
+# already ships (0.15, matrixmultiply), plus a safetensors reader.
+ndarray = { version = "0.15", optional = true }
+safetensors = { version = "0.8", optional = true }
+half = { version = "2", optional = true }
+libm = { version = "0.2", optional = true }
+
+# only for timing the HTTP path the way kannaka's OllamaEncoder calls it
+ureq = { version = "2", features = ["json"], optional = true }
+
+[features]
+default = []
+tok = ["dep:tokenizers"]
+candle = ["tok", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+tract = ["tok", "dep:tract-onnx"]
+http-timing = ["dep:ureq"]
+scratch = ["tok", "dep:ndarray", "dep:safetensors", "dep:half", "dep:libm"]

@@ -1,0 +1,5 @@
+target/
+models/
+data/ollama_ref*.json
+data/out_*.json
+Cargo.lock
