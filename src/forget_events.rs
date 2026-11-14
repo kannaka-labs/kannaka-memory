@@ -100,6 +100,10 @@ pub struct ForgetRecord {
     pub merged_into: Option<Uuid>,
 }
 
+/// `ForgetPublishOutcome::reason` when the node is not a swarm member, so
+/// nothing was dialled (`KannakaMemorySystem::set_swarm_publish`).
+pub const REASON_SWARM_NOT_ENABLED: &str = "swarm not enabled";
+
 /// What happened to the forget events of one save. `announced` counts the
 /// removals that should have produced an event; `published` the ones that
 /// did. Every other one is in `not_published`, with the last reason, so a
@@ -124,6 +128,10 @@ impl ForgetPublishOutcome {
 
     /// The one line the CLI prints after a delete.
     pub fn summary_line(&self) -> String {
+        if self.published == 0 && self.reason.as_deref() == Some(REASON_SWARM_NOT_ENABLED) {
+            // A node that never joined the swarm: nothing went wrong.
+            return format!("forget event: none ({REASON_SWARM_NOT_ENABLED})");
+        }
         if self.not_published == 0 {
             format!("forget event: published {}", self.published)
         } else {
