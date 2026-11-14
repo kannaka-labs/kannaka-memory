@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-Planned as 0.17.0. One change: the text embedder is built into the binary, so a fresh install needs no Ollama (#1180 spike, #1182). The store format, recall ranking and dream scoring are unchanged, and a store written through Ollama `all-minilm` opens as before.
+Planned as 0.17.0. One change: the text embedder is built into the binary, so a fresh install needs no Ollama (spike #1180). The store format, recall ranking and dream scoring are unchanged, and a store written through Ollama `all-minilm` opens as before.
 
 ### The text embedder is built in: a fresh install needs no Ollama
 
@@ -17,7 +17,7 @@ Until now `kannaka` turned text into vectors by calling an Ollama server, and re
 - **Default Ollama address** is `http://127.0.0.1:11434` everywhere it was `http://localhost:11434` (encoder config, `OllamaEncoder::default_local`, the second pipeline, `kannaka-recompute-encoding`, the Ollama LLM defaults in `init` and `agent`). On Windows every request to `localhost` took about 2 s longer than the same request to `127.0.0.1` (measured in #1180). A config.toml that already says `localhost` is not changed.
 - **Cargo feature** `native-embed`, in the default set. Without it the `native` kind reports itself as compiled out and `auto` means Ollama.
 
-Costs: the release `kannaka.exe` on Windows grows from SIZE_BEFORE to SIZE_AFTER bytes (DELTA); a process that embeds natively holds the model in memory (about 91 MB as f32); the first embed of a process takes about 0.3 s to load it, later embeds 20 to 60 ms each on a laptop CPU.
+Costs: the release binary grows (the spike measured about +3.8 MB for the tokenizer and forward pass in a standalone probe; the delta in `kannaka` itself is not yet measured); a process that embeds natively holds the model in memory (about 91 MB as f32); the first embed of a process takes about 0.3 s to load it, later embeds 20 to 60 ms each on a laptop CPU.
 
 Known gap, not fixed here: Ollama tokenizes with llama.cpp's own WordPiece, which keeps Hangul syllables whole and keeps Devanagari vowel signs; this tokenizer does neither. For Korean and Devanagari text the built-in embedder's vectors therefore differ from Ollama's (cosine 0.659 and 0.964 on one sentence each), and the two stamps are still treated as equivalent. A store holding such text should stay with the embedder that wrote it (#1183). `kannaka-recompute-encoding` still re-encodes through Ollama only.
 
