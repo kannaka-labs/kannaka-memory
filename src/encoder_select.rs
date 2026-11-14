@@ -4,7 +4,7 @@
 //! without the native embedder still reads a native store's stamp and says why
 //! it cannot serve it.
 
-use crate::encoding::{SimpleHashEncoder, TextEncoder};
+use crate::encoding::TextEncoder;
 
 /// The `.encoder` stamp of a store written by the native embedder.
 pub const NATIVE_ENCODER_ID: &str = "kannaka:all-minilm-l6-v2:384";
@@ -280,24 +280,6 @@ pub fn ensure_native_weights() -> Result<std::path::PathBuf, String> {
     }
 }
 
-/// The encoder a stamp names, when it is one the 384-wide codebook can take
-/// and needs no address: a hash encoder or the native embedder. Used by
-/// `openclaw::make_pipeline` to mirror the store pipeline's selection.
-pub(crate) fn addressless_encoder(stamp: &str, dim: usize) -> Option<Result<Box<dyn TextEncoder>, String>> {
-    match parse_encoder_stamp(stamp)? {
-        (kind, seed, d) if (kind == "hash" || kind == "hash2") && d == dim => {
-            let seed = seed.parse().unwrap_or(42);
-            Some(Ok(if kind == "hash" {
-                Box::new(SimpleHashEncoder::new(d, seed))
-            } else {
-                Box::new(SimpleHashEncoder::new_cleaned(d, seed))
-            }))
-        }
-        (kind, _, d) if kind == "native" && d == dim => Some(native_encoder()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,16 +487,5 @@ mod tests {
     fn unknown_kinds_are_errors() {
         assert!(select(&input(Some("onnx"), "auto", None), &mut || false).is_err());
         assert!(select(&input(None, "onnx", None), &mut || false).is_err());
-    }
-
-    #[test]
-    fn addressless_encoders_follow_the_stamp() {
-        assert_eq!(addressless_encoder("hash:384:42", 384).unwrap().unwrap().embedding_dim(), 384);
-        assert!(addressless_encoder("hash2:384:42", 384).is_some());
-        assert!(addressless_encoder("hash:768:42", 384).is_none(), "wrong width for the codebook");
-        assert!(addressless_encoder(OLLAMA_MINILM_ID, 384).is_none(), "Ollama needs an address");
-        assert!(addressless_encoder("unknown", 384).is_none());
-        let native = addressless_encoder(NATIVE_ENCODER_ID, 384).expect("native is addressless");
-        assert_eq!(native.is_ok(), native_built());
     }
 }

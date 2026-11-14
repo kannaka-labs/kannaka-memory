@@ -443,62 +443,102 @@ pub fn make_pipeline() -> EncodingPipeline {
     )
 }
 
-/// [`make_pipeline`] for an explicit stamp (`None`: nothing was selected).
-pub(crate) fn make_pipeline_for_stamp(selected: Option<&str>) -> EncodingPipeline {
-    use crate::encoder_select::{addressless_encoder, parse_encoder_stamp};
-    let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
-    if let Some(stamp) = selected {
-        match addressless_encoder(stamp, CODEBOOK_INPUT_DIM) {
-            Some(Ok(encoder)) => {
-                return EncodingPipeline::new(Box::new(CachedEncoder::new(BoxedEncoder(encoder))), codebook)
-                    .with_metadata(stamp.trim().to_string(), false);
-            }
-            // The store selected the native embedder and this build has none.
-            // Say so on every embed instead of answering from another space.
-            Some(Err(why)) => {
-                return EncodingPipeline::new(Box::new(UnavailableEncoder(why)), codebook)
-                    .with_metadata(stamp.trim().to_string(), false);
-            }
-            None => {}
-        }
-    }
-    // #1178: this pipeline used to be pinned to localhost, so a process whose
-    // store pipeline honoured KANNAKA_ENCODER_URL still embedded through
-    // localhost here (`observe`), failed, and fell back to the hash encoder.
-    let (model, stamp) = match selected.and_then(parse_encoder_stamp) {
-        Some((kind, model, dim)) if kind == "ollama" && dim == CODEBOOK_INPUT_DIM => {
-            (model, selected.map(|s| s.trim().to_string()))
-        }
-        _ => ("all-minilm".to_string(), None),
+/// Which encoder the second pipeline builds for a selected stamp. Pure: no
+/// environment, no network, nothing constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SecondEncoder {
+    /// A hash encoder, directly (no Ollama in front of it).
+    Hash { cleaned: bool, seed: u64 },
+    /// The native embedder, with no fallback.
+    Native,
+    /// Ollama with this model over the hash fallback. `stamp` is the selected
+    /// stamp when it named this arm, `None` for the legacy default.
+    OllamaOverHash { model: String, stamp: Option<String> },
+}
+
+/// The plan for a selected stamp (`None`: nothing was selected).
+pub(crate) fn second_encoder_for(selected: Option<&str>) -> SecondEncoder {
+    let legacy = SecondEncoder::OllamaOverHash { model: "all-minilm".to_string(), stamp: None };
+    let Some(stamp) = selected.map(str::trim).filter(|s| !s.is_empty()) else {
+        return legacy;
     };
-    let ollama = OllamaEncoder::new(
-        pipeline_encoder_url(std::env::var("KANNAKA_ENCODER_URL").ok()),
-        model,
-        CODEBOOK_INPUT_DIM,
-    );
-    let hash_fallback = SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, CODEBOOK_SEED);
-    let composite = CompositeEncoder::new(Box::new(ollama), Box::new(hash_fallback));
-    let cached = CachedEncoder::new(composite);
-    let pipeline = EncodingPipeline::new(Box::new(cached), codebook);
-    match stamp {
-        Some(stamp) => pipeline.with_metadata(stamp, false),
-        None => pipeline,
+    match crate::encoder_select::parse_encoder_stamp(stamp) {
+        Some((kind, arg, dim)) if dim == CODEBOOK_INPUT_DIM => match kind.as_str() {
+            "hash" | "hash2" => SecondEncoder::Hash { cleaned: kind == "hash2", seed: arg.parse().unwrap_or(42) },
+            "native" => SecondEncoder::Native,
+            "ollama" => SecondEncoder::OllamaOverHash { model: arg, stamp: Some(stamp.to_string()) },
+            _ => legacy,
+        },
+        _ => legacy,
     }
 }
 
-/// [`make_pipeline`] for a system opened on `data_dir` without the `kannaka`
-/// binary's selection (`KannakaMemorySystem::init`: `kannaka-acp`, setup
-/// seeding, tools). When nothing was exported and the store's `.encoder` stamp
-/// is the native id, the store was written by the native embedder and is opened
-/// with it, not with Ollama over a hash fallback.
-pub(crate) fn make_pipeline_for_data_dir(data_dir: &std::path::Path) -> EncodingPipeline {
-    if std::env::var(crate::encoder_select::SELECTED_ENV).map(|v| v.trim().is_empty()).unwrap_or(true) {
-        let stamp = std::fs::read_to_string(data_dir.join(".encoder")).unwrap_or_default();
-        if stamp.trim() == crate::encoder_select::NATIVE_ENCODER_ID {
-            return make_pipeline_for_stamp(Some(stamp.trim()));
+/// The stamp a system opened on a store should build its pipelines from: what
+/// the `kannaka` binary exported, else the store's own stamp when that is the
+/// native id (so `KannakaMemorySystem::init` — `kannaka-acp`, setup seeding,
+/// tools — opens a natively written store natively), else nothing. Pure.
+pub(crate) fn selection_for_store(exported: Option<&str>, store_stamp: Option<&str>) -> Option<String> {
+    if let Some(e) = exported.map(str::trim).filter(|e| !e.is_empty()) {
+        return Some(e.to_string());
+    }
+    store_stamp
+        .map(str::trim)
+        .filter(|s| *s == crate::encoder_select::NATIVE_ENCODER_ID)
+        .map(str::to_string)
+}
+
+/// [`make_pipeline`] for an explicit stamp (`None`: nothing was selected).
+/// Reads no selection from the environment; see [`second_encoder_for`].
+pub(crate) fn make_pipeline_for_stamp(selected: Option<&str>) -> EncodingPipeline {
+    let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
+    let named = |p: EncodingPipeline| match selected.map(str::trim) {
+        Some(stamp) => p.with_metadata(stamp.to_string(), false),
+        None => p,
+    };
+    match second_encoder_for(selected) {
+        SecondEncoder::Hash { cleaned, seed } => {
+            let hash = if cleaned {
+                SimpleHashEncoder::new_cleaned(CODEBOOK_INPUT_DIM, seed)
+            } else {
+                SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, seed)
+            };
+            named(EncodingPipeline::new(Box::new(CachedEncoder::new(hash)), codebook))
+        }
+        SecondEncoder::Native => match crate::encoder_select::native_encoder() {
+            Ok(encoder) => {
+                named(EncodingPipeline::new(Box::new(CachedEncoder::new(BoxedEncoder(encoder))), codebook))
+            }
+            // The store selected the native embedder and this build has none.
+            // Say so on every embed instead of answering from another space.
+            Err(why) => named(EncodingPipeline::new(Box::new(UnavailableEncoder(why)), codebook)),
+        },
+        SecondEncoder::OllamaOverHash { model, stamp } => {
+            // #1178: this pipeline used to be pinned to localhost, so a process
+            // whose store pipeline honoured KANNAKA_ENCODER_URL still embedded
+            // through localhost here (`observe`), failed, and fell back to the
+            // hash encoder.
+            let ollama = OllamaEncoder::new(
+                pipeline_encoder_url(std::env::var("KANNAKA_ENCODER_URL").ok()),
+                model,
+                CODEBOOK_INPUT_DIM,
+            );
+            let hash_fallback = SimpleHashEncoder::new(CODEBOOK_INPUT_DIM, CODEBOOK_SEED);
+            let composite = CompositeEncoder::new(Box::new(ollama), Box::new(hash_fallback));
+            let pipeline = EncodingPipeline::new(Box::new(CachedEncoder::new(composite)), codebook);
+            match stamp {
+                Some(stamp) => pipeline.with_metadata(stamp, false),
+                None => pipeline,
+            }
         }
     }
-    make_pipeline()
+}
+
+/// [`make_pipeline`] for a system opened on `data_dir`: the exported selection,
+/// else the store's stamp when it is the native id ([`selection_for_store`]).
+pub(crate) fn make_pipeline_for_data_dir(data_dir: &std::path::Path) -> EncodingPipeline {
+    let exported = std::env::var(crate::encoder_select::SELECTED_ENV).ok();
+    let stamp = std::fs::read_to_string(data_dir.join(".encoder")).ok();
+    make_pipeline_for_stamp(selection_for_store(exported.as_deref(), stamp.as_deref()).as_deref())
 }
 
 /// A boxed encoder as an encoder, so it can sit inside [`CachedEncoder`].
@@ -3842,10 +3882,42 @@ mod tests {
     }
 
     /// #1180: the second pipeline builds the encoder the store pipeline
-    /// selected. A hash store is embedded with that hash encoder directly (it
-    /// used to go to Ollama first and only reach the hash encoder by failing).
+    /// selected. The plan is a pure function of the stamp, so these tests read
+    /// no environment and no process-wide counter (the first version asserted
+    /// on `encoding::fallback_count()`, which every other test in the parallel
+    /// suite can move).
     #[test]
-    fn second_pipeline_mirrors_a_selected_hash_encoder() {
+    fn second_encoder_plan_follows_the_selected_stamp() {
+        let ollama = |model: &str, stamp: Option<&str>| SecondEncoder::OllamaOverHash {
+            model: model.to_string(),
+            stamp: stamp.map(str::to_string),
+        };
+        // A hash store is embedded with that hash encoder directly; it used to
+        // go to Ollama first and reach the hash encoder only by failing.
+        assert_eq!(second_encoder_for(Some("hash:384:42")), SecondEncoder::Hash { cleaned: false, seed: 42 });
+        assert_eq!(second_encoder_for(Some("hash:384:7")), SecondEncoder::Hash { cleaned: false, seed: 7 });
+        assert_eq!(second_encoder_for(Some(" hash2:384:42\n")), SecondEncoder::Hash { cleaned: true, seed: 42 });
+        // Native: no fallback arm exists in the plan.
+        assert_eq!(second_encoder_for(Some(crate::encoder_select::NATIVE_ENCODER_ID)), SecondEncoder::Native);
+        // Ollama stamps at the codebook's width keep Ollama, with their model.
+        assert_eq!(
+            second_encoder_for(Some("ollama:all-minilm:384")),
+            ollama("all-minilm", Some("ollama:all-minilm:384"))
+        );
+        assert_eq!(
+            second_encoder_for(Some("ollama:nomic-embed-text:384")),
+            ollama("nomic-embed-text", Some("ollama:nomic-embed-text:384"))
+        );
+        // Nothing selected, another width, or an unknown stamp: the legacy pipeline.
+        for other in
+            [None, Some(""), Some("  "), Some("ollama:mxbai-embed-large:1024"), Some("hash:768:42"), Some("future:v9:384")]
+        {
+            assert_eq!(second_encoder_for(other), ollama("all-minilm", None), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn second_pipeline_built_from_a_hash_plan_embeds_with_that_hash_encoder() {
         use crate::encoding::TextEncoder;
         let text = "the spare key is under the blue flowerpot";
         let codebook = Codebook::new(CODEBOOK_INPUT_DIM, CODEBOOK_OUTPUT_DIM, CODEBOOK_SEED);
@@ -3854,7 +3926,6 @@ mod tests {
             ("hash:384:7", SimpleHashEncoder::new(384, 7)),
             ("hash2:384:42", SimpleHashEncoder::new_cleaned(384, 42)),
         ] {
-            let before = crate::encoding::fallback_count();
             let pipeline = make_pipeline_for_stamp(Some(stamp));
             assert_eq!(pipeline.stamp, stamp);
             assert_eq!(
@@ -3862,50 +3933,41 @@ mod tests {
                 codebook.project(&direct.embed(text).unwrap()),
                 "{stamp}"
             );
-            assert_eq!(crate::encoding::fallback_count(), before, "{stamp}: no fallback was involved");
         }
     }
 
-    /// #1180: a selected native embedder has no hash fallback in the second
-    /// pipeline either. Without the feature every embed is an error that says
-    /// why; with it, the pipeline carries the native stamp (embedding needs the
-    /// weights and is covered by the ignored tests in `native_embed`).
+    /// The stamp carried by each arm, and the compiled-out native arm: every
+    /// embed is an error that says why, never a vector from another encoder.
     #[test]
-    fn second_pipeline_mirrors_a_selected_native_encoder() {
+    fn second_pipeline_carries_the_selected_stamp() {
         let id = crate::encoder_select::NATIVE_ENCODER_ID;
-        let pipeline = make_pipeline_for_stamp(Some(id));
-        assert_eq!(pipeline.stamp, id);
+        let native = make_pipeline_for_stamp(Some(id));
+        assert_eq!(native.stamp, id);
         if !crate::encoder_select::native_built() {
-            let before = crate::encoding::fallback_count();
-            let err = pipeline.encode_text("anything").unwrap_err().to_string();
+            let err = native.encode_text("anything").unwrap_err().to_string();
             assert!(err.contains("native-embed"), "{err}");
-            assert_eq!(crate::encoding::fallback_count(), before);
         }
-        // A store stamped native is opened natively by `init` with nothing exported.
-        let dir = std::env::temp_dir().join(format!("kannaka_native_stamp_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".encoder"), format!("{id}\n")).unwrap();
-        if std::env::var(crate::encoder_select::SELECTED_ENV).is_err() {
-            assert_eq!(make_pipeline_for_data_dir(&dir).stamp, id);
-            std::fs::write(dir.join(".encoder"), "ollama:all-minilm:384").unwrap();
-            assert_eq!(make_pipeline_for_data_dir(&dir).stamp, "unknown", "anything else keeps the legacy pipeline");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An Ollama stamp at the codebook's width keeps Ollama over the hash
-    /// fallback and takes the stamp's model; other widths and no stamp are the
-    /// legacy all-minilm pipeline.
-    #[test]
-    fn second_pipeline_keeps_the_ollama_arm_for_ollama_stamps() {
         assert_eq!(make_pipeline_for_stamp(Some("ollama:all-minilm:384")).stamp, "ollama:all-minilm:384");
-        assert_eq!(make_pipeline_for_stamp(Some("ollama:nomic-embed-text:384")).stamp, "ollama:nomic-embed-text:384");
         assert_eq!(make_pipeline_for_stamp(Some("ollama:mxbai-embed-large:1024")).stamp, "unknown");
-        assert_eq!(make_pipeline_for_stamp(Some("hash:768:42")).stamp, "unknown");
         assert_eq!(make_pipeline_for_stamp(None).stamp, "unknown");
     }
 
+    /// What `KannakaMemorySystem::init` builds from: the exported selection
+    /// first, else a native store's own stamp, else nothing.
+    #[test]
+    fn selection_for_a_store_prefers_the_export_then_a_native_stamp() {
+        let id = crate::encoder_select::NATIVE_ENCODER_ID;
+        assert_eq!(selection_for_store(None, None), None);
+        assert_eq!(selection_for_store(None, Some(&format!("{id}\n"))), Some(id.to_string()));
+        assert_eq!(selection_for_store(Some(" "), Some(id)), Some(id.to_string()));
+        // Any other stamp keeps the legacy pipeline, as before this change.
+        for stamp in ["ollama:all-minilm:384", "hash:384:42", "", "garbage"] {
+            assert_eq!(selection_for_store(None, Some(stamp)), None, "{stamp:?}");
+        }
+        // An exported selection wins over whatever the store says.
+        assert_eq!(selection_for_store(Some("hash:384:42"), Some(id)), Some("hash:384:42".to_string()));
+        assert_eq!(selection_for_store(Some(id), None), Some(id.to_string()));
+    }
 
     use super::*;
     use std::env;
