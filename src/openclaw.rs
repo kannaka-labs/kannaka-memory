@@ -526,6 +526,12 @@ pub struct KannakaMemorySystem {
     /// The default sink, opened on first use and reused.
     #[cfg(feature = "nats")]
     nats_sink: Option<crate::remember_events::NatsRememberSink>,
+    /// Whether this system may publish to the swarm bus at all. `false`
+    /// (a node that has not joined, ADR-0059 §1) means no remember, forget
+    /// or dream event and no `event_transport`: NATS is never dialled.
+    /// `true` by default for library callers; the CLI sets it from
+    /// `KannakaConfig::swarm_publish_enabled`.
+    swarm_publish: bool,
     /// Rows that existed when the running dream began; `Some` only mid-dream.
     dream_ids_before: Option<std::collections::HashSet<Uuid>>,
 
@@ -682,6 +688,7 @@ impl KannakaMemorySystem {
             remember_sink: None,
             #[cfg(feature = "nats")]
             nats_sink: None,
+            swarm_publish: true,
             dream_ids_before: None,
             forget_level: crate::forget_events::ForgetLevel::from_env(),
             forget_via: crate::remember_events::VIA_API,
@@ -702,6 +709,22 @@ impl KannakaMemorySystem {
         {
             self.nats_sink = None;
         }
+    }
+
+    /// Allow or forbid every swarm publish this system makes (remember,
+    /// forget and dream events, the shared `event_transport`). Forbidding
+    /// also drops a connection that is already open.
+    pub fn set_swarm_publish(&mut self, enabled: bool) {
+        self.swarm_publish = enabled;
+        #[cfg(feature = "nats")]
+        if !enabled {
+            self.nats_sink = None;
+        }
+    }
+
+    /// See [`Self::set_swarm_publish`].
+    pub fn swarm_publish(&self) -> bool {
+        self.swarm_publish
     }
 
     // -- #1057: remember events ----------------------------------------------
@@ -742,6 +765,9 @@ impl KannakaMemorySystem {
     /// of dialling a second time. `None` while NATS is unreachable.
     #[cfg(feature = "nats")]
     pub fn event_transport(&mut self) -> Option<std::sync::Arc<crate::nats::SwarmTransport>> {
+        if !self.swarm_publish {
+            return None;
+        }
         if self.nats_sink.is_none() {
             self.nats_sink = Some(crate::remember_events::NatsRememberSink::new(
                 self.resolved_nats_url(),
@@ -857,6 +883,11 @@ impl KannakaMemorySystem {
             return;
         }
         let pending = std::mem::take(&mut self.pending_remember);
+        // Not a swarm member: nothing is built, nothing is dialled, and
+        // nothing is said. The pending ids are dropped, as at `off`.
+        if !self.swarm_publish {
+            return;
+        }
         #[cfg(feature = "nats")]
         {
             use crate::remember_events::{build_remember_event, RememberLevel};
@@ -1026,6 +1057,16 @@ impl KannakaMemorySystem {
         };
         if self.forget_level == crate::forget_events::ForgetLevel::Off {
             not_published(&mut out, pending.len(), "events.forget = off".into());
+            self.forget_outcome.merge(&out);
+            return;
+        }
+        // Not a swarm member: counted, never dialled, no warning line.
+        if !self.swarm_publish {
+            not_published(
+                &mut out,
+                pending.len(),
+                crate::forget_events::REASON_SWARM_NOT_ENABLED.into(),
+            );
             self.forget_outcome.merge(&out);
             return;
         }
@@ -2686,7 +2727,7 @@ impl KannakaMemorySystem {
         #[cfg(feature = "nats")]
         {
             let agent_id = std::env::var("KANNAKA_AGENT_ID").unwrap_or_default();
-            if agent_id.is_empty() {
+            if agent_id.is_empty() || !self.swarm_publish {
                 return;
             }
             let nats_url = self.resolved_nats_url();
@@ -2709,7 +2750,7 @@ impl KannakaMemorySystem {
     /// Publish dream report to NATS `KANNAKA.dreams` for swarm visibility (best-effort).
     fn publish_dream_to_nats(&self, report: &DreamReport) {
         let agent_id = std::env::var("KANNAKA_AGENT_ID").unwrap_or_default();
-        if agent_id.is_empty() {
+        if agent_id.is_empty() || !self.swarm_publish {
             return;
         }
         let nats_url = self.resolved_nats_url();
@@ -2788,7 +2829,7 @@ impl KannakaMemorySystem {
         duration_ms: u128,
     ) {
         let agent_id = std::env::var("KANNAKA_AGENT_ID").unwrap_or_default();
-        if agent_id.is_empty() {
+        if agent_id.is_empty() || !self.swarm_publish {
             return;
         }
         let transport = match crate::nats::SwarmTransport::connect(&self.resolved_nats_url()) {
@@ -2813,7 +2854,7 @@ impl KannakaMemorySystem {
     /// Radio, observatory, and all clients subscribe to this subject to stay in sync.
     pub fn publish_consciousness_to_nats(&self, state: &ConsciousnessState) {
         let agent_id = std::env::var("KANNAKA_AGENT_ID").unwrap_or_default();
-        if agent_id.is_empty() {
+        if agent_id.is_empty() || !self.swarm_publish {
             return;
         }
         let nats_url = self.resolved_nats_url();
@@ -6083,6 +6124,51 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A node that has not joined the swarm: a CLI remember (default
+        /// level `content`) reaches no sink, and re-enabling does not replay
+        /// what was written while off.
+        #[test]
+        fn swarm_publish_off_publishes_nothing() {
+            let (mut sys, dir, cap) = system("re_swarm_off");
+            assert!(sys.swarm_publish(), "library default is unchanged");
+            sys.set_swarm_publish(false);
+            sys.set_write_origin(re::VIA_CLI);
+            let id = sys.remember("text that must stay on this machine").unwrap();
+            sys.save().unwrap();
+            assert!(sys.engine.store.get(&id).unwrap().is_some());
+            assert!(events(&cap).is_empty(), "{:?}", events(&cap));
+            assert!(sys.pending_remember_events().is_empty());
+            sys.set_swarm_publish(true);
+            sys.save().unwrap();
+            assert!(events(&cap).is_empty(), "nothing is replayed");
+            let later = sys.remember("written after joining").unwrap();
+            sys.save().unwrap();
+            let evs = events(&cap);
+            assert_eq!(evs.len(), 1, "{evs:?}");
+            assert_eq!(evs[0]["memory_id"], later.to_string());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The gate is ahead of the dial: with the real sink and a URL
+        /// nothing listens on, a gated system never constructs a sink or
+        /// opens a transport.
+        #[test]
+        fn swarm_publish_off_never_dials() {
+            let dir = temp_dir("re_swarm_off_dial");
+            let mut sys = KannakaMemorySystem::init(dir.clone()).unwrap();
+            sys.set_agent_id("a".into());
+            sys.set_remember_level(None);
+            sys.set_nats_url("nats://127.0.0.1:1".into());
+            sys.set_swarm_publish(false);
+            sys.set_write_origin(re::VIA_CLI);
+            sys.remember("never leaves").unwrap();
+            sys.save().unwrap();
+            assert!(sys.nats_sink.is_none(), "no sink was even constructed");
+            assert!(sys.event_transport().is_none());
+            assert!(sys.nats_sink.is_none(), "event_transport must not dial either");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// The real sink against a port nothing listens on: the connect is
         /// refused, the write succeeds, and the retry window stops a second dial.
         #[test]
@@ -6265,6 +6351,28 @@ mod tests {
 
         fn id_of(p: &serde_json::Value) -> Uuid {
             p["memory_id"].as_str().unwrap().parse().unwrap()
+        }
+
+        /// A node that has not joined the swarm: the delete is counted, no
+        /// event reaches any sink, and the outcome line is the quiet one.
+        #[test]
+        fn swarm_publish_off_publishes_no_forget() {
+            let (mut sys, dir, cap) = system("fe_swarm_off");
+            let id = sys.remember("the heron stands in the shallows").unwrap();
+            sys.save().unwrap();
+            cap.lock().unwrap().clear();
+            sys.set_swarm_publish(false);
+            sys.with_forget_origin(re::VIA_CLI, fe::REASON_OPERATOR, |s| {
+                s.forget(&id)?;
+                s.save()
+            })
+            .unwrap();
+            assert!(cap.lock().unwrap().is_empty());
+            let out = sys.take_forget_outcome();
+            assert_eq!((out.announced, out.published, out.not_published), (1, 0, 1));
+            assert_eq!(out.reason.as_deref(), Some(fe::REASON_SWARM_NOT_ENABLED));
+            assert_eq!(out.summary_line(), "forget event: none (swarm not enabled)");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// The `kannaka forget` flow: one event after the save, via/reason set,

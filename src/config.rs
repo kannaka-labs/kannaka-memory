@@ -1117,6 +1117,37 @@ impl KannakaConfig {
             && std::env::var("NATS_PASSWORD").map(|v| !v.is_empty()).unwrap_or(false);
         env_ok || Self::nats_creds_path().map(|p| p.is_file()).unwrap_or(false)
     }
+
+    /// Whether this process may publish to the swarm bus at all (remember,
+    /// forget and dream events, `KANNAKA.memory.new`). `explicit_bus`: the
+    /// operator named a broker for this invocation (`--nats-url` or
+    /// `KANNAKA_NATS_URL`). See [`swarm_publish_allowed`].
+    pub fn swarm_publish_enabled(&self, explicit_bus: bool) -> bool {
+        swarm_publish_allowed(
+            self.swarm.enabled,
+            Self::swarm_credentials_present(),
+            explicit_bus,
+        )
+    }
+}
+
+/// The gate every write-side publish sits behind (ADR-0059 §1). A node
+/// publishes when any of these holds:
+///
+/// - `swarm.enabled = true` in config.toml (credentialed or explicitly
+///   anonymous membership, written by `kannaka init`);
+/// - swarm credentials are present (`NATS_USER`/`NATS_PASSWORD` exported, or
+///   `~/.kannaka-nats.env`). `swarm.enabled` is a plain serde field that
+///   defaults to `false` and nothing derives it at load, so a fleet node whose
+///   config.toml predates the key, or was re-serialized with the default,
+///   would otherwise go silent; credentials on the box are the same
+///   deliberate act of joining that ADR-0059 keys `enabled` on;
+/// - the operator pointed at a bus for this invocation.
+///
+/// A fresh install has none of the three, so its writes never dial the
+/// built-in public broker.
+pub fn swarm_publish_allowed(enabled: bool, creds_present: bool, explicit_bus: bool) -> bool {
+    enabled || creds_present || explicit_bus
 }
 
 /// The comment block at the top of `config.toml`. When the node is an
@@ -6194,6 +6225,30 @@ id = \"from-config\"
         assert_eq!(body["id"], "node-a");
         assert_eq!(body["display_name"], "Node A");
         assert_eq!(body["kind"], "agent");
+    }
+
+    /// The write-side publish gate: a fresh install (not enabled, no
+    /// credentials, no bus named) stays off the bus; each deliberate act
+    /// alone turns it on, so a credentialed node whose config.toml lacks
+    /// `swarm.enabled` keeps publishing.
+    #[test]
+    fn swarm_publish_needs_membership_credentials_or_an_explicit_bus() {
+        assert!(!swarm_publish_allowed(false, false, false), "fresh install");
+        assert!(swarm_publish_allowed(true, false, false), "explicit anonymous membership");
+        assert!(swarm_publish_allowed(false, true, false), "credentials, config without the key");
+        assert!(swarm_publish_allowed(false, false, true), "--nats-url / KANNAKA_NATS_URL");
+        assert!(swarm_publish_allowed(true, true, false), "credentialed fleet node");
+
+        // An older config.toml with a [swarm] table but no `enabled` key
+        // parses to `false`: the credentials leg is what keeps it publishing.
+        let old: KannakaConfig =
+            toml::from_str("[swarm]\nnats_url = \"nats://example:4222\"\n").unwrap();
+        assert!(!old.swarm.enabled);
+        assert!(swarm_publish_allowed(old.swarm.enabled, true, false));
+        assert!(!swarm_publish_allowed(old.swarm.enabled, false, false));
+        assert!(!KannakaConfig::default().swarm.enabled);
+        // The explicit-bus leg does not depend on the environment.
+        assert!(KannakaConfig::default().swarm_publish_enabled(true));
     }
 
     // ── #930: swarm.enabled only with credentials or an explicit choice ─

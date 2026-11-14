@@ -1150,6 +1150,43 @@ pub(crate) fn resolve_nats_url(args: &[String], start: usize, config_nats_url: &
     config_nats_url.to_string()
 }
 
+/// The operator named a broker for THIS invocation: `--nats-url URL` on the
+/// command line, or a non-empty `KANNAKA_NATS_URL`. Either is a deliberate
+/// act, so it opens the write-side publish gate on a node that has not
+/// joined the swarm (`KannakaConfig::swarm_publish_enabled`). The config
+/// file's `swarm.nats_url` does not count: it defaults to the public broker.
+pub(crate) fn explicit_nats_bus(args: &[String], start: usize, env_url: Option<&str>) -> bool {
+    let flag = args
+        .iter()
+        .skip(start)
+        .zip(args.iter().skip(start + 1))
+        .any(|(a, v)| a == "--nats-url" && !v.trim().is_empty());
+    flag || env_url.map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod explicit_nats_bus_tests {
+    use super::explicit_nats_bus;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_the_flag_or_the_env_var_counts() {
+        let plain = argv(&["remember", "some text"]);
+        assert!(!explicit_nats_bus(&plain, 0, None), "fresh install: nothing named");
+        assert!(!explicit_nats_bus(&plain, 0, Some("")));
+        assert!(!explicit_nats_bus(&plain, 0, Some("  ")));
+        assert!(explicit_nats_bus(&plain, 0, Some("nats://mine:4222")));
+        let flagged = argv(&["remember", "some text", "--nats-url", "nats://mine:4222"]);
+        assert!(explicit_nats_bus(&flagged, 0, None));
+        // A flag with no value names nothing; one before `start` is not ours.
+        assert!(!explicit_nats_bus(&argv(&["remember", "--nats-url"]), 0, None));
+        assert!(!explicit_nats_bus(&flagged, 4, None));
+    }
+}
+
 /// Broker-selection precedence is the contract every swarm-facing command
 /// shares, and it had no test — so a claim that `--nats-url` is ignored could
 /// only be answered by hand-running the CLI (#753, #754, and #735/#731 before
@@ -2356,6 +2393,19 @@ fn main() {
         0,
         &cfg.swarm.nats_url,
     ));
+    // ADR-0059 §1: a node that has not joined the swarm does not publish.
+    // Without this a fresh install's `kannaka remember` dialled the built-in
+    // public broker and sent the memory's text (the remember event at its
+    // CLI default `content`, and `KANNAKA.memory.new`). Open when
+    // `swarm.enabled`, when swarm credentials are present, or when this
+    // invocation names a bus (`--nats-url` / `KANNAKA_NATS_URL`). Read here,
+    // before the dream command seeds KANNAKA_NATS_URL from config (#87).
+    let env_nats_url = std::env::var("KANNAKA_NATS_URL").ok();
+    sys.set_swarm_publish(cfg.swarm_publish_enabled(explicit_nats_bus(
+        &args[command_start..],
+        0,
+        env_nats_url.as_deref(),
+    )));
     // #1057: remember events from the shared write path carry this node's
     // agent id and honour `[events] remember` (env KANNAKA_EVENTS_REMEMBER,
     // already folded into cfg). Unset = per-origin default.

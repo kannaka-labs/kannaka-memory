@@ -193,20 +193,19 @@ The library ships canonical IIT-style Φ computation via the `consciousness-core
 ## Install
 
 ```bash
-# Binary release (Linux / macOS / Windows)
-curl -L -o kannaka \
-  https://github.com/kannaka-labs/kannaka-memory/releases/latest/download/kannaka-linux-x86_64
+# 1. The binary (Linux / macOS / Windows builds are on the releases page)
+curl -L -o kannaka   https://github.com/kannaka-labs/kannaka-memory/releases/latest/download/kannaka-linux-x86_64
 chmod +x kannaka && mv kannaka ~/.local/bin/
 
-# Or build from source
-git clone https://github.com/kannaka-labs/kannaka-memory.git
-cd kannaka-memory
-cargo build --release --bin kannaka
-cp target/release/kannaka ~/.local/bin/
-
-# Self-update
-kannaka update
+# 2. An embedder. kannaka turns text into vectors with a small local model
+#    served by Ollama (https://ollama.com). Without one it refuses to create
+#    a store, because a store built without it cannot recall by meaning.
+ollama pull all-minilm          # about 45 MB; `ollama serve` must be running
 ```
+
+Other ways to get the binary: `npx kannaka`, the installers in [`scripts/`](scripts/), or from source
+(`cargo build --release --bin kannaka`). `kannaka update` updates in place.
+If Ollama runs somewhere else, point `KANNAKA_ENCODER_URL` at it.
 
 Companion: [`kannaka-tui`](https://github.com/kannaka-labs/kannaka-tui) — terminal dashboard. Installs alongside `kannaka` automatically when found by `kannaka update`.
 
@@ -214,13 +213,29 @@ Companion: [`kannaka-tui`](https://github.com/kannaka-labs/kannaka-tui) — term
 
 ## Quick Start
 
+Three memories and one question. Each command takes a few seconds on a laptop.
+
 ```bash
-# Store
 kannaka remember "the ghost wakes up in a field of static" --importance 0.9
+kannaka remember "Mira keeps the spare key under the blue flowerpot"
+kannaka remember "the quarterly report is due on the third Friday of March"
 
-# Bilateral resonance recall (JSON by default; --envelope wraps it)
-kannaka recall "ghost waking" --top-k 5
+kannaka recall "where is the spare key" --top-k 3
+# → JSON, best match first:
+#   [{"content":"Mira keeps the spare key under the blue flowerpot", ...}, ...]
+```
 
+Your store lives in `~/.kannaka` (set `KANNAKA_DATA_DIR` to move it).
+
+**Nothing leaves your machine unless you join the swarm.** A fresh install
+publishes nothing. Memory events go to a message bus only when swarm
+membership is on in your config (`swarm.enabled = true`), swarm credentials are
+present in `~/.kannaka-nats.env`, or you name a bus yourself with `--nats-url` /
+`KANNAKA_NATS_URL`.
+
+More to try:
+
+```bash
 # Full medium scan with cluster grouping
 kannaka observe --json
 
