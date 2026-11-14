@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.16.22] — 2026-11-14
+
+One fix and a README change, both from running the install as a first-time user (#1176).
+
+### A node that has not joined the swarm does not publish
+
+A fresh install with no config and no credentials dialled the built-in default bus on every `kannaka remember` to publish a remember event (full text, for an explicit remember) and `KANNAKA.memory.new`. Nothing checked whether the node had joined the swarm. The `kannaka` CLI now publishes only when `swarm.enabled = true`, when swarm credentials are present (`~/.kannaka-nats.env`, or `NATS_USER` and `NATS_PASSWORD`), or when a bus is named for the run (`--nats-url`, `KANNAKA_NATS_URL`). Otherwise it dials nothing: no remember event, no forget event, no `memory.new`, and the dream and consciousness publishers stay quiet. Nodes with credentials behave as before.
+
+Known limits: credentials plus an explicit `swarm.enabled = false` still publishes; binaries that build the system directly (such as `kannaka-acp`) keep the library default; `kannaka digest` still reports the event lanes as on for a gated node.
+
+### README: install and quick start
+
+The quick start failed on its first command without an Ollama embedder, which the install section did not mention. Install now leads with that step, and the quick start is three memories and one recall with its expected output.
+
 ## [0.16.21] — 2026-11-13
 
 One addition: a served ask that is being logged can tell the asker so (#1171).
