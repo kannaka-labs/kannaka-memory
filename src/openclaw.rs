@@ -1909,6 +1909,16 @@ impl KannakaMemorySystem {
             .unwrap_or(false)
     }
 
+    /// Does the store hold any `__consolidation*` bookkeeping row (#1181)?
+    /// One pass over the cache, like [`store_has_expiries`](Self::store_has_expiries).
+    fn store_has_bookkeeping_rows(&self) -> bool {
+        self.engine
+            .store
+            .all_memories()
+            .map(|ms| ms.iter().any(|m| m.content.starts_with("__consolidation")))
+            .unwrap_or(false)
+    }
+
     /// Evidence-only recall: dream rows never take a slot (#979). Use
     /// [`recall_split`](Self::recall_split) to also see the dreams.
     pub fn recall(&mut self, query: &str, top_k: usize) -> Result<Vec<RecallResult>, SystemError> {
@@ -1920,7 +1930,16 @@ impl KannakaMemorySystem {
         // #1044: over-fetch only when the store actually holds expiries, so
         // the common case is byte-identical to before.
         let drop_expired = Self::recall_drops_expired() && self.store_has_expiries();
-        let fetch = if drop_expired { top_k.saturating_add(5).max(top_k * 2) } else { top_k };
+        // #1181: a dream's `__consolidation*` layer-summary rows are
+        // bookkeeping, not memories. They sit in the medium with a real
+        // vector, so on a small store one outranked what the user stored.
+        // Same shape as the expiry rule: over-fetch only when such rows exist.
+        let drop_bookkeeping = self.store_has_bookkeeping_rows();
+        let fetch = if drop_expired || drop_bookkeeping {
+            top_k.saturating_add(5).max(top_k * 2)
+        } else {
+            top_k
+        };
         let as_of = crate::medium::hemisphere::recall_now();
         let (results, dream_hits) = self.engine.store.resonate_query_split(query, fetch)
             .map_err(SystemError::Store)?;
@@ -1938,6 +1957,9 @@ impl KannakaMemorySystem {
                 eprintln!("[recall-trace] openclaw DROP: id {id} not in canonical store");
             }
             if let Some(m) = self.engine.store.get(&id).ok().flatten() {
+                if drop_bookkeeping && m.content.starts_with("__consolidation") {
+                    continue;
+                }
                 if drop_expired && Self::expired_as_of(m, as_of) {
                     if std::env::var("KANNAKA_RECALL_TRACE").is_ok() {
                         eprintln!("[recall-trace] openclaw DROP: id {id} expired at {:?} (as of {as_of})", m.expires_at);
@@ -1967,6 +1989,9 @@ impl KannakaMemorySystem {
             if let Some(m) = self.engine.store.get(&hit.id).ok().flatten() {
                 // Same expiry rule as the evidence rows above.
                 if drop_expired && Self::expired_as_of(m, as_of) {
+                    continue;
+                }
+                if drop_bookkeeping && m.content.starts_with("__consolidation") {
                     continue;
                 }
                 dreams.push(RecallResult {
@@ -2155,6 +2180,10 @@ impl KannakaMemorySystem {
         for (id, strength) in results {
             if let Some(m) = self.engine.store.get(&id).ok().flatten() {
                 if drop_expired && Self::expired_as_of(m, as_of) {
+                    continue;
+                }
+                // #1181: bookkeeping rows are never an answer on this path either.
+                if m.content.starts_with("__consolidation") {
                     continue;
                 }
                 let age_hours = (now - m.created_at).num_seconds().max(0) as f64 / 3600.0;
@@ -6255,6 +6284,26 @@ mod tests {
             assert_eq!(committed, announced, "digest set != announced set (excluded {ex:?})");
             assert_eq!(d.count, 2);
             assert!(ex.facets >= 2 && ex.bookkeeping == 1, "{ex:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1181: a dream's layer-summary row never takes a recall slot, and
+        /// its absence does not shorten the answer.
+        #[test]
+        fn recall_never_returns_a_consolidation_summary_row() {
+            let (mut sys, dir, _cap) = system("recall_hides_summary");
+            sys.remember("hello harbor").unwrap();
+            sys.remember("the lamp never went out").unwrap();
+            let summary = crate::memory::HyperMemory::new(
+                sys.engine.store.all_memories().unwrap()[0].vector.clone(),
+                "__consolidation_summary_layer_0".into(),
+            );
+            sys.engine.store.insert(summary).unwrap();
+            let out = sys.recall_split("hello harbor", 2).unwrap();
+            assert_eq!(out.evidence.len(), 2, "a hidden row shortened the answer");
+            for r in out.evidence.iter().chain(out.dreams.iter()) {
+                assert!(!r.content.starts_with("__consolidation"), "bookkeeping row surfaced: {}", r.content);
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
 
