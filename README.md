@@ -203,7 +203,7 @@ chmod +x kannaka && mv kannaka ~/.local/bin/
 ollama pull all-minilm          # about 45 MB; `ollama serve` must be running
 ```
 
-Other ways to get the binary: `npx kannaka`,the installers in [`scripts/`](scripts/), or from source
+Other ways to get the binary: `npx kannaka`, the installers in [`scripts/`](scripts/), or from source
 (`cargo build --release --bin kannaka`). `kannaka update` updates in place.
 If Ollama runs somewhere else, point `KANNAKA_ENCODER_URL` at it.
 
