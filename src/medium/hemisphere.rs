@@ -566,6 +566,9 @@ impl Hemisphere {
         // 1. Score all candidates by raw similarity * energy^exp * tweight^texp
         let mut results: Vec<(usize, f32, f32)> = (0..self.count())
             .map(|i| {
+                if i % 256 == 0 {
+                    crate::progress::mark("recall scan");
+                }
                 let wf = self.wavefronts.row(i);
                 let wf_norm = wf.dot(&wf).sqrt();
                 if wf_norm < 1e-8 { return (i, 0.0, 0.0); }

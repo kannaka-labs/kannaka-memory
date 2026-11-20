@@ -371,7 +371,10 @@ impl Medium {
             0.0
         };
 
-        for &i in cand_slice {
+        for (n, &i) in cand_slice.iter().enumerate() {
+            if n % 256 == 0 {
+                crate::progress::mark("recall scan");
+            }
             if i >= safe_count { continue; } // guard against stale beam indices / section desync
             let wavefront = self.store.wavefronts.row(i);
 

@@ -562,12 +562,15 @@ impl ConsciousnessBridge {
 
         // === HRM-native path: emergent Phi from topology ===
         // Phi emerges from actual cross-cluster integration, not a density bonus.
-        { let hrm_metrics = engine.store.consciousness_metrics();
+        { crate::progress::mark("assess metrics");
+            let hrm_metrics = engine.store.consciousness_metrics();
             let total_links: usize = all.iter().map(|m| m.connections.len()).sum();
 
             // Build cluster membership from Kuramoto sync
+            crate::progress::mark("assess clusters");
             let sync = KuramotoSync::default();
             let clusters = sync.find_synchronized_clusters(engine, 2);
+            crate::progress::mark("assess integration");
             let mut id_to_cluster: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
             for (ci, cluster) in clusters.iter().enumerate() {
                 for &mem_id in &cluster.memory_ids {
