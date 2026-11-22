@@ -337,6 +337,121 @@ fn acquire_write_lock_blocking(timeout_secs: u64) -> Option<WriteLock> {
     None
 }
 
+/// One-shot commands that load the whole store, change it and save it.
+///
+/// Each of these is a read-modify-write of one file. Two of them overlapping
+/// is a lost update: the one that loaded first and saved last writes back a
+/// copy that never contained the other's memory. On O1 (2026-11-22) the radio
+/// ran a `hear` for every track and voice chunk while write-backs ran
+/// `remember`; a load takes seconds there, so the windows overlapped all day
+/// and most memories written since mid-November were reported stored and then
+/// overwritten. The write lock above cannot serialize them: `swarm join`
+/// holds it for its whole lifetime.
+const ONESHOT_WRITERS: &[&str] = &[
+    "remember",
+    "hear",
+    "see",
+    "forget",
+    "prune-prefix",
+    "boost",
+    "relate",
+    "import-json",
+    "dream",
+    "triage",
+];
+
+fn oneshot_lock_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(".kannaka-oneshot.lock")
+}
+
+/// How long a one-shot writer waits for the one ahead of it, in seconds.
+/// `KANNAKA_ONESHOT_LOCK_SECS` overrides; 0 disables the lock.
+fn oneshot_lock_timeout_secs() -> u64 {
+    std::env::var("KANNAKA_ONESHOT_LOCK_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+fn try_acquire_oneshot_lock(dir: &std::path::Path) -> Option<WriteLock> {
+    let path = oneshot_lock_path(dir);
+    let _ = std::fs::create_dir_all(dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return None;
+        }
+    }
+    Some(WriteLock { file })
+}
+
+/// Take the one-shot lock BEFORE the store is loaded and keep it until the
+/// process exits, so the load, the change and the save are one step as far as
+/// the next one-shot writer is concerned. Returns `None` (and says so) when
+/// the wait runs out: a writer that refuses to run is worse than the rare
+/// overlap, the same policy as the write lock.
+fn acquire_oneshot_lock(dir: &std::path::Path, command: &str, timeout_secs: u64) -> Option<WriteLock> {
+    if timeout_secs == 0 {
+        return None;
+    }
+    let polls = timeout_secs * 4; // every 250 ms
+    for attempt in 0..polls {
+        if let Some(lock) = try_acquire_oneshot_lock(dir) {
+            return Some(lock);
+        }
+        if attempt == 0 && std::env::var("KANNAKA_QUIET").is_err() {
+            eprintln!("[lock] another one-shot writer is working on the store; `{command}` waits up to {timeout_secs}s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    eprintln!("[lock] WARN: `{command}` waited {timeout_secs}s for the one-shot lock and is proceeding without it; a memory written by the other writer may be lost");
+    None
+}
+
+#[cfg(test)]
+mod oneshot_lock_tests {
+    use super::{acquire_oneshot_lock, try_acquire_oneshot_lock, ONESHOT_WRITERS};
+
+    #[test]
+    fn the_writers_that_lost_memories_are_covered() {
+        for cmd in ["remember", "hear", "prune-prefix", "dream"] {
+            assert!(ONESHOT_WRITERS.contains(&cmd), "{cmd} must queue");
+        }
+        // Reads and the long-running services must never queue behind a writer.
+        for cmd in ["recall", "search", "status", "swarm", "ask"] {
+            assert!(!ONESHOT_WRITERS.contains(&cmd), "{cmd} must not queue");
+        }
+    }
+
+    /// The second writer does not get the lock while the first holds it, and
+    /// gets it as soon as the first is done.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_writer_waits_for_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = try_acquire_oneshot_lock(dir.path()).expect("first writer takes the lock");
+        assert!(try_acquire_oneshot_lock(dir.path()).is_none(), "second writer must wait");
+        let path = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || acquire_oneshot_lock(&path, "remember", 10).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        drop(first);
+        assert!(waiter.join().unwrap(), "the waiting writer gets the lock once the first is done");
+    }
+
+    #[test]
+    fn a_zero_timeout_turns_the_lock_off() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(acquire_oneshot_lock(dir.path(), "remember", 0).is_none());
+    }
+}
+
 /// ADR-0037: `kannaka belief on|off` — persist `[belief].enabled` to config.toml.
 /// Mirrors `config set` (load_unmodified so writing one key doesn't bake env-only
 /// values into the file). Stateless: does NOT touch the HRM and does NOT re-phase
@@ -2399,6 +2514,16 @@ fn main() {
     } else {
         None
     };
+
+    // One-shot writers queue here, before the load, so each one loads what the
+    // one before it saved (see ONESHOT_WRITERS). Read-only processes never
+    // save, so they never wait.
+    let _oneshot_lock: Option<WriteLock> =
+        if ONESHOT_WRITERS.contains(&args[command_start].as_str()) && !readonly_env_active() {
+            acquire_oneshot_lock(&dir, &args[command_start], oneshot_lock_timeout_secs())
+        } else {
+            None
+        };
 
     // HRM is the sole backend
     let quiet = std::env::var("KANNAKA_QUIET").is_ok();
