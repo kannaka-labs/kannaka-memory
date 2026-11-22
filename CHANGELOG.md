@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.17.2] — 2026-11-22
+
+One fix: `swarm join` no longer saves an old copy of the store over newer memories (#1188). This was the known limit of 0.17.1 and turned out to be the larger loss. The store format, recall ranking and dream scoring are unchanged.
+
+### `swarm join` reloads a store that changed on disk before it saves (#1188)
+
+`swarm join` runs for hours with the whole store in memory and saves it from its heartbeat, its hourly snapshot and its belief-coupling step. Every `remember` and `hear` in between saved a newer file, and the service's next save wrote the copy it had loaded at start back over them. On the production host on 2026-11-22, running 0.17.1, a memory stored at 05:44Z was in the file ten minutes later and gone by 15:25Z; the service's journal shows a coupling step (`KANNAKA_EXEMPLAR_COUPLING=on`, every 40 ticks) saving in between.
+
+- **Write window.** Each tick, and the initial heartbeat, takes `.kannaka-oneshot.lock`, compares the store file with a stamp (modified time, length, inode) of the version the service last loaded or saved, and loads the store again when another process has saved since. The lock is held until the tick's saves are done.
+- **What a reload drops.** Whatever the service had changed in memory since its own last save: derived values (phases, caches) that the next step recomputes.
+- **A tick that cannot write is skipped whole.** If the lock is not free within `max(heartbeat, 30)` seconds, or the newer file does not load, the tick publishes nothing and saves nothing, and says so.
+- **Read-only nodes** take no lock and never reload, as before.
+- `KANNAKA_ONESHOT_LOCK_SECS=0` still turns the lock off; the reload check stays on.
+
+Cost: while one-shot writers are active the service reloads the store at most once per heartbeat, and one-shot writers wait while a tick runs (an assess every ten ticks, the hourly snapshot).
+
+Tests: `join_sync_tests` (two). Checked on a Linux build against a private local NATS: one `remember` while the service ran, one reload logged, the memory still in the file five heartbeats later.
+
+Known limits: `swarm listen --auto-sync` keeps a long-lived in-memory store and saves it the same way; `swarm absorb` and `autoabsorb` were not reviewed.
+
 ## [0.17.1] — 2026-11-22
 
 One fix: one-shot writers no longer overwrite each other's memories (#1186). The store format, recall ranking and dream scoring are unchanged.
