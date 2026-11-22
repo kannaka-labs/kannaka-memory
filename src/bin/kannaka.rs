@@ -360,6 +360,36 @@ const ONESHOT_WRITERS: &[&str] = &[
     "triage",
 ];
 
+/// Whether this invocation is a one-shot read-modify-write of the store.
+/// `args[0]` is the command. Beyond `ONESHOT_WRITERS`, some commands write
+/// only in one mode, and queueing their read-only mode behind a writer would
+/// cost up to the lock's wait for nothing:
+///
+/// - `swarm absorb` and `swarm autoabsorb` store what they absorb and save
+///   when the process ends; `--dry-run` stores nothing.
+/// - `research` stores only with `--ingest`; `dedupe` and `facets` change
+///   the store only with `--apply`.
+/// - `watch` and `import` always store.
+fn needs_oneshot_lock(args: &[String]) -> bool {
+    let Some(command) = args.first().map(String::as_str) else {
+        return false;
+    };
+    if ONESHOT_WRITERS.contains(&command) {
+        return true;
+    }
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    match command {
+        "watch" | "import" => true,
+        "research" => has("--ingest"),
+        "dedupe" | "facets" => has("--apply"),
+        "swarm" => {
+            matches!(args.get(1).map(String::as_str), Some("absorb") | Some("autoabsorb"))
+                && !has("--dry-run")
+        }
+        _ => false,
+    }
+}
+
 fn oneshot_lock_path(dir: &std::path::Path) -> PathBuf {
     dir.join(".kannaka-oneshot.lock")
 }
@@ -707,6 +737,35 @@ mod oneshot_lock_tests {
         std::thread::sleep(std::time::Duration::from_millis(600));
         drop(first);
         assert!(waiter.join().unwrap(), "the waiting writer gets the lock once the first is done");
+    }
+
+    fn a(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Commands that write in one mode only queue in that mode.
+    #[test]
+    fn commands_that_write_in_one_mode_queue_only_then() {
+        use super::needs_oneshot_lock as needs;
+        assert!(needs(&a(&["remember", "x"])));
+        assert!(needs(&a(&["swarm", "absorb"])));
+        assert!(needs(&a(&["swarm", "autoabsorb", "--threshold", "0.4"])));
+        assert!(!needs(&a(&["swarm", "absorb", "--dry-run"])));
+        assert!(!needs(&a(&["swarm", "autoabsorb", "--dry-run"])));
+        // The long-running swarm services open their own write windows.
+        for sub in ["join", "serve", "listen", "worker", "status", "peers"] {
+            assert!(!needs(&a(&["swarm", sub])), "swarm {sub} must not hold the lock for its lifetime");
+        }
+        assert!(needs(&a(&["research", "q", "--ingest"])));
+        assert!(!needs(&a(&["research", "q"])));
+        assert!(needs(&a(&["dedupe", "--apply"])));
+        assert!(!needs(&a(&["dedupe"])));
+        assert!(needs(&a(&["facets", "backfill", "--apply"])));
+        assert!(!needs(&a(&["facets", "backfill"])));
+        assert!(needs(&a(&["watch", "clip.mp4"])));
+        assert!(needs(&a(&["import", "f.json"])));
+        assert!(!needs(&a(&["recall", "x"])));
+        assert!(!needs(&[]));
     }
 
     #[test]
@@ -2783,7 +2842,7 @@ fn main() {
     // one before it saved (see ONESHOT_WRITERS). Read-only processes never
     // save, so they never wait.
     let _oneshot_lock: Option<WriteLock> =
-        if ONESHOT_WRITERS.contains(&args[command_start].as_str()) && !readonly_env_active() {
+        if needs_oneshot_lock(&args[command_start..]) && !readonly_env_active() {
             acquire_oneshot_lock(&dir, &args[command_start], oneshot_lock_timeout_secs())
         } else {
             None
