@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.17.3] — 2026-11-22
+
+Two follow-ups to 0.17.2 (#1190): `swarm serve` picks up a changed store without restarting, and `swarm listen --auto-sync` reloads before it saves. The store format, recall ranking and dream scoring are unchanged.
+
+### `swarm serve` reloads a changed store in place (#1190)
+
+When the store file changed and settled, `swarm serve` exited and let systemd start it again (#563). On the production host the store changes every few minutes: 135 restarts by mid-afternoon on 2026-11-22, each leaving the ask, recall and neighbors subjects without a responder for about eight seconds, and dropping whatever had been delivered to the old process but not yet handled.
+
+The service now loads the store again inside the same process and swaps it in. The subscriptions stay open, and a request that arrives during the reload waits for it. Recall counts are flushed to the sidecar before the swap; the new store is read-only like the first. If the reload fails the service falls back to exit-and-restart.
+
+- `KANNAKA_SERVE_RELOAD=restart` keeps the old behaviour. The in-place reload holds two copies of the store for a moment, so set it on a host that cannot afford that. A unit with a memory limit close to twice the store's size will be restarted by systemd at the swap, which is the old behaviour by another route.
+
+### `swarm listen --auto-sync` reloads before it saves an import (#1190)
+
+The limit named in 0.17.2. `listen` keeps the store in memory and saved the whole of it when it imported a peer's memory, over anything stored since it started. It now opens the same write window as `swarm join` around the insert and the save: take the one-shot lock, reload if the file changed, check again that the memory is not already there. If the window cannot be opened the memory is not imported and the log says so.
+
+Checked on a Linux build against a private local NATS: `swarm serve` logged one in-place reload after a `remember` and the same process was still running; `swarm listen --auto-sync` left a memory stored beside it in the file. The import path of `listen` was not exercised end to end (no peer publishing).
+
+Known limits: `swarm absorb` and `autoabsorb` were not reviewed for the same pattern.
+
 ## [0.17.2] — 2026-11-22
 
 One fix: `swarm join` no longer saves an old copy of the store over newer memories (#1188). This was the known limit of 0.17.1 and turned out to be the larger loss. The store format, recall ranking and dream scoring are unchanged.
