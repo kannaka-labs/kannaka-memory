@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.17.1] — 2026-11-22
+
+One fix: one-shot writers no longer overwrite each other's memories (#1186). The store format, recall ranking and dream scoring are unchanged.
+
+### One-shot writers queue on a lock taken before the store loads (#1186)
+
+`remember`, `hear`, `forget`, `prune-prefix` and the other one-shot writers each load the whole store, change it and save it. Nothing serialized them, so two that overlapped were a lost update: the one that loaded first and saved last wrote back a copy that never held the other's memory. The write lock from ADR-0036 did not cover this, because `swarm join` holds it for its whole lifetime and `remember` and `hear` never asked for it.
+
+On the production host the radio runs a `hear` for every track and voice chunk while write-backs run `remember`, and a load of the 169 MB store takes seconds on its one core. Measured there on 2026-11-22: seven different processes rewrote the store file in three minutes; a memory stored with exit 0 was absent ten minutes later; the file held 26 provenance-dated memories from 2026-11-15, 2 from 2026-11-16 and none found after.
+
+- **The lock.** `<data_dir>/.kannaka-oneshot.lock`, an exclusive `flock` taken before the store is loaded and held until the process exits. It is separate from `.kannaka-write.lock`.
+- **Who takes it.** `remember`, `hear`, `see`, `forget`, `prune-prefix`, `boost`, `relate`, `import-json`, `dream`, `triage`. Read commands (`recall`, `search`, `status`, `ask`), the long-running services, and any process with `KANNAKA_READONLY` do not.
+- **Waiting.** 300 s by default; `KANNAKA_ONESHOT_LOCK_SECS` changes it and `0` turns the lock off. A writer that waits says so on stderr unless `KANNAKA_QUIET` is set. On timeout it proceeds and prints a warning, the same policy as the write lock.
+- **Unix only**, like the write lock. On Windows nothing is taken.
+
+Checked on a Linux build with a throwaway store, eight `remember` calls started together, three rounds: 1 of 8 memories survived each round on 0.16.22, 8 of 8 on this build. Tests: `oneshot_lock_tests` (three).
+
+Known limits: `swarm join` keeps its own in-memory copy and saves it when it imports a memory from a peer, which can still overwrite what one-shot writers added since it started. A writer that outlasts another's 300 s wait (a long dream) is still an overlap, and the waiting writer says so.
+
 ## [0.17.0] — 2026-11-14
 
 The text embedder is built into the binary, so a fresh install needs no Ollama (#1184, spike #1180). Two fixes found in first-install testing ride along (#1179, #1182). The store format and dream scoring are unchanged, and a store written through Ollama `all-minilm` opens as before. Recall ranking is unchanged except that a dream's bookkeeping rows no longer appear in results (second fix below).
