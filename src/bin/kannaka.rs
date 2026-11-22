@@ -533,6 +533,24 @@ fn open_join_write_window(
     }
 }
 
+/// What `main` used to build this process's system, kept so a long-running
+/// command can build it again from the file on disk: the data directory, the
+/// NATS URL and whether this node publishes.
+static SYSTEM_RUNTIME: std::sync::OnceLock<(PathBuf, String, bool)> = std::sync::OnceLock::new();
+
+/// Load the store from disk again, configured the way `main` configured the
+/// system this process started with. `swarm serve` uses it to serve a store
+/// that changed without restarting.
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+pub(crate) fn reload_system(cfg: &KannakaConfig) -> Result<KannakaMemorySystem, String> {
+    let (dir, nats_url, swarm_publish) = SYSTEM_RUNTIME
+        .get()
+        .ok_or_else(|| "the system was not initialised by main".to_string())?;
+    let mut fresh = init_with_hrm(dir.clone(), true, cfg).map_err(|e| e.to_string())?;
+    configure_system(&mut fresh, cfg, nats_url.clone(), *swarm_publish);
+    Ok(fresh)
+}
+
 /// The settings `main` applies to a freshly loaded system. `swarm join`
 /// applies them again to each system it reloads.
 fn configure_system(
@@ -2826,6 +2844,7 @@ fn main() {
         env_nats_url.as_deref(),
     ));
     configure_system(&mut sys, &cfg, sys_nats_url.clone(), sys_swarm_publish);
+    let _ = SYSTEM_RUNTIME.set((dir.clone(), sys_nats_url.clone(), sys_swarm_publish));
 
     match args[command_start].as_str() {
         "remember" => {
@@ -6493,6 +6512,7 @@ fn main() {
                 "listen" => {
                     let nats_url = resolve_nats_url(&args, command_start, &cfg.swarm.nats_url);
                     let auto_sync = args[command_start..].iter().any(|a| a == "--auto-sync");
+                    let mut listen_stamp = store_stamp_at_load;
 
                     let transport = match kannaka_memory::nats::SwarmTransport::connect(&nats_url) {
                         Ok(t) => t,
@@ -6742,6 +6762,29 @@ fn main() {
                                                                     kannaka_memory::wire_source_trusted(source_agent, &trust.trusted_agents, trust.metrics_trusted_only)
                                                                 };
                                                                 if admit_import {
+                                                                    // This process has held the store in memory since it
+                                                                    // started. Before it saves, take the one-shot lock and
+                                                                    // reload if another writer saved since, so the import
+                                                                    // lands on the newer file instead of replacing it.
+                                                                    let listen_window = match open_join_write_window(
+                                                                        &mut sys,
+                                                                        &dir,
+                                                                        &cfg,
+                                                                        &mut listen_stamp,
+                                                                        &sys_nats_url,
+                                                                        sys_swarm_publish,
+                                                                        60,
+                                                                    ) {
+                                                                        Ok(w) => w,
+                                                                        Err(e) => {
+                                                                            eprintln!("[sync] memory {mem_id} from {} NOT imported: {e}", kannaka_memory::sanitize_display(source_agent));
+                                                                            continue;
+                                                                        }
+                                                                    };
+                                                                    if matches!(sys.engine.store.get(&mem_id), Ok(Some(_))) {
+                                                                        eprintln!("[sync] Memory {mem_id} already exists, skipping");
+                                                                        continue;
+                                                                    }
                                                                     // Bound as a local so the mutable borrow of `sys`
                                                                     // ends here and `sys.save()` can run in the arm below.
                                                                     let insert_result = sys.with_write_origin(
@@ -6775,6 +6818,10 @@ fn main() {
                                                                             eprintln!("[sync] Failed to import memory {} from {}: {}", mem_id, kannaka_memory::sanitize_display(source_agent), e);
                                                                         }
                                                                     }
+                                                                    if !readonly_env_active() {
+                                                                        listen_stamp = store_file_stamp(&hrm_path_for(&dir, &cfg));
+                                                                    }
+                                                                    drop(listen_window);
                                                                 } else {
                                                                     eprintln!("[sync] skip untrusted source {} (increment-0 gate)", kannaka_memory::sanitize_display(source_agent));
                                                                 }
