@@ -415,6 +415,270 @@ fn acquire_oneshot_lock(dir: &std::path::Path, command: &str, timeout_secs: u64)
     None
 }
 
+/// What identifies one saved version of the store file: modified time, length
+/// and (on unix) inode. A save replaces all three or at least one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoreStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    inode: u64,
+}
+
+fn store_file_stamp(path: &std::path::Path) -> Option<StoreStamp> {
+    let md = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        md.ino()
+    };
+    #[cfg(not(unix))]
+    let inode = 0u64;
+    Some(StoreStamp { modified: md.modified().ok(), len: md.len(), inode })
+}
+
+/// What `swarm join` does at a point where it is about to write.
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+enum JoinSync {
+    /// The file is the one this process loaded or last saved: write as before.
+    Current,
+    /// Another process saved the store since; the in-memory copy was replaced
+    /// by a fresh load, so the write that follows is built on the newer file.
+    Reloaded,
+    /// The newer file could not be loaded. The caller must not write.
+    Stale(String),
+}
+
+/// `swarm join` runs for hours with the store in memory and saves it from its
+/// heartbeat, its hourly snapshot and its belief-coupling step. Every one-shot
+/// writer (`remember`, `hear`, ...) saves the file in between, and a save from
+/// this process then wrote the copy it loaded at start back over all of them.
+/// On O1 on 2026-11-22 a memory stored at 05:44Z was in the file ten minutes
+/// later and gone after the coupling step saved.
+///
+/// Call this with the one-shot lock held, before the write. When the file is
+/// not the one in memory, `reload` supplies a fresh system and whatever this
+/// process had changed in memory since its last save is dropped: those are
+/// derived values (phases, caches) that the next step recomputes, and the
+/// memories other writers stored are not.
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+fn sync_join_with_disk(
+    sys: &mut KannakaMemorySystem,
+    hrm_path: &std::path::Path,
+    stamp: &mut Option<StoreStamp>,
+    reload: impl FnOnce() -> Result<KannakaMemorySystem, String>,
+) -> JoinSync {
+    let on_disk = store_file_stamp(hrm_path);
+    if on_disk == *stamp {
+        return JoinSync::Current;
+    }
+    match reload() {
+        Ok(fresh) => {
+            *sys = fresh;
+            *stamp = on_disk;
+            JoinSync::Reloaded
+        }
+        Err(e) => JoinSync::Stale(e),
+    }
+}
+
+/// Open a window in which `swarm join` may save: take the one-shot lock, then
+/// make sure the copy in memory is the file on disk. `Ok` carries the lock to
+/// hold until the save is done and the new stamp recorded; `Err` means this
+/// tick must not write (a one-shot writer is still at work, or the newer file
+/// would not load). A read-only node never saves, so it gets `Ok(None)` at
+/// once.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+fn open_join_write_window(
+    sys: &mut KannakaMemorySystem,
+    dir: &std::path::Path,
+    cfg: &KannakaConfig,
+    stamp: &mut Option<StoreStamp>,
+    nats_url: &str,
+    swarm_publish: bool,
+    wait_secs: u64,
+) -> Result<Option<WriteLock>, String> {
+    if readonly_env_active() {
+        return Ok(None);
+    }
+    let mut lock = None;
+    if cfg!(unix) && oneshot_lock_timeout_secs() > 0 {
+        for _ in 0..wait_secs.max(1) * 4 {
+            lock = try_acquire_oneshot_lock(dir);
+            if lock.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if lock.is_none() {
+            return Err(format!("a one-shot writer held the store for {wait_secs}s"));
+        }
+    }
+    let hrm_path = hrm_path_for(dir, cfg);
+    let outcome = sync_join_with_disk(sys, &hrm_path, stamp, || {
+        let mut fresh = init_with_hrm(dir.to_path_buf(), true, cfg).map_err(|e| e.to_string())?;
+        configure_system(&mut fresh, cfg, nats_url.to_string(), swarm_publish);
+        Ok(fresh)
+    });
+    match outcome {
+        JoinSync::Current => Ok(lock),
+        JoinSync::Reloaded => {
+            println!(
+                "[join] the store changed on disk; reloaded {} memories before writing",
+                sys.engine.store.count()
+            );
+            Ok(lock)
+        }
+        JoinSync::Stale(e) => Err(format!("the store changed on disk and could not be reloaded: {e}")),
+    }
+}
+
+/// The settings `main` applies to a freshly loaded system. `swarm join`
+/// applies them again to each system it reloads.
+fn configure_system(
+    sys: &mut KannakaMemorySystem,
+    cfg: &KannakaConfig,
+    nats_url: String,
+    swarm_publish: bool,
+) {
+    // Inject the config-aware NATS URL into the memory system so its
+    // dream/consciousness publish helpers honor cfg.swarm.nats_url instead
+    // of falling back to env-only. Fixes km#77.
+    sys.set_nats_url(nats_url);
+    // ADR-0059 §1: a node that has not joined the swarm does not publish.
+    sys.set_swarm_publish(swarm_publish);
+    // #1057: remember events from the shared write path carry this node's
+    // agent id and honour `[events] remember` (env KANNAKA_EVENTS_REMEMBER,
+    // already folded into cfg). Unset = per-origin default.
+    sys.set_agent_id(cfg.agent.id.clone());
+    match kannaka_memory::remember_events::RememberLevel::parse(&cfg.events.remember) {
+        Ok(level) => sys.set_remember_level(level),
+        Err(e) => eprintln!("[events] {e}; using the per-origin default"),
+    }
+    // #1157: forget events, `[events] forget` (env KANNAKA_EVENTS_FORGET).
+    match kannaka_memory::forget_events::ForgetLevel::parse(&cfg.events.forget) {
+        Ok(level) => sys.set_forget_level(level),
+        Err(e) => eprintln!("[events] {e}; using ids"),
+    }
+
+    // ADR-0031 Phase 3: install the dream-cycle auto-triage policy from config
+    // (opt-in via `config set triage.enabled true`). When enabled with a
+    // non-zero xi_trigger, the dream cycle self-heals Ξ by shedding redundant
+    // short-term memories — no external cron needed.
+    if cfg.triage.enabled {
+        sys.set_triage_policy(kannaka_memory::openclaw::TriageParams {
+            redundancy: cfg.triage.redundancy,
+            min_amplitude: cfg.triage.min_amplitude,
+            min_age_hours: cfg.triage.min_age_hours,
+            max_evict: cfg.triage.max_evict,
+            include_long_term: false,
+            xi_trigger: cfg.triage.xi_trigger,
+        });
+    }
+}
+
+#[cfg(test)]
+mod join_sync_tests {
+    use super::{store_file_stamp, sync_join_with_disk, JoinSync};
+    use kannaka_memory::hrm_store::HrmStore;
+    use kannaka_memory::openclaw::KannakaMemorySystem;
+    use kannaka_memory::{Codebook, EncodingPipeline, SimpleHashEncoder};
+
+    fn pipeline() -> EncodingPipeline {
+        EncodingPipeline::new(
+            Box::new(SimpleHashEncoder::new(384, 42)),
+            Codebook::new(384, kannaka_memory::WAVEFRONT_DIM, 42),
+        )
+    }
+
+    fn open(dir: &std::path::Path) -> KannakaMemorySystem {
+        let hrm = dir.join("kannaka.hrm");
+        let store = if hrm.exists() {
+            HrmStore::load(pipeline(), hrm).unwrap()
+        } else {
+            HrmStore::new(pipeline(), hrm)
+        };
+        KannakaMemorySystem::init_with_store_and_pipeline(dir.to_path_buf(), Box::new(store), pipeline())
+            .unwrap()
+    }
+
+    fn contents(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = open(dir)
+            .all_memories()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The loss itself, then the fix: a long-running process that loaded the
+    /// store before another writer saved must not write its old copy back.
+    #[test]
+    fn a_long_running_writer_does_not_save_over_a_newer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hrm = dir.path().join("kannaka.hrm");
+        {
+            let mut first = open(dir.path());
+            first.remember_with_importance("stored before the service started", 0.5).unwrap();
+            first.save().unwrap();
+        }
+
+        // The service loads the store and keeps it in memory.
+        let mut join = open(dir.path());
+        let mut stamp = store_file_stamp(&hrm);
+
+        // A one-shot writer stores a memory while the service runs. Sleep so
+        // a coarse filesystem clock cannot give both saves one timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        {
+            let mut oneshot = open(dir.path());
+            oneshot.remember_with_importance("stored while the service ran", 0.5).unwrap();
+            oneshot.save().unwrap();
+        }
+        assert_eq!(contents(dir.path()).len(), 2);
+
+        // The service is about to write: it must notice and reload first.
+        let outcome = sync_join_with_disk(&mut join, &hrm, &mut stamp, || Ok(open(dir.path())));
+        assert!(matches!(outcome, JoinSync::Reloaded));
+
+        // Its own write then lands on top of the newer file.
+        join.remember_with_importance("written by the service afterwards", 0.5).unwrap();
+        join.save().unwrap();
+        stamp = store_file_stamp(&hrm);
+        assert_eq!(
+            contents(dir.path()),
+            vec![
+                "stored before the service started".to_string(),
+                "stored while the service ran".to_string(),
+                "written by the service afterwards".to_string(),
+            ]
+        );
+
+        // Nothing changed on disk since its own save: no reload.
+        let outcome = sync_join_with_disk(&mut join, &hrm, &mut stamp, || {
+            Err("must not be called".to_string())
+        });
+        assert!(matches!(outcome, JoinSync::Current));
+    }
+
+    /// When the newer file cannot be loaded the caller is told not to write,
+    /// and the stamp stays old so the next attempt tries again.
+    #[test]
+    fn a_failed_reload_is_reported_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let hrm = dir.path().join("kannaka.hrm");
+        let mut join = open(dir.path());
+        join.remember_with_importance("first", 0.5).unwrap();
+        join.save().unwrap();
+        let mut stamp = None; // as if the file had been replaced
+        let outcome = sync_join_with_disk(&mut join, &hrm, &mut stamp, || Err("no".to_string()));
+        assert!(matches!(outcome, JoinSync::Stale(_)));
+        assert!(stamp.is_none());
+    }
+}
+
 #[cfg(test)]
 mod oneshot_lock_tests {
     use super::{acquire_oneshot_lock, try_acquire_oneshot_lock, ONESHOT_WRITERS};
@@ -2527,6 +2791,10 @@ fn main() {
 
     // HRM is the sole backend
     let quiet = std::env::var("KANNAKA_QUIET").is_ok();
+    // Taken before the load: a save that lands while this process is loading
+    // then reads as "changed since" to `swarm join`, which reloads.
+    #[cfg_attr(not(feature = "nats"), allow(unused_variables))]
+    let store_stamp_at_load = store_file_stamp(&hrm_path_for(&dir, &cfg));
     let mut sys = {
         if !quiet {
             eprintln!("Using HRM backend (Holographic Resonance Medium)");
@@ -2543,11 +2811,7 @@ fn main() {
     // Inject the config-aware NATS URL into the memory system so its
     // dream/consciousness publish helpers honor cfg.swarm.nats_url instead
     // of falling back to env-only. Fixes km#77.
-    sys.set_nats_url(resolve_nats_url(
-        &args[command_start..],
-        0,
-        &cfg.swarm.nats_url,
-    ));
+    let sys_nats_url = resolve_nats_url(&args[command_start..], 0, &cfg.swarm.nats_url);
     // ADR-0059 §1: a node that has not joined the swarm does not publish.
     // Without this a fresh install's `kannaka remember` dialled the built-in
     // public broker and sent the memory's text (the remember event at its
@@ -2556,39 +2820,12 @@ fn main() {
     // invocation names a bus (`--nats-url` / `KANNAKA_NATS_URL`). Read here,
     // before the dream command seeds KANNAKA_NATS_URL from config (#87).
     let env_nats_url = std::env::var("KANNAKA_NATS_URL").ok();
-    sys.set_swarm_publish(cfg.swarm_publish_enabled(explicit_nats_bus(
+    let sys_swarm_publish = cfg.swarm_publish_enabled(explicit_nats_bus(
         &args[command_start..],
         0,
         env_nats_url.as_deref(),
-    )));
-    // #1057: remember events from the shared write path carry this node's
-    // agent id and honour `[events] remember` (env KANNAKA_EVENTS_REMEMBER,
-    // already folded into cfg). Unset = per-origin default.
-    sys.set_agent_id(cfg.agent.id.clone());
-    match kannaka_memory::remember_events::RememberLevel::parse(&cfg.events.remember) {
-        Ok(level) => sys.set_remember_level(level),
-        Err(e) => eprintln!("[events] {e}; using the per-origin default"),
-    }
-    // #1157: forget events, `[events] forget` (env KANNAKA_EVENTS_FORGET).
-    match kannaka_memory::forget_events::ForgetLevel::parse(&cfg.events.forget) {
-        Ok(level) => sys.set_forget_level(level),
-        Err(e) => eprintln!("[events] {e}; using ids"),
-    }
-
-    // ADR-0031 Phase 3: install the dream-cycle auto-triage policy from config
-    // (opt-in via `config set triage.enabled true`). When enabled with a
-    // non-zero xi_trigger, the dream cycle self-heals Ξ by shedding redundant
-    // short-term memories — no external cron needed.
-    if cfg.triage.enabled {
-        sys.set_triage_policy(kannaka_memory::openclaw::TriageParams {
-            redundancy: cfg.triage.redundancy,
-            min_amplitude: cfg.triage.min_amplitude,
-            min_age_hours: cfg.triage.min_age_hours,
-            max_evict: cfg.triage.max_evict,
-            include_long_term: false,
-            xi_trigger: cfg.triage.xi_trigger,
-        });
-    }
+    ));
+    configure_system(&mut sys, &cfg, sys_nats_url.clone(), sys_swarm_publish);
 
     match args[command_start].as_str() {
         "remember" => {
@@ -5794,6 +6031,26 @@ fn main() {
                     // a self-registration carries no trust signal a Sybil could
                     // not forge. The vestigial write/read pair is gone.
 
+                    // This process saves from its heartbeat, snapshot and
+                    // coupling steps. Each of them runs inside a write window
+                    // (see `open_join_write_window`) so it never saves the
+                    // copy it loaded over what one-shot writers stored since.
+                    let mut disk_stamp = store_stamp_at_load;
+                    let initial_window = match open_join_write_window(
+                        &mut sys,
+                        &dir,
+                        &cfg,
+                        &mut disk_stamp,
+                        &sys_nats_url,
+                        sys_swarm_publish,
+                        oneshot_lock_timeout_secs(),
+                    ) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!("[join] cannot start: {e}");
+                            process::exit(1);
+                        }
+                    };
                     let initial_phase = swarm_publish_heartbeat(
                         &mut sys,
                         &my_agent_id,
@@ -5842,6 +6099,10 @@ fn main() {
                     // canonical Φ from drifting.
                     let initial_assess = sys.assess();
                     sys.publish_consciousness_to_nats(&initial_assess);
+                    if !readonly_env_active() {
+                        disk_stamp = store_file_stamp(&hrm_path_for(&dir, &cfg));
+                    }
+                    drop(initial_window);
                     const CONSCIOUSNESS_REFRESH_TICKS: u64 = 10;
 
                     // ADR-0037 Track-D heartbeat coupling (default OFF). Conservative,
@@ -5955,6 +6216,24 @@ fn main() {
                             break;
                         }
                         tick += 1;
+                        // Everything below may save the store. A tick that
+                        // cannot open its window is skipped whole: a missed
+                        // heartbeat is recoverable, a stale save is not.
+                        let tick_window = match open_join_write_window(
+                            &mut sys,
+                            &dir,
+                            &cfg,
+                            &mut disk_stamp,
+                            &sys_nats_url,
+                            sys_swarm_publish,
+                            heartbeat_secs.max(30),
+                        ) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                eprintln!("[join] tick #{tick} skipped, nothing written: {e}");
+                                continue;
+                            }
+                        };
                         let p = swarm_publish_heartbeat(
                             &mut sys,
                             &my_agent_id,
@@ -6141,6 +6420,12 @@ fn main() {
                                 }
                             }
                         }
+                        // Whatever this tick saved is now the file this
+                        // process knows; release the lock after noting it.
+                        if !readonly_env_active() {
+                            disk_stamp = store_file_stamp(&hrm_path_for(&dir, &cfg));
+                        }
+                        drop(tick_window);
                     }
 
                     if let Err(e) = transport.announce_leave(&my_agent_id) {
