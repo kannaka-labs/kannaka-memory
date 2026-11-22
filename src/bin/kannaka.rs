@@ -607,7 +607,7 @@ mod join_sync_tests {
             .all_memories()
             .unwrap()
             .into_iter()
-            .map(|m| m.content)
+            .map(|m| m.content.clone())
             .collect();
         v.sort();
         v
