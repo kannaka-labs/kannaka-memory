@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.17.4] — 2026-11-22
+
+Two fixes: `swarm join` held the one-shot lock for its whole tick (#1193, a defect in 0.17.2), and six more one-shot commands that save the store now queue on that lock (#1191).
+
+### `swarm join` holds the one-shot lock only around its saves (#1193)
+
+0.17.2 opened the service's write window at the top of each tick and closed it at the bottom. A tick also runs an assess every ten ticks and at startup, and on the production host (168 MB store, one core) an assess takes about 4.5 minutes, so the lock was held for more than half of every five minutes. One-shot writers wait 300 s for it and then write without it, and a write made without it while the window was open was then taken for the service's own, which reopened the loss 0.17.2 closed. No loss was observed in the hour it ran.
+
+- The tick's window now covers the heartbeat's flush and, when a snapshot is due, a flush done at that point; it closes before the snapshot's gzip and assess and before the periodic assess.
+- The belief-coupling step opens its own window, with its own changed-on-disk check.
+- At startup the window closes after the initial heartbeat, before the initial assess.
+
+Checked on a Linux build against a private local NATS with a 3 s heartbeat: the lock was free in 40 of 40 samples while the service ran, and 5 of 5 memories stored beside it were in the file.
+
+### `swarm absorb`, `swarm autoabsorb` and four other one-shot savers take the one-shot lock (#1191)
+
+`swarm absorb` and `swarm autoabsorb` load the store, run one sweep, store what they absorb and save when the process ends, so they are one-shot read-modify-write commands like `remember`. They were outside the lock because it was keyed on the top-level command, and theirs is `swarm`. The same review found `watch`, `import`, `research --ingest`, and `dedupe` / `facets` with `--apply`. All of them now queue, and only in the mode that writes: a `--dry-run` absorb, a plain `research`, or a `dedupe` without `--apply` does not wait.
+
+Known limits: `chat` and `agent` sessions are long-lived, hold the store in memory and can store into it; a long session can still save an old copy. `swarm worker` is long-lived and not read-only; no save was found in its handler, but not every library call it makes was traced.
+
 ## [0.17.3] — 2026-11-22
 
 Two follow-ups to 0.17.2 (#1190): `swarm serve` picks up a changed store without restarting, and `swarm listen --auto-sync` reloads before it saves. The store format, recall ranking and dream scoring are unchanged.
