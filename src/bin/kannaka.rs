@@ -533,6 +533,24 @@ fn open_join_write_window(
     }
 }
 
+/// Close a write window: whatever this process saved inside it is now the
+/// file it knows, so note the file's stamp, then let the lock go. Keep the
+/// window short. One-shot writers wait on this lock for 300 s and then write
+/// without it, and a write made without it while the window is open would be
+/// taken for this process's own.
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+fn close_join_write_window(
+    window: Option<WriteLock>,
+    stamp: &mut Option<StoreStamp>,
+    dir: &std::path::Path,
+    cfg: &KannakaConfig,
+) {
+    if !readonly_env_active() {
+        *stamp = store_file_stamp(&hrm_path_for(dir, cfg));
+    }
+    drop(window);
+}
+
 /// What `main` used to build this process's system, kept so a long-running
 /// command can build it again from the file on disk: the data directory, the
 /// NATS URL and whether this node publishes.
@@ -6079,6 +6097,12 @@ fn main() {
                         identity.as_ref(),
                         &session_joined_at,
                     );
+                    // The heartbeat's flush was the only save in this window.
+                    // Close it here: the assess below takes minutes on a large
+                    // store and one core (4.5 on O1), and holding the lock
+                    // through it kept every one-shot writer waiting past its
+                    // own timeout (0.17.2).
+                    close_join_write_window(initial_window, &mut disk_stamp, &dir, &cfg);
                     println!("Joined swarm as '{display_name}' ({my_agent_id})");
                     println!(
                         "[nats] Initial phase \u{03b8}={initial_phase:.3} published to {nats_url}"
@@ -6118,10 +6142,6 @@ fn main() {
                     // canonical Φ from drifting.
                     let initial_assess = sys.assess();
                     sys.publish_consciousness_to_nats(&initial_assess);
-                    if !readonly_env_active() {
-                        disk_stamp = store_file_stamp(&hrm_path_for(&dir, &cfg));
-                    }
-                    drop(initial_window);
                     const CONSCIOUSNESS_REFRESH_TICKS: u64 = 10;
 
                     // ADR-0037 Track-D heartbeat coupling (default OFF). Conservative,
@@ -6235,9 +6255,13 @@ fn main() {
                             break;
                         }
                         tick += 1;
-                        // Everything below may save the store. A tick that
-                        // cannot open its window is skipped whole: a missed
-                        // heartbeat is recoverable, a stale save is not.
+                        // The heartbeat's flush and the snapshot's flush save
+                        // the store, so they run inside a write window. The
+                        // window closes before the slow steps (the snapshot's
+                        // gzip and assess, the periodic assess); the coupling
+                        // step further down opens its own. A tick that cannot
+                        // open its window is skipped whole: a missed heartbeat
+                        // is recoverable, a stale save is not.
                         let tick_window = match open_join_write_window(
                             &mut sys,
                             &dir,
@@ -6269,9 +6293,18 @@ fn main() {
                         // is written before the manifest is published, so an Err
                         // here (usually a NATS publish hiccup) still means the
                         // restore point landed on disk. Never fatal to the loop.
-                        if snapshot_on
-                            && last_snapshot.elapsed().as_secs() >= snapshot_interval_secs
-                        {
+                        let snapshot_due = snapshot_on
+                            && last_snapshot.elapsed().as_secs() >= snapshot_interval_secs;
+                        if snapshot_due {
+                            // The snapshot begins by flushing the store. Do
+                            // that flush here, inside the window, so the one
+                            // inside the snapshot finds nothing left to write.
+                            if let Err(e) = sys.engine.store.flush() {
+                                eprintln!("[snapshot] WARNING: flush before snapshot failed: {e}");
+                            }
+                        }
+                        close_join_write_window(tick_window, &mut disk_stamp, &dir, &cfg);
+                        if snapshot_due {
                             if let Err(e) = handlers_substrate::capture_and_publish_snapshot(
                                 &transport,
                                 &my_agent_id,
@@ -6338,11 +6371,33 @@ fn main() {
                         // beliefs. Phase-only ⇒ recall preserved; the heartbeat's own
                         // flush (in swarm_publish_heartbeat above) persists the result.
                         // Requires a re-phased belief field; skips on no peers / errors.
-                        if running.load(Ordering::SeqCst)
+                        // The coupling step saves, so it gets its own window:
+                        // minutes may have passed in the assess above, and a
+                        // one-shot writer may have saved in them.
+                        let coupling_window = if running.load(Ordering::SeqCst)
                             && coupling_on
                             && tick % coupling_ticks == 0
                             && kannaka_memory::medium::chiral::belief_phase_enabled()
                         {
+                            match open_join_write_window(
+                                &mut sys,
+                                &dir,
+                                &cfg,
+                                &mut disk_stamp,
+                                &sys_nats_url,
+                                sys_swarm_publish,
+                                heartbeat_secs.max(30),
+                            ) {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    eprintln!("[couple] tick #{tick} skipped, nothing written: {e}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if coupling_window.is_some() {
                             // (1) publish our (fresh) cores.
                             if let Some(h) = sys
                                 .engine
@@ -6439,12 +6494,9 @@ fn main() {
                                 }
                             }
                         }
-                        // Whatever this tick saved is now the file this
-                        // process knows; release the lock after noting it.
-                        if !readonly_env_active() {
-                            disk_stamp = store_file_stamp(&hrm_path_for(&dir, &cfg));
+                        if let Some(window) = coupling_window {
+                            close_join_write_window(window, &mut disk_stamp, &dir, &cfg);
                         }
-                        drop(tick_window);
                     }
 
                     if let Err(e) = transport.announce_leave(&my_agent_id) {
