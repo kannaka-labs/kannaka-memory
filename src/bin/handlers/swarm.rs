@@ -453,7 +453,15 @@ pub(crate) fn handle_swarm_serve(
     } else {
         std::path::PathBuf::from(&cfg.hrm.path)
     };
-    let hrm_loaded_mtime = std::fs::metadata(&hrm_path).and_then(|m| m.modified()).ok();
+    let mut hrm_loaded_mtime = std::fs::metadata(&hrm_path).and_then(|m| m.modified()).ok();
+    // How to pick up a changed store. The default loads it again inside this
+    // process, so the subscriptions stay open and a question that arrives
+    // during the reload waits a few seconds instead of finding nobody home.
+    // `KANNAKA_SERVE_RELOAD=restart` keeps the old exit-and-restart, for a
+    // host too small to hold two copies of the store for a moment.
+    let reload_by_restart = std::env::var("KANNAKA_SERVE_RELOAD")
+        .map(|v| v.eq_ignore_ascii_case("restart"))
+        .unwrap_or(false);
     let mut hrm_pending: Option<(std::time::SystemTime, std::time::Instant)> = None;
     let mut last_freshness_check = std::time::Instant::now();
     const FRESHNESS_CHECK_SECS: u64 = 60;
@@ -487,6 +495,43 @@ pub(crate) fn handle_swarm_serve(
                         FRESHNESS_SETTLE,
                     );
                     hrm_pending = next_pending;
+                    let mut reload = reload;
+                    if reload && !reload_by_restart {
+                        // Reload in place. Until 0.17.3 this exited and let
+                        // systemd start a new process: on O1 the store changes
+                        // every few minutes, so the responder was gone for
+                        // about eight seconds each time (135 restarts by the
+                        // afternoon of 2026-11-22) and whatever arrived in
+                        // that gap, or sat unread in the subscription buffer
+                        // at exit, got no answer.
+                        sd_notify("WATCHDOG=1");
+                        sys.flush_reactivation();
+                        match crate::reload_system(cfg) {
+                            Ok(mut fresh) => {
+                                if let Some(hrm) = fresh
+                                    .engine
+                                    .store
+                                    .as_any_mut()
+                                    .downcast_mut::<kannaka_memory::hrm_store::HrmStore>()
+                                {
+                                    hrm.set_readonly(true);
+                                }
+                                *sys = fresh;
+                                hrm_loaded_mtime = Some(current);
+                                hrm_pending = None;
+                                reload = false;
+                                eprintln!(
+                                    "[swarm serve] HRM changed on disk and settled — reloaded in place, {} memories",
+                                    sys.engine.store.count()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[swarm serve] in-place reload failed ({e}) — falling back to a restart");
+                            }
+                        }
+                        sd_notify("WATCHDOG=1");
+                        last_watchdog = std::time::Instant::now();
+                    }
                     if reload {
                         eprintln!(
                             "[swarm serve] HRM changed on disk and settled — restarting to serve the fresh mind (#563)"
