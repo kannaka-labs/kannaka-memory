@@ -29,6 +29,7 @@ boxes; `oracle-cluster.conf.template` in `ops/nats-cluster/` is the redacted sha
 | `beacon` | kannaka-beacon (seeds) | `KANNAKA.events.beacon`, `_INBOX.>` | INTERNAL |
 | `kannaktopus` | Kannaktopus daemons (off-box) | `QUEEN.phase.>`, `announce`, `queen.event.>`, `reactions`, `KANNAKTOPUS.>` | INTERNAL |
 | `queen_agent` | owned swarm members off-box (`kannaka swarm join` on laptops: 0xSCADA-QE, Flaukowski, …) | open memory lane + `QUEEN.*`, `ask.>`, `inbox.>`, **`$KV.QUEEN_AGENTS.>`** (KV roster — the one write anon must never get), `$JS.API.STREAM.MSG.GET.>`; **denied** `work.>`/JS-admin/private lanes | INTERNAL |
+| `flaukowski` | Nick's agent on his work desktop (off-box; `$NATS_FLAUKOWSKI_PASS`) | own `presence`/`snapshots`/`recall`/`neighbors` lanes, `ask.>`, `inbox.>`, open memory lane, `$KV.QUEEN_AGENTS.flaukowski`, `$JS.API.STREAM.MSG.GET/INFO.>` (mail stream and stream admin denied), `_INBOX.>`. Subscribe: the one scoped identity allowed to read `KANNAKA.events.hive.>` (2026-11-24); `mail.>` and `events.nostr.>` denied | INTERNAL |
 | `anon` | open swarm peers, observatory reads, Command Center MCP | open memory lane ONLY (see below); **denied** `ask.>`/`work.>`/`inbox.>`/JS-admin | PUBLIC |
 
 All identities `subscribe` broadly within their reach; the security invariant is
