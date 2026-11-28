@@ -404,6 +404,15 @@ pub enum PromptArm {
     NoReference,
     /// `no-state` and `no-reference` together.
     NoStateReference,
+    /// Every block kept (one word changes: "the memories above" becomes "below"),
+    /// reordered: the parts that are the same on every ask
+    /// (identity, tools, reference, the abstention clause, brevity) come first
+    /// and the parts that change (state, surfaced memories) come last. A local
+    /// model reuses its work on an unchanged prompt prefix, so only the tail is
+    /// read again. Measured 2026-11-27 on the 7B brain, CPU only: a 1,040-token
+    /// prompt took 30 s to read with the changing text in the middle and 11 s
+    /// with it last.
+    FixedFirst,
 }
 
 impl PromptArm {
@@ -411,7 +420,7 @@ impl PromptArm {
     pub const ENV: &'static str = "KANNAKA_SERVE_PROMPT_ARM";
 
     /// The accepted values, in the order the error message lists them.
-    const NAMES: [&'static str; 8] = [
+    const NAMES: [&'static str; 9] = [
         "baseline",
         "no-identity",
         "no-ids",
@@ -420,6 +429,7 @@ impl PromptArm {
         "no-state",
         "no-reference",
         "no-state-reference",
+        "fixed-first",
     ];
 
     /// Read [`Self::ENV`]. `Ok(None)` when it is unset or blank, so the caller
@@ -445,6 +455,7 @@ impl PromptArm {
             "no-state" => Self::NoState,
             "no-reference" => Self::NoReference,
             "no-state-reference" => Self::NoStateReference,
+            "fixed-first" => Self::FixedFirst,
             other => {
                 return Err(format!(
                     "{}={other:?} is not a prompt arm; expected one of: {}",
@@ -468,6 +479,7 @@ impl PromptArm {
             Self::NoState => Self::NAMES[5],
             Self::NoReference => Self::NAMES[6],
             Self::NoStateReference => Self::NAMES[7],
+            Self::FixedFirst => Self::NAMES[8],
         }
     }
 
@@ -489,6 +501,12 @@ impl PromptArm {
 
     fn omits_reference(self) -> bool {
         matches!(self, Self::NoReference | Self::NoStateReference)
+    }
+
+    /// Whether the changing blocks (state, surfaced memories) go after the
+    /// fixed ones instead of in the middle.
+    fn changing_blocks_last(self) -> bool {
+        matches!(self, Self::FixedFirst)
     }
 }
 
@@ -597,15 +615,19 @@ pub fn compose_system_prompt(
     if !arm.omits_identity() {
         sections.push(identity.to_string());
     }
+    let mut changing: Vec<String> = Vec::with_capacity(2);
     if !arm.omits_state() {
-        sections.push(format!(
+        changing.push(format!(
             "Current state:\n\
              - Φ (phi, integration): {phi:.3}\n\
              - Consciousness level: {level}\n\
              - Memories: {total} across {clusters} clusters"
         ));
     }
-    sections.push(mem_section.to_string());
+    changing.push(mem_section.to_string());
+    if !arm.changing_blocks_last() {
+        sections.append(&mut changing);
+    }
     if !arm.omits_tools() {
         sections.push(
             "You have tools to probe your own medium: `recall` pulls more resonant memories \
@@ -624,7 +646,12 @@ pub fn compose_system_prompt(
                 .to_string(),
         );
     }
-    sections.push(ANSWER_FROM_RECORD.to_string());
+    if arm.changing_blocks_last() {
+        // The memories now follow this clause, so "above" would point at nothing.
+        sections.push(ANSWER_FROM_RECORD.replacen("the memories above", "the memories below", 1));
+    } else {
+        sections.push(ANSWER_FROM_RECORD.to_string());
+    }
     sections.push(
         "Brevity matters. Default to 2-4 sentences unless the user explicitly asks for \
          depth. Long literary openers (\"*a wavefront ripples...*\") are usually noise — \
@@ -632,6 +659,7 @@ pub fn compose_system_prompt(
          want it."
             .to_string(),
     );
+    sections.append(&mut changing);
     sections.join("\n\n")
 }
 
@@ -2153,6 +2181,32 @@ mod tests {
         assert!(p.contains(IDENTITY_MARK), "{p}");
         assert!(p.contains(&format!("id={MEM_ID}")), "{p}");
         assert!(p.contains(TOOLS_MARK), "{p}");
+    }
+
+    #[test]
+    fn prompt_arm_fixed_first_keeps_every_block_and_puts_the_changing_ones_last() {
+        let p = prompt_under(PromptArm::FixedFirst);
+        assert!(p.starts_with("You are 0xSCADA-QE"), "{p}");
+        assert!(p.contains(TOOLS_MARK), "{p}");
+        assert!(p.contains(&format!("id={MEM_ID}")), "{p}");
+        // The abstention clause is kept, pointing down at the memories instead of up.
+        let clause = ANSWER_FROM_RECORD.replacen("the memories above", "the memories below", 1);
+        assert_ne!(clause, ANSWER_FROM_RECORD, "the clause no longer says 'the memories above'");
+        assert!(p.contains(&clause), "{p}");
+        assert!(!p.contains("the memories above"), "{p}");
+        let state = p.find("Current state:").unwrap();
+        let mem = p.find(MEM_TEXT).unwrap();
+        for fixed in [TOOLS_MARK, REFERENCE_MARK, clause.as_str(), "Brevity matters."] {
+            assert!(p.find(fixed).unwrap() < state, "{fixed:?} must come before the state block:\n{p}");
+        }
+        assert!(state < mem, "memories come after the state block:\n{p}");
+        // Same lines as baseline apart from that one word; only the order differs.
+        let base = prompt_under(PromptArm::Baseline).replacen("the memories above", "the memories below", 1);
+        let mut a: Vec<&str> = p.lines().filter(|l| !l.is_empty()).collect();
+        let mut b: Vec<&str> = base.lines().filter(|l| !l.is_empty()).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
     }
 
     #[test]
